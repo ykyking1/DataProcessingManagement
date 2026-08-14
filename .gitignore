@@ -1,0 +1,6 @@
+/**/target/
+*.tab
+*.parquet
+__pycache__/
+*.pyc
+/testdata/

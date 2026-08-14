@@ -1,0 +1,19 @@
+[package]
+name = "tab-to-parquet"
+version = "0.1.0"
+edition = "2021"
+description = ".tab -> .parquet dönüştürücü (streaming, zstd sıkıştırmalı) -- İHA telemetri pipeline'ının üretim implementasyonu"
+
+[[bin]]
+name = "tab_to_parquet"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+arrow = "53"
+parquet = { version = "53", features = ["arrow", "zstd"] }
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
