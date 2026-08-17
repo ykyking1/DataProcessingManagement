@@ -1,213 +1,1976 @@
 """
-A3 - Katalog / Pipeline Metrik Dashboard'u
+A3 - İHA Veri Platformu
+Pipeline Metrikleri + Asset Kataloğu + Telemetri Gözat/Dışa Aktar
 
-docs/postgres_manifest_schema.sql içindeki `conversion_manifest` tablosunu
-okuyup pipeline'ın (tab -> parquet -> clickhouse) durumunu görselleştirir.
+Backend:
+    ClickHouse
 
-Ortam değişkenleri (docker-compose'da servis olarak set edilmeli):
-    POSTGRES_HOST       (varsayılan: postgres)
-    POSTGRES_PORT       (varsayılan: 5432)
-    POSTGRES_DB         (varsayılan: pipeline)
-    POSTGRES_USER
-    POSTGRES_PASSWORD
+AU-AIR telemetry kolonları:
+
+    time
+    latitude
+    longitude
+    altitude
+    velocity_x
+    velocity_y
+    velocity_z
+    roll
+    pitch
+    yaw
+    image_name
+    box_x
+    box_y
+    box_w
+    box_h
+    class
+
+Dashboard bölümleri:
+
+    1. Pipeline Metrikleri
+       - Dagster GraphQL API
+       - Run durumu
+       - Run süresi
+
+    2. Katalog
+       - Dagster asset'leri
+       - Son materialization
+       - Metadata
+
+    3. Alertler
+       - Başarısız Dagster run'ları
+       - failure_hook tarafından oluşturulan alert kayıtları
+
+    4. Veri Gözat / Dışa Aktar
+       - ClickHouse bağlantısı
+       - Time filtresi
+       - Kolon seçimi
+       - Satır sayısı
+       - Veri önizleme
+       - CSV dışa aktarma
 """
 
+import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
+import clickhouse_connect
 import pandas as pd
+import requests
 import streamlit as st
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 from streamlit_autorefresh import st_autorefresh
 
+
+# ============================================================
+# STREAMLIT CONFIG
+# ============================================================
+
 st.set_page_config(
-    page_title="İHA Veri Platformu - Katalog & Metrikler",
+    page_title="İHA Veri Platformu - Pipeline & Katalog",
     layout="wide",
 )
 
-REFRESH_OPTIONS = {"Kapalı": 0, "10 sn": 10, "30 sn": 30, "60 sn": 60}
+
+# ============================================================
+# GENEL AYARLAR
+# ============================================================
+
+REFRESH_OPTIONS = {
+    "Kapalı": 0,
+    "10 sn": 10,
+    "30 sn": 30,
+    "60 sn": 60,
+}
+
+MAX_EXPORT_ROWS = 2_000_000
 
 
-def get_db_url() -> str:
-    host = os.environ.get("POSTGRES_HOST", "postgres")
-    port = os.environ.get("POSTGRES_PORT", "5432")
-    db = os.environ.get("POSTGRES_DB", "pipeline")
-    user = os.environ.get("POSTGRES_USER", "postgres")
-    password = os.environ.get("POSTGRES_PASSWORD", "postgres")
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+# ============================================================
+# AU-AIR KOLONLARI
+# ============================================================
+
+AU_AIR_COLUMNS = [
+    "time",
+    "latitude",
+    "longitude",
+    "altitude",
+    "velocity_x",
+    "velocity_y",
+    "velocity_z",
+    "roll",
+    "pitch",
+    "yaw",
+    "image_name",
+    "box_x",
+    "box_y",
+    "box_w",
+    "box_h",
+    "class",
+]
 
 
-@st.cache_resource
-def get_engine() -> Engine:
-    return create_engine(get_db_url(), pool_pre_ping=True)
+# ============================================================
+# DAGSTER GRAPHQL
+# ============================================================
+
+RUNS_QUERY = """
+query RecentRuns($limit: Int!) {
+  runsOrError(limit: $limit) {
+    __typename
+
+    ... on Runs {
+      results {
+        runId
+        jobName
+        status
+        startTime
+        endTime
+      }
+    }
+
+    ... on PythonError {
+      message
+    }
+  }
+}
+"""
 
 
-@st.cache_data(ttl=10)
-def load_manifest() -> pd.DataFrame:
-    query = text(
-        """
-        SELECT
-            id, tab_file_name, ham_file_name, flight_id,
-            status, attempt_count, max_attempts,
-            row_count_tab, row_count_parquet, row_count_clickhouse,
-            content_fingerprint,
-            parquet_object_key, parquet_size_bytes,
-            clickhouse_loaded_at, error_detail,
-            created_at, updated_at
-        FROM conversion_manifest
-        ORDER BY updated_at DESC
-        """
+ASSET_CATALOG_QUERY = """
+query AssetCatalog {
+  assetNodes {
+    id
+    groupName
+    description
+
+    assetKey {
+      path
+    }
+
+    assetMaterializations(limit: 1) {
+      timestamp
+      runId
+
+      metadataEntries {
+        label
+        description
+        __typename
+
+        ... on TextMetadataEntry {
+          text
+        }
+
+        ... on IntMetadataEntry {
+          intValue
+        }
+
+        ... on FloatMetadataEntry {
+          floatValue
+        }
+
+        ... on BoolMetadataEntry {
+          boolValue
+        }
+
+        ... on MarkdownMetadataEntry {
+          mdStr
+        }
+
+        ... on JsonMetadataEntry {
+          jsonString
+        }
+
+        ... on UrlMetadataEntry {
+          url
+        }
+
+        ... on PathMetadataEntry {
+          path
+        }
+      }
+    }
+  }
+}
+"""
+
+
+# ============================================================
+# DAGSTER URL
+# ============================================================
+
+def get_graphql_url() -> str:
+    return os.environ.get(
+        "DAGSTER_GRAPHQL_URL",
+        "http://localhost:3000/graphql",
     )
-    with get_engine().connect() as conn:
-        df = pd.read_sql(query, conn)
-    return df
 
 
-def reconciliation_mask(df: pd.DataFrame) -> pd.Series:
-    """Üç katman arasında satır sayısı uyuşmazlığı olan, tamamlanmış kayıtlar."""
-    done = df["status"] == "done"
-    mismatch = (df["row_count_tab"] != df["row_count_parquet"]) | (
-        df["row_count_parquet"] != df["row_count_clickhouse"]
-    )
-    return done & mismatch
+def get_ui_url() -> str:
+    explicit = os.environ.get("DAGSTER_UI_URL")
+
+    if explicit:
+        return explicit.rstrip("/")
+
+    return get_graphql_url().replace(
+        "/graphql",
+        "",
+    ).rstrip("/")
 
 
-def render_kpis(df: pd.DataFrame) -> None:
-    total = len(df)
-    counts = df["status"].value_counts().to_dict()
-    done = counts.get("done", 0)
-    pending = counts.get("pending", 0)
-    processing = counts.get("processing", 0)
-    failed = counts.get("verification_failed", 0) + counts.get("needs_review", 0)
-    mismatches = int(reconciliation_mask(df).sum()) if total else 0
+# ============================================================
+# CLICKHOUSE AYARLARI
+# ============================================================
 
-    cols = st.columns(6)
-    cols[0].metric("Toplam Dosya", f"{total:,}")
-    cols[1].metric("Tamamlandı", f"{done:,}")
-    cols[2].metric("Bekliyor", f"{pending:,}")
-    cols[3].metric("İşleniyor", f"{processing:,}")
-    cols[4].metric("Hatalı / İnceleme Bekliyor", f"{failed:,}")
-    cols[5].metric(
-        "Mutabakat Uyuşmazlığı",
-        f"{mismatches:,}",
-        delta=None if mismatches == 0 else "dikkat",
-        delta_color="inverse",
+def get_clickhouse_host() -> str:
+    return os.environ.get(
+        "CLICKHOUSE_HOST",
+        "localhost",
     )
 
 
-def render_status_chart(df: pd.DataFrame) -> None:
-    st.subheader("Durum Dağılımı")
-    if df.empty:
-        st.info("Henüz manifest kaydı yok.")
-        return
-    status_counts = df["status"].value_counts().rename_axis("status").reset_index(name="count")
-    st.bar_chart(status_counts.set_index("status"))
+def get_clickhouse_port() -> int:
+    return int(
+        os.environ.get(
+            "CLICKHOUSE_PORT",
+            "8123",
+        )
+    )
 
 
-def render_reconciliation_table(df: pd.DataFrame) -> None:
-    st.subheader("Üç Katman Mutabakat Kontrolü (tab / parquet / clickhouse)")
-    mismatched = df[reconciliation_mask(df)]
-    if mismatched.empty:
-        st.success("Tamamlanan kayıtlarda satır sayısı uyuşmazlığı bulunamadı.")
-    else:
-        st.warning(f"{len(mismatched)} kayıtta katmanlar arası satır sayısı uyuşmuyor.")
-        st.dataframe(
-            mismatched[
-                [
-                    "tab_file_name",
-                    "row_count_tab",
-                    "row_count_parquet",
-                    "row_count_clickhouse",
-                    "updated_at",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
+def get_clickhouse_user() -> str:
+    return os.environ.get(
+        "CLICKHOUSE_USER",
+        "default",
+    )
+
+
+def get_clickhouse_password() -> str:
+    return os.environ.get(
+        "CLICKHOUSE_PASSWORD",
+        "",
+    )
+
+
+def get_clickhouse_database() -> str:
+    return os.environ.get(
+        "CLICKHOUSE_DATABASE",
+        "default",
+    )
+
+
+def get_clickhouse_table() -> str:
+    return os.environ.get(
+        "CLICKHOUSE_TABLE",
+        "telemetry",
+    )
+
+
+# ============================================================
+# CLICKHOUSE CLIENT
+# ============================================================
+
+def get_clickhouse_client():
+
+    return clickhouse_connect.get_client(
+        host=get_clickhouse_host(),
+        port=get_clickhouse_port(),
+        username=get_clickhouse_user(),
+        password=get_clickhouse_password(),
+        database=get_clickhouse_database(),
+    )
+
+
+# ============================================================
+# CLICKHOUSE KONTROL
+# ============================================================
+
+@st.cache_data(ttl=30)
+def check_clickhouse_connection() -> bool:
+
+    client = get_clickhouse_client()
+
+    result = client.query(
+        "SELECT 1"
+    )
+
+    return bool(result.result_rows)
+
+
+# ============================================================
+# CLICKHOUSE TABLO ŞEMASI
+# ============================================================
+
+@st.cache_data(ttl=30)
+def get_clickhouse_schema() -> pd.DataFrame:
+
+    client = get_clickhouse_client()
+
+    query = f"""
+    DESCRIBE TABLE {get_clickhouse_table()}
+    """
+
+    result = client.query(query)
+
+    rows = []
+
+    for row in result.result_rows:
+
+        rows.append(
+            {
+                "kolon": row[0],
+                "tip": row[1],
+                "default_type": row[2],
+                "default_expression": row[3],
+            }
         )
 
+    return pd.DataFrame(rows)
 
-def render_error_table(df: pd.DataFrame) -> None:
-    st.subheader("Hatalı / İncelenmesi Gereken Kayıtlar")
-    errored = df[df["status"].isin(["verification_failed", "needs_review"])]
-    if errored.empty:
-        st.success("Hatalı veya incelemede kayıt yok.")
-        return
-    st.dataframe(
-        errored[
-            [
-                "tab_file_name",
+
+@st.cache_data(ttl=30)
+def get_available_columns() -> list:
+
+    schema = get_clickhouse_schema()
+
+    if schema.empty:
+        return []
+
+    return schema["kolon"].tolist()
+
+
+# ============================================================
+# CLICKHOUSE FLIGHT / CLASS BİLGİLERİ
+# ============================================================
+
+@st.cache_data(ttl=60)
+def get_available_classes() -> list:
+
+    columns = get_available_columns()
+
+    if "class" not in columns:
+        return []
+
+    client = get_clickhouse_client()
+
+    query = f"""
+    SELECT DISTINCT class
+    FROM {get_clickhouse_table()}
+    ORDER BY class
+    """
+
+    result = client.query(query)
+
+    return [
+        row[0]
+        for row in result.result_rows
+    ]
+
+
+# ============================================================
+# TIME ARALIĞI
+# ============================================================
+
+def get_time_range():
+
+    client = get_clickhouse_client()
+
+    query = f"""
+    SELECT
+        min(time),
+        max(time)
+    FROM {get_clickhouse_table()}
+    """
+
+    result = client.query(query)
+
+    if not result.result_rows:
+        return None, None
+
+    min_time = result.result_rows[0][0]
+    max_time = result.result_rows[0][1]
+
+    return min_time, max_time
+
+
+# ============================================================
+# CLICKHOUSE WHERE OLUŞTURMA
+# ============================================================
+
+def build_clickhouse_where(
+    start_time=None,
+    end_time=None,
+    selected_classes=None,
+):
+
+    conditions = []
+    parameters = {}
+
+    if start_time is not None:
+
+        conditions.append(
+            "time >= {start_time:DateTime}"
+        )
+
+        parameters["start_time"] = start_time
+
+    if end_time is not None:
+
+        conditions.append(
+            "time <= {end_time:DateTime}"
+        )
+
+        parameters["end_time"] = end_time
+
+    if selected_classes:
+
+        conditions.append(
+            "class IN {classes:Array(String)}"
+        )
+
+        parameters["classes"] = [
+            str(x)
+            for x in selected_classes
+        ]
+
+    if not conditions:
+        return "1 = 1", parameters
+
+    return (
+        " AND ".join(conditions),
+        parameters,
+    )
+
+
+# ============================================================
+# SATIR SAYISI
+# ============================================================
+
+def count_filtered_rows(
+    start_time=None,
+    end_time=None,
+    selected_classes=None,
+):
+
+    client = get_clickhouse_client()
+
+    where, parameters = build_clickhouse_where(
+        start_time,
+        end_time,
+        selected_classes,
+    )
+
+    query = f"""
+    SELECT count() FROM (
+        SELECT DISTINCT *
+        FROM {get_clickhouse_table()}
+        WHERE {where}
+    )
+    """
+
+    result = client.query(
+        query,
+        parameters=parameters,
+    )
+
+    return int(
+        result.result_rows[0][0]
+    )
+
+
+# ============================================================
+# VERİ GETİRME
+# ============================================================
+
+def fetch_filtered_telemetry(
+    start_time=None,
+    end_time=None,
+    selected_classes=None,
+    columns=None,
+):
+
+    client = get_clickhouse_client()
+
+    where, parameters = build_clickhouse_where(
+        start_time,
+        end_time,
+        selected_classes,
+    )
+
+    if columns:
+
+        # Güvenlik açısından sadece mevcut kolonları kullan
+        available = set(
+            get_available_columns()
+        )
+
+        valid_columns = [
+            col
+            for col in columns
+            if col in available
+        ]
+
+        if not valid_columns:
+            col_expr = "*"
+        else:
+            col_expr = ", ".join(
+                f"`{col}`"
+                for col in valid_columns
+            )
+
+    else:
+
+        col_expr = "*"
+
+    query = f"""
+    SELECT DISTINCT {col_expr}
+    FROM {get_clickhouse_table()}
+    WHERE {where}
+    ORDER BY time
+    """
+
+    return client.query_df(
+        query,
+        parameters=parameters,
+    )
+
+
+# ============================================================
+# GRAPHQL REQUEST
+# ============================================================
+
+def run_graphql(
+    query: str,
+    variables: dict | None = None,
+) -> dict:
+
+    response = requests.post(
+        get_graphql_url(),
+        json={
+            "query": query,
+            "variables": variables or {},
+        },
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if payload.get("errors"):
+
+        raise RuntimeError(
+            payload["errors"][0].get(
+                "message",
+                "GraphQL hatası",
+            )
+        )
+
+    return payload["data"]
+
+
+# ============================================================
+# TIMESTAMP
+# ============================================================
+
+def epoch_to_dt(value):
+
+    if value is None:
+        return None
+
+    value = float(value)
+
+    if value > 10_000_000_000:
+        value /= 1000
+
+    return datetime.fromtimestamp(
+        value,
+        tz=timezone.utc,
+    )
+
+
+# ============================================================
+# DAGSTER RUN'LARI
+# ============================================================
+
+@st.cache_data(ttl=10)
+def fetch_runs(
+    limit: int = 50,
+) -> pd.DataFrame:
+
+    data = run_graphql(
+        RUNS_QUERY,
+        {
+            "limit": limit
+        },
+    )
+
+    runs_result = data[
+        "runsOrError"
+    ]
+
+    if runs_result["__typename"] == "PythonError":
+
+        raise RuntimeError(
+            runs_result["message"]
+        )
+
+    rows = []
+
+    for run in runs_result["results"]:
+
+        start = epoch_to_dt(
+            run.get("startTime")
+        )
+
+        end = epoch_to_dt(
+            run.get("endTime")
+        )
+
+        duration = None
+
+        if start and end:
+
+            duration = (
+                end - start
+            ).total_seconds()
+
+        rows.append(
+            {
+                "run_id": run["runId"],
+                "job": run.get("jobName"),
+                "status": run["status"],
+                "start": start,
+                "end": end,
+                "duration_sn": (
+                    round(duration, 1)
+                    if duration is not None
+                    else None
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# METADATA OKUMA
+# ============================================================
+
+def parse_json_metadata(value):
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+
+        try:
+            return json.loads(value)
+
+        except Exception:
+            return value
+
+    return value
+
+
+def flatten_metadata(entries):
+
+    flat = {}
+
+    for entry in entries or []:
+
+        label = entry.get(
+            "label",
+            "?",
+        )
+
+        typename = entry.get(
+            "__typename",
+            "",
+        )
+
+        if typename == "TextMetadataEntry":
+
+            value = entry.get("text")
+
+        elif typename == "IntMetadataEntry":
+
+            value = entry.get("intValue")
+
+        elif typename == "FloatMetadataEntry":
+
+            value = entry.get("floatValue")
+
+        elif typename == "BoolMetadataEntry":
+
+            value = entry.get("boolValue")
+
+        elif typename == "MarkdownMetadataEntry":
+
+            value = entry.get("mdStr")
+
+        elif typename == "JsonMetadataEntry":
+
+            value = parse_json_metadata(
+                entry.get("jsonString")
+            )
+
+        elif typename == "UrlMetadataEntry":
+
+            value = entry.get("url")
+
+        elif typename == "PathMetadataEntry":
+
+            value = entry.get("path")
+
+        else:
+
+            value = entry.get(
+                "description"
+            )
+
+        flat[label] = value
+
+    return flat
+
+
+# ============================================================
+# ASSET CATALOG
+# ============================================================
+
+@st.cache_data(ttl=10)
+def fetch_asset_catalog() -> pd.DataFrame:
+
+    data = run_graphql(
+        ASSET_CATALOG_QUERY
+    )
+
+    nodes = data["assetNodes"]
+
+    rows = []
+
+    for node in nodes:
+
+        key = "/".join(
+            node["assetKey"]["path"]
+        )
+
+        materializations = (
+            node.get(
+                "assetMaterializations"
+            )
+            or []
+        )
+
+        latest = (
+            materializations[0]
+            if materializations
+            else None
+        )
+
+        metadata = (
+            flatten_metadata(
+                latest[
+                    "metadataEntries"
+                ]
+            )
+            if latest
+            else {}
+        )
+
+        rows.append(
+            {
+                "asset": key,
+                "grup": node.get(
+                    "groupName"
+                ),
+                "aciklama": node.get(
+                    "description"
+                ),
+                "son_materialize": (
+                    epoch_to_dt(
+                        latest["timestamp"]
+                    )
+                    if latest
+                    else None
+                ),
+                "run_id": (
+                    latest.get("runId")
+                    if latest
+                    else None
+                ),
+                "metadata": metadata,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# ===========================================================================
+# ALERT DOSYASI
+# ===========================================================================
+
+def get_alert_file() -> Path:
+    """
+    Alert dosyasını farklı çalışma dizinlerinde bulmaya çalışır.
+
+    Olası konumlar:
+
+        dashboard/data/alerts/alerts.json
+
+        dagster/data/alerts/alerts.json
+
+    Ayrıca ALERT_FILE environment variable ile doğrudan
+    dosya yolu verilebilir.
+    """
+
+    explicit = os.environ.get(
+        "ALERT_FILE"
+    )
+
+    if explicit:
+
+        return Path(explicit)
+
+    current_dir = Path(__file__).resolve().parent
+
+    candidates = [
+
+        current_dir
+        / "data"
+        / "alerts"
+        / "alerts.json",
+
+        current_dir.parent
+        / "dagster"
+        / "data"
+        / "alerts"
+        / "alerts.json",
+
+        Path.cwd()
+        / "data"
+        / "alerts"
+        / "alerts.json",
+
+    ]
+
+    for candidate in candidates:
+
+        if candidate.exists():
+
+            return candidate
+
+    # Varsayılan
+    return candidates[1]
+
+
+@st.cache_data(ttl=5)
+def load_alerts() -> pd.DataFrame:
+
+    alert_file = get_alert_file()
+
+    if not alert_file.exists():
+
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "job_name",
+                "step_name",
+                "error",
                 "status",
-                "attempt_count",
-                "max_attempts",
-                "error_detail",
-                "updated_at",
+            ]
+        )
+
+    try:
+
+        content = alert_file.read_text(
+            encoding="utf-8"
+        )
+
+        alerts = json.loads(
+            content
+        )
+
+    except Exception:
+
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "job_name",
+                "step_name",
+                "error",
+                "status",
+            ]
+        )
+
+    if not isinstance(
+        alerts,
+        list,
+    ):
+
+        return pd.DataFrame()
+
+    if not alerts:
+
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                "job_name",
+                "step_name",
+                "error",
+                "status",
+            ]
+        )
+
+    df = pd.DataFrame(
+        alerts
+    )
+
+    if "timestamp" in df.columns:
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce",
+        )
+
+    return df.sort_values(
+        "timestamp",
+        ascending=False,
+    ).reset_index(drop=True)
+
+
+# ============================================================
+# PIPELINE KPI
+# ============================================================
+
+def render_run_kpis(
+    df: pd.DataFrame,
+):
+
+    total = len(df)
+
+    counts = (
+        df["status"]
+        .value_counts()
+        .to_dict()
+        if total
+        else {}
+    )
+
+    success = counts.get(
+        "SUCCESS",
+        0,
+    )
+
+    failure = counts.get(
+        "FAILURE",
+        0,
+    )
+
+    in_progress = (
+        counts.get(
+            "STARTED",
+            0,
+        )
+        + counts.get(
+            "STARTING",
+            0,
+        )
+        + counts.get(
+            "QUEUED",
+            0,
+        )
+    )
+
+    columns = st.columns(4)
+
+    columns[0].metric(
+        "Son Run Sayısı",
+        f"{total:,}",
+    )
+
+    columns[1].metric(
+        "Başarılı",
+        f"{success:,}",
+    )
+
+    columns[2].metric(
+        "Hatalı",
+        f"{failure:,}",
+    )
+
+    columns[3].metric(
+        "Sürüyor / Kuyrukta",
+        f"{in_progress:,}",
+    )
+
+
+# ============================================================
+# RUN TABLOSU
+# ============================================================
+
+def render_run_table(
+    df: pd.DataFrame,
+):
+
+    if df.empty:
+
+        st.info(
+            "Henüz run kaydı yok."
+        )
+
+        return
+
+    ui_url = get_ui_url()
+
+    display = df.copy()
+
+    display["Dagster UI"] = display[
+        "run_id"
+    ].apply(
+        lambda run_id:
+        f"{ui_url}/runs/{run_id}"
+    )
+
+    st.dataframe(
+        display[
+            [
+                "run_id",
+                "job",
+                "status",
+                "start",
+                "end",
+                "duration_sn",
+                "Dagster UI",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Dagster UI":
+                st.column_config.LinkColumn(
+                    "Dagster UI",
+                    display_text="Aç",
+                )
+        },
+    )
+
+
+# ============================================================
+# RUN STATUS CHART
+# ============================================================
+
+def render_status_chart(
+    df: pd.DataFrame,
+):
+
+    if df.empty:
+        return
+
+    status_counts = (
+        df["status"]
+        .value_counts()
+        .rename_axis("status")
+        .reset_index(
+            name="count"
+        )
+    )
+
+    st.bar_chart(
+        status_counts.set_index(
+            "status"
+        )
+    )
+
+
+# ============================================================
+# KATALOG
+# ============================================================
+
+def render_catalog(
+    df: pd.DataFrame,
+):
+
+    if df.empty:
+
+        st.info(
+            "Henüz asset yok."
+        )
+
+        return
+
+    search = st.text_input(
+        "Asset ara"
+    )
+
+    filtered = df
+
+    if search:
+
+        filtered = df[
+            df["asset"].str.contains(
+                search,
+                case=False,
+                na=False,
+            )
+        ]
+
+    st.dataframe(
+        filtered[
+            [
+                "asset",
+                "grup",
+                "son_materialize",
+                "aciklama",
             ]
         ],
         use_container_width=True,
         hide_index=True,
     )
 
-
-def render_full_table(df: pd.DataFrame) -> None:
-    st.subheader("Katalog")
-
-    status_filter = st.multiselect(
-        "Duruma göre filtrele",
-        options=sorted(df["status"].unique().tolist()) if not df.empty else [],
-        default=[],
-    )
-    filtered = df if not status_filter else df[df["status"].isin(status_filter)]
-
-    search = st.text_input("Dosya adı / uçuş id ara")
-    if search:
-        mask = filtered["tab_file_name"].str.contains(search, case=False, na=False) | filtered[
-            "flight_id"
-        ].astype(str).str.contains(search, case=False, na=False)
-        filtered = filtered[mask]
-
-    st.dataframe(filtered, use_container_width=True, hide_index=True)
-
-
-def main() -> None:
-    st.title("İHA Veri Platformu — Katalog & Pipeline Metrikleri")
     st.caption(
-        "conversion_manifest tablosundan canlı okunur "
-        "(A2'nin dvc/pipeline'ı ve A1'in ingestion'ı burada görünmez, "
-        "yalnızca tab -> parquet -> clickhouse dağıtım durumu izlenir)."
+        "Asset metadata detayları:"
     )
 
-    with st.sidebar:
-        st.header("Ayarlar")
-        refresh_label = st.selectbox("Otomatik yenileme", list(REFRESH_OPTIONS.keys()), index=2)
-        refresh_seconds = REFRESH_OPTIONS[refresh_label]
-        if st.button("Şimdi yenile"):
-            load_manifest.clear()
-        st.caption(f"Son sorgu: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    for _, row in filtered.iterrows():
 
-    if refresh_seconds:
-        st_autorefresh(interval=refresh_seconds * 1000, key="manifest_refresh")
+        metadata = row[
+            "metadata"
+        ]
+
+        if not metadata:
+            continue
+
+        with st.expander(
+            f"{row['asset']} — metadata"
+        ):
+
+            metadata_rows = []
+
+            for key, value in metadata.items():
+
+                if isinstance(
+                    value,
+                    (dict, list),
+                ):
+
+                    value = json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                metadata_rows.append(
+                    {
+                        "alan": key,
+                        "değer": value,
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    metadata_rows
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+# ===========================================================================
+# ALERT DASHBOARD
+# ===========================================================================
+
+def render_alerts(
+    runs_df: pd.DataFrame,
+) -> None:
+
+    st.subheader(
+        "🚨 Pipeline Alertleri"
+    )
+
+    alerts_df = load_alerts()
+
+    # -----------------------------------------------------------------------
+    # Üst KPI'lar
+    # -----------------------------------------------------------------------
+
+    total_alerts = len(
+        alerts_df
+    )
+
+    failed_runs = 0
+
+    if not runs_df.empty:
+
+        failed_runs = int(
+            (
+                runs_df["status"]
+                == "FAILURE"
+            ).sum()
+        )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Kayıtlı Alert",
+        f"{total_alerts:,}",
+    )
+
+    col2.metric(
+        "Başarısız Run",
+        f"{failed_runs:,}",
+    )
+
+    if total_alerts > 0:
+
+        last_alert = alerts_df.iloc[0][
+            "timestamp"
+        ]
+
+        col3.metric(
+            "Son Alert",
+            str(last_alert),
+        )
+
+    else:
+
+        col3.metric(
+            "Son Alert",
+            "Yok",
+        )
+
+    st.divider()
+
+    # -----------------------------------------------------------------------
+    # Alert dosyası bilgisi
+    # -----------------------------------------------------------------------
+
+    alert_file = get_alert_file()
+
+    st.caption(
+        f"Alert kaynağı: `{alert_file}`"
+    )
+
+    # -----------------------------------------------------------------------
+    # JSON alert kayıtları
+    # -----------------------------------------------------------------------
+
+    if not alerts_df.empty:
+
+        st.subheader(
+            "Hook Tarafından Kaydedilen Alertler"
+        )
+
+        display = alerts_df.copy()
+
+        st.dataframe(
+            display[
+                [
+                    "timestamp",
+                    "job_name",
+                    "step_name",
+                    "status",
+                    "error",
+                ]
+            ],
+
+            use_container_width=True,
+
+            hide_index=True,
+        )
+
+        st.divider()
+
+        st.subheader(
+            "Hata Detayı"
+        )
+
+        for index, row in alerts_df.iterrows():
+
+            timestamp = row.get(
+                "timestamp",
+                "",
+            )
+
+            job_name = row.get(
+                "job_name",
+                "unknown",
+            )
+
+            step_name = row.get(
+                "step_name",
+                "unknown",
+            )
+
+            error = row.get(
+                "error",
+                "Bilinmeyen hata",
+            )
+
+            with st.expander(
+                f"🚨 {job_name} → {step_name} | {timestamp}"
+            ):
+
+                st.markdown(
+                    f"**Job:** `{job_name}`"
+                )
+
+                st.markdown(
+                    f"**Step:** `{step_name}`"
+                )
+
+                st.markdown(
+                    f"**Zaman:** `{timestamp}`"
+                )
+
+                st.error(
+                    error
+                )
+
+    else:
+
+        st.success(
+            "🎉 Henüz kayıtlı bir pipeline alert'i yok."
+        )
+
+    # -----------------------------------------------------------------------
+    # Başarısız Dagster run'ları
+    # -----------------------------------------------------------------------
+
+    st.divider()
+
+    st.subheader(
+        "Dagster'daki Başarısız Run'lar"
+    )
+
+    if runs_df.empty:
+
+        st.info(
+            "Henüz Dagster run bilgisi yok."
+        )
+
+        return
+
+    failures = runs_df[
+        runs_df["status"]
+        == "FAILURE"
+    ].copy()
+
+    if failures.empty:
+
+        st.success(
+            "Son run'lar içerisinde başarısız pipeline bulunmuyor."
+        )
+
+        return
+
+    ui_url = get_ui_url()
+
+    failures["Dagster UI"] = (
+        failures["run_id"].apply(
+            lambda rid:
+                f"{ui_url}/runs/{rid}"
+        )
+    )
+
+    st.dataframe(
+
+        failures[
+            [
+                "run_id",
+                "job",
+                "status",
+                "start",
+                "end",
+                "duration_sn",
+                "Dagster UI",
+            ]
+        ],
+
+        use_container_width=True,
+
+        hide_index=True,
+
+        column_config={
+            "Dagster UI":
+                st.column_config.LinkColumn(
+                    "Dagster UI",
+                    display_text="Aç",
+                ),
+        },
+    )
+
+
+# ============================================================
+# VERİ GÖZAT / DIŞA AKTAR
+# ============================================================
+
+def render_data_export():
+
+    st.subheader(
+        "AU-AIR Telemetri Verisi"
+    )
+
+    st.caption(
+        f"Backend: **ClickHouse** | "
+        f"Tablo: `{get_clickhouse_database()}.{get_clickhouse_table()}`"
+    )
+
+    # --------------------------------------------------------
+    # ClickHouse bağlantısı
+    # --------------------------------------------------------
 
     try:
-        df = load_manifest()
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Veritabanına bağlanılamadı: {exc}")
-        st.stop()
 
-    render_kpis(df)
+        check_clickhouse_connection()
+
+    except Exception as exc:
+
+        st.error(
+            f"ClickHouse'a bağlanılamadı: {exc}"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Şema
+    # --------------------------------------------------------
+
+    try:
+
+        schema = get_clickhouse_schema()
+
+    except Exception as exc:
+
+        st.error(
+            f"ClickHouse tablo şeması okunamadı: {exc}"
+        )
+
+        return
+
+    if schema.empty:
+
+        st.warning(
+            "ClickHouse tablosunda kolon bulunamadı."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Time aralığı
+    # --------------------------------------------------------
+
+    try:
+
+        min_time, max_time = get_time_range()
+
+    except Exception as exc:
+
+        st.error(
+            f"Time aralığı okunamadı: {exc}"
+        )
+
+        return
+
+    if min_time is None or max_time is None:
+
+        st.warning(
+            "Telemetry tablosunda veri bulunamadı."
+        )
+
+        return
+
+    st.write(
+        f"**Veri aralığı:** "
+        f"{min_time} → {max_time}"
+    )
+
     st.divider()
 
-    left, right = st.columns([1, 1])
-    with left:
-        render_status_chart(df)
-    with right:
-        render_error_table(df)
+    # --------------------------------------------------------
+    # Filtreler
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Veri Filtreleme"
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        start_time = st.datetime_input(
+            "Başlangıç zamanı",
+            value=min_time,
+        )
+
+    with col2:
+
+        end_time = st.datetime_input(
+            "Bitiş zamanı",
+            value=max_time,
+        )
+
+    # --------------------------------------------------------
+    # Class filtresi
+    # --------------------------------------------------------
+
+    try:
+
+        available_classes = (
+            get_available_classes()
+        )
+
+    except Exception:
+
+        available_classes = []
+
+    selected_classes = []
+
+    if available_classes:
+
+        selected_classes = st.multiselect(
+            "Class",
+            options=available_classes,
+            help="Boş bırakılırsa tüm class değerleri seçilir.",
+        )
+
+    # --------------------------------------------------------
+    # Kolon seçimi
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Kolon Seçimi"
+    )
+
+    available_columns = (
+        get_available_columns()
+    )
+
+    default_columns = [
+        column
+        for column in AU_AIR_COLUMNS
+        if column in available_columns
+    ]
+
+    selected_columns = st.multiselect(
+        "Gösterilecek / dışa aktarılacak kolonlar",
+        options=available_columns,
+        default=default_columns,
+    )
+
+    columns = (
+        selected_columns
+        if selected_columns
+        else None
+    )
+
+    # --------------------------------------------------------
+    # Tarih kontrolü
+    # --------------------------------------------------------
+
+    if start_time > end_time:
+
+        st.error(
+            "Başlangıç zamanı bitiş zamanından sonra olamaz."
+        )
+
+        return
 
     st.divider()
-    render_reconciliation_table(df)
-    st.divider()
-    render_full_table(df)
 
+    # --------------------------------------------------------
+    # SATIR SAYISI
+    # --------------------------------------------------------
+
+    if st.button(
+        "Satır Sayısını Hesapla",
+        type="secondary",
+    ):
+
+        try:
+
+            with st.spinner(
+                "Satır sayısı hesaplanıyor..."
+            ):
+
+                row_count = count_filtered_rows(
+                    start_time=start_time,
+                    end_time=end_time,
+                    selected_classes=selected_classes,
+                )
+
+            st.session_state[
+                "export_row_count"
+            ] = row_count
+
+            st.success(
+                f"Filtreye uyan satır sayısı: "
+                f"**{row_count:,}**"
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"Sorgu çalıştırılamadı: {exc}"
+            )
+
+            return
+
+    row_count = st.session_state.get(
+        "export_row_count"
+    )
+
+    if row_count is None:
+        return
+
+    # --------------------------------------------------------
+    # SONUÇ YOK
+    # --------------------------------------------------------
+
+    if row_count == 0:
+
+        st.warning(
+            "Seçilen filtrelerle eşleşen veri yok."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # EXPORT LIMIT
+    # --------------------------------------------------------
+
+    if row_count > MAX_EXPORT_ROWS:
+
+        st.warning(
+            f"{row_count:,} satır çok fazla. "
+            f"Mevcut export limiti: "
+            f"{MAX_EXPORT_ROWS:,} satır."
+        )
+
+        st.info(
+            "Lütfen zaman aralığını veya class filtresini daraltın."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # VERİ GETİR
+    # --------------------------------------------------------
+
+    if st.button(
+        "Veriyi Getir ve Önizle",
+        type="primary",
+    ):
+
+        try:
+
+            with st.spinner(
+                "ClickHouse'dan veri okunuyor..."
+            ):
+
+                dataframe = fetch_filtered_telemetry(
+                    start_time=start_time,
+                    end_time=end_time,
+                    selected_classes=selected_classes,
+                    columns=columns,
+                )
+
+            st.session_state[
+                "export_df"
+            ] = dataframe
+
+        except Exception as exc:
+
+            st.error(
+                f"Veri okunamadı: {exc}"
+            )
+
+            return
+
+    dataframe = st.session_state.get(
+        "export_df"
+    )
+
+    if dataframe is None:
+        return
+
+    # --------------------------------------------------------
+    # ÖNİZLEME
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.subheader(
+        "Veri Önizleme"
+    )
+
+    st.info(
+        f"Toplam {len(dataframe):,} satır getirildi."
+    )
+
+    st.dataframe(
+        dataframe.head(200),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "Yukarıdaki tablo ilk 200 satırı gösterir. "
+        "CSV dosyasında seçilen tüm satırlar bulunur."
+    )
+
+    # --------------------------------------------------------
+    # CSV EXPORT
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.subheader(
+        "Dışa Aktar"
+    )
+
+    csv_data = dataframe.to_csv(
+        index=False
+    ).encode(
+        "utf-8-sig"
+    )
+
+    filename = (
+        f"au_air_telemetry_"
+        f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
+        f"{end_time.strftime('%Y%m%d_%H%M%S')}.csv"
+    )
+
+    st.download_button(
+        label="CSV olarak indir",
+        data=csv_data,
+        file_name=filename,
+        mime="text/csv",
+        type="primary",
+    )
+
+    st.caption(
+        f"CSV dosyası: {len(dataframe):,} satır, "
+        f"{len(dataframe.columns)} kolon"
+    )
+
+
+# ============================================================
+# ANA UYGULAMA
+# ============================================================
+
+def main():
+
+    st.title(
+        "İHA Veri Platformu — Pipeline Metrikleri & Katalog"
+    )
+
+    st.caption(
+        "Kaynak: Dagster GraphQL API + ClickHouse. "
+        "Katalog verisi Dagster asset materialization metadata'sından, "
+        "telemetri verisi ise ClickHouse üzerinden okunmaktadır."
+    )
+
+    # ========================================================
+    # SIDEBAR
+    # ========================================================
+
+    with st.sidebar:
+
+        st.header(
+            "Ayarlar"
+        )
+
+        st.caption(
+            f"Dagster GraphQL: "
+            f"{get_graphql_url()}"
+        )
+
+        st.caption(
+            f"ClickHouse: "
+            f"{get_clickhouse_host()}:{get_clickhouse_port()}"
+        )
+
+        st.caption(
+            f"Tablo: "
+            f"{get_clickhouse_database()}."
+            f"{get_clickhouse_table()}"
+        )
+
+        st.divider()
+
+        run_limit = st.slider(
+            "Gösterilecek run sayısı",
+            10,
+            200,
+            50,
+            step=10,
+        )
+
+        refresh_label = st.selectbox(
+            "Otomatik yenileme",
+            list(
+                REFRESH_OPTIONS.keys()
+            ),
+            index=2,
+        )
+
+        refresh_seconds = (
+            REFRESH_OPTIONS[
+                refresh_label
+            ]
+        )
+
+        if st.button(
+            "Şimdi yenile"
+        ):
+
+            fetch_runs.clear()
+            fetch_asset_catalog.clear()
+            load_alerts.clear()
+            get_available_columns.clear()
+            get_clickhouse_schema.clear()
+            get_available_classes.clear()
+            check_clickhouse_connection.clear()
+
+            st.rerun()
+
+        st.caption(
+            "Son sorgu: "
+            f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+        )
+
+    # ========================================================
+    # AUTO REFRESH
+    # ========================================================
+
+    if refresh_seconds:
+
+        st_autorefresh(
+            interval=refresh_seconds * 1000,
+            key="dashboard_refresh",
+        )
+
+    # ========================================================
+    # RUN VERİSİNİ BİR KEZ ÇEK
+    # ========================================================
+
+    try:
+
+        runs_df = fetch_runs(
+            run_limit
+        )
+
+    except Exception as exc:
+
+        runs_df = pd.DataFrame()
+
+        st.error(
+            f"Dagster'a bağlanılamadı: {exc}"
+        )
+
+    # ========================================================
+    # TABS
+    # ========================================================
+
+    tab_runs, tab_catalog, tab_alerts, tab_export = st.tabs(
+        [
+            "Pipeline Metrikleri",
+            "Katalog",
+            "🚨 Alertler",
+            "Veri Gözat / Dışa Aktar",
+        ]
+    )
+
+    # ========================================================
+    # PIPELINE METRİKLERİ
+    # ========================================================
+
+    with tab_runs:
+
+        if not runs_df.empty:
+
+            render_run_kpis(
+                runs_df
+            )
+
+            st.divider()
+
+            left, right = st.columns(
+                [1, 1]
+            )
+
+            with left:
+
+                st.subheader(
+                    "Durum Dağılımı"
+                )
+
+                render_status_chart(
+                    runs_df
+                )
+
+            with right:
+
+                st.subheader(
+                    "Son Run'lar"
+                )
+
+            render_run_table(
+                runs_df
+            )
+            
+        else:
+
+            st.info(
+                "Gösterilecek run bulunamadı."
+            )
+
+    # ========================================================
+    # KATALOG
+    # ========================================================
+
+    with tab_catalog:
+
+        try:
+
+            catalog_df = (
+                fetch_asset_catalog()
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"Katalog okunamadı: {exc}"
+            )
+
+        else:
+
+            render_catalog(
+                catalog_df
+            )
+            
+    # ========================================================
+    # ALERTS
+    # ========================================================
+
+    with tab_alerts:
+    
+        render_alerts(
+            runs_df
+        )
+
+    # ========================================================
+    # VERİ GÖZAT / EXPORT
+    # ========================================================
+
+    with tab_export:
+
+        render_data_export()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()

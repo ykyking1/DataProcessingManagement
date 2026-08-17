@@ -1,5 +1,6 @@
 streamlit==1.38.0
 pandas==2.2.2
-sqlalchemy==2.0.32
-psycopg2-binary==2.9.9
+requests==2.32.3
 streamlit-autorefresh==1.0.1
+pyarrow==17.0.0
+clickhouse-connect==1.7.1

@@ -1,29 +1,58 @@
+import pandas as pd
+
 from dagster import asset, MaterializeResult
+
 
 @asset(
     group_name="processing",
     description="Raw telemetri verisini işleyerek curated katmana hazırlar.",
 )
 def processed_telemetry(raw_uav_telemetry):
-    """
-    A2 preprocessing pipeline'ını çalıştırır.
 
-    raw_uav_telemetry:
-        A1 asset'inin çıktısı.
-    """
+    df = raw_uav_telemetry.copy()
 
-    print("A2 preprocessing çalıştırılıyor...")
+    df["time"] = pd.to_datetime(
+        df["time"],
+        errors="coerce"
+    )
 
-    # TODO:
-    #
-    # from processing.preprocess import preprocess_telemetry
-    #
-    # result = preprocess_telemetry(raw_uav_telemetry)
+    numeric_columns = [
+        "latitude",
+        "longitude",
+        "altitude",
+        "velocity_x",
+        "velocity_y",
+        "velocity_z",
+        "roll",
+        "pitch",
+        "yaw",
+        "box_x",
+        "box_y",
+        "box_w",
+        "box_h",
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=[
+            "time",
+            "latitude",
+            "longitude",
+        ]
+    )
+
+    df = df.drop_duplicates()
 
     return MaterializeResult(
+        value=df,
         metadata={
-            "status": "success",
-            "layer": "curated",
-            "source": "raw_uav_telemetry",
-        }
+            "row_count": len(df),
+            "column_count": len(df.columns),
+            "columns": ", ".join(df.columns),
+        },
     )
