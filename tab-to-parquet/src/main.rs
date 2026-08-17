@@ -162,16 +162,26 @@ fn convert(
                     }
                 }
 
+                // NOT: Vec<f64>'ün sahipliğini Float64Array doğrudan alabiliyor
+                // (From<Vec<f64>>) -- .clone() + sonrasında .clear() yapmak
+                // gereksiz bir tam kopya demekti (1000 sütunda flush başına
+                // ~400MB boşa memcpy). mem::replace ile sahipliği devralıp
+                // yerine taze/boş bir Vec bırakıyoruz -- hem kopya yok hem
+                // bir sonraki chunk için kapasite hazır (2026-08-15 düzeltmesi,
+                // bkz. docs/plan_dokumani.md).
+                let n = buf_ts.len();
                 let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_columns + 1);
-                arrays.push(Arc::new(Float64Array::from(buf_ts.clone())));
-                for col in &buf_vals {
-                    arrays.push(Arc::new(Float64Array::from(col.clone())));
+                let ts_owned = std::mem::replace(&mut buf_ts, Vec::with_capacity(chunk_rows));
+                arrays.push(Arc::new(Float64Array::from(ts_owned)));
+                for col in buf_vals.iter_mut() {
+                    let owned = std::mem::replace(col, Vec::with_capacity(chunk_rows));
+                    arrays.push(Arc::new(Float64Array::from(owned)));
                 }
                 let batch = RecordBatch::try_new(schema.clone(), arrays)
                     .expect("record batch oluşturulamadı");
                 writer.write(&batch).expect("parquet'e yazılamadı");
 
-                row_count += buf_ts.len() as u64;
+                row_count += n as u64;
                 chunk_idx += 1;
                 let elapsed = t0.elapsed().as_secs_f64();
                 let rate = if elapsed > 0.0 {
@@ -180,14 +190,8 @@ fn convert(
                     0.0
                 };
                 println!(
-                    "  Parça {chunk_idx}: {} satır (toplam {row_count}, {rate:.0} satır/sn)",
-                    buf_ts.len()
+                    "  Parça {chunk_idx}: {n} satır (toplam {row_count}, {rate:.0} satır/sn)"
                 );
-
-                buf_ts.clear();
-                for col in buf_vals.iter_mut() {
-                    col.clear();
-                }
             }
         };
     }

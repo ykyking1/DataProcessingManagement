@@ -318,6 +318,69 @@ dosya + `wsl --shutdown`). 12-paralel test tekrarlandı:
   ve/veya **worker sayısını gerçek RAM bütçesine göre sınırlamak** --
   ikisi de henüz test edilmedi, sıradaki mantıklı adım bu.
 
+**Not (2026-08-14, kök neden bulundu ve DÜZELTİLDİ -- `--max-row-group-rows`)**:
+Kullanıcının "chunk boyutunu azaltmak fayda sağlar" hipotezi test edildi --
+**ampirik olarak yanlış çıktı**: `--chunk-rows`'u 50000'den 5000'e, 1000'e
+düşürmenin peak belleğe ölçülebilir bir faydası yoktu (hepsi ~1-1.3GB
+aralığında, fark gürültü düzeyinde). Kod incelenince neden bulundu:
+parquet-rs'nin varsayılan row-group boyutu **1.048.576 satır** --
+bizim test dosyalarımız (~266.667 satır/parça) bunun altında kaldığı için
+`ArrowWriter`, `--chunk-rows` ile kaç kere `write()` çağrılırsa çağrılsın,
+**tüm dosyayı `close()`'a kadar tek row-group olarak bellekte tutuyordu**.
+`--chunk-rows` sadece okuma/flush granülaritesini kontrolü ediyor, peak
+belleği DEĞİL.
+
+**Düzeltme**: `tab-to-parquet`'e yeni bir `--max-row-group-rows` parametresi
+eklendi (`WriterProperties::set_max_row_group_size()`), varsayılan 100.000.
+Doğrulama (tek parça, 266.667 satır, peak RSS):
+- `--max-row-group-rows 100000`: 869MB
+- `--max-row-group-rows 20000`: 293MB
+- `--max-row-group-rows 5000`: 138MB
+
+12-paralel test bu düzeltmeyle tekrarlandı (12GB WSL2, ama artık gerek yok):
+- `--max-row-group-rows 20000`: 196sn, doğru (3.2M satır), peak ~6GB --
+  ama tek worker'ın (78sn) ~2.5x yavaşı (küçük row-group = daha sık
+  encode/sıkıştırma çağrısı = CPU ek yükü, bir trade-off var).
+- **`--max-row-group-rows 50000`: 108sn, doğru (3.2M satır), peak ~8.6GB
+  -- tek worker'ın sadece ~1.4x yavaşı.** En iyi denge noktası burada
+  bulundu (bu spesifik veri şekli/donanım için -- gerçek `.ham` verisiyle
+  yeniden ayarlanmalı).
+
+**Sonuç**: Bellek limitini büyütmek (`.wslconfig`) yanlış çözümdü --
+asıl sorun kod düzeyindeydi ve düzeltildi. Şimdi 12 worker, WSL2'nin
+varsayılan (~7.6GB) belleğine bile muhtemelen sığar (8.6GB biraz üstünde
+kalıyor ama `--max-row-group-rows` ile daha da ince ayarlanabilir).
+**Üretim/gerçek veri ile mutlaka `--max-row-group-rows` sütun
+sayısı/RAM bütçesine göre yeniden ölçülmeli** -- burada bulunan 50000
+değeri bu sentetik 300-sütunlu veriye özgü, evrensel bir sabit değil.
+
+**Not (2026-08-14, ölçekleme eğrisi -- "12 worker neden 1 worker'dan
+yavaş?" sorusuna cevap)**: N=1,2,4,6,8,12 worker için (hepsi aynı
+`--max-row-group-rows 50000` ile, Docker'da) tam ölçekleme eğrisi
+çıkarıldı:
+
+| N | Süre | Agregat throughput | Hızlanma | Verimlilik |
+|---|---|---|---|---|
+| 1 | 21.8sn | 12.232 satır/sn | 1.00x | %100 |
+| 2 | 30.6sn | 17.430 satır/sn | 1.42x | %71 |
+| 4 | 47.8sn | 22.317 satır/sn | 1.82x | %46 |
+| 6 | 59.7sn | 26.801 satır/sn | 2.19x | %37 |
+| 8 | 74.3sn | 28.713 satır/sn | 2.35x | %29 |
+| 12 | 108sn | 29.630 satır/sn | 2.42x | %20 |
+
+Verimlilik **ani bir eşikte çökmüyor, sürekli ve düzgün azalıyor** --
+CPU throttling'in kademeli doğasıyla tutarlı (bkz. yukarıdaki saf
+CPU-bound test notu). Asıl kazanç N=1→6 arasında (1.0x→2.19x); N=6→12
+arası neredeyse boşuna (worker sayısı 2 katına çıkıyor, hızlanma sadece
+2.19x→2.42x, yani %100 fazla kaynak için %10 ek kazanç).
+
+**Sonuç**: Bu makinede (i7-12700 laptop, throttling'e eğilimli) 12
+worker (tüm mantıksal çekirdek) kullanmak israf -- **~6 worker civarı
+gözlemlenen tatlı nokta**. Bu, evrensel bir kural değil, bu donanıma
+özgü bir gözlem -- üretim sunucusunda (muhtemelen daha fazla çekirdek,
+sürdürülebilir soğutma, throttling yok) eğri tamamen farklı olabilir;
+worker sayısı kararı gerçek üretim donanımıyla yeniden ölçülmeli.
+
 ---
 
 ## 5. Açık Sorular / Netleştirilmesi Gerekenler
@@ -359,3 +422,62 @@ dosya + `wsl --shutdown`). 12-paralel test tekrarlandı:
 4. Gerçek `.tab` örnekleri elinize geçtiğinde, laptop'ınızda (i7-12700,
    16GB) küçük ölçekli benchmark yapıp chunk boyutu / worker sayısı gibi
    parametreleri gerçek verilerle netleştirin.
+
+---
+
+## 7. Rust vs Python -- doğrudan karşılaştırma (2026-08-15)
+
+**Kapsam değişikliği**: Test verisi 300 tümü-float sütundan, gerçekçi bir
+karışıma geçti -- 1000 sütun (300 float64 + 700 binary 0/1), her biri
+~10GB, 6 dosya (toplam ~61GB, `tools/generate_test_tab.py` güncellendi).
+Amaç: aynı işi hem Rust (`tab-to-parquet/`) hem Python
+(`tab-to-parquet-py/tab_to_parquet.py` -- Rust ile aynı CLI sözleşmesine
+sahip, trailing-tab düzeltmesi ve eşdeğer row-group kontrolü eklenmiş yeni
+bir implementasyon, `prototypes/tab_to_parquet.py` ile karıştırılmasın)
+yaptırıp **hız** ve **veri kaybı** açısından karşılaştırmak.
+
+Ortam: Docker (bind-mount ile salt-okunur kaynak okuma, container'ın kendi
+iç diskine yazma -- Trellix'in NTFS katmanından kaçınmak için, bkz. Bölüm
+6). Parametreler: `--chunk-rows 50000 --max-row-group-rows 50000`, 6
+worker paralel (dosya başına bir worker).
+
+| | Rust | Python |
+|---|---|---|
+| Tamamlanan dosya | **6/6** | **5/6** -- 1 dosya sessizce kayboldu |
+| Toplam süre | 1377sn (~23dk) | 2118sn (~35dk, sadece 5 dosya) |
+| Agregat throughput | ~10.022 satır/sn | ~5.430 satır/sn (5 dosya üzerinden) |
+| Sıkıştırma oranı | 1.61x | 1.61x (aynı) |
+
+**Veri kaybı bulgusu (en önemli sonuç)**: 6 worker aynı anda çalışırken
+Python tarafında bir süreç (dataset_06) sessizce öldü -- log dosyası
+tamamen boş (0 byte, traceback bile yok -- klasik SIGKILL/OOM imzası),
+üretilen `.parquet` sadece 4 byte (sadece parquet magic header, hiç veri
+yok). Rust tarafında hiçbir dosya kaybolmadı.
+
+Kaybolan dosyayı **tek başına** (kaynak rekabeti olmadan, bol bellekle)
+tekrar çalıştırınca 641,6sn'de sorunsuz tamamlandı, ve içerik parmak izi
+Rust'ın aynı dosya için ürettiğiyle **birebir eşleşti**
+(`25cb430de14d977f...`). Sonuç: **hata dosyada/mantıkta değil, Python/
+pyarrow'un aynı `--chunk-rows`/`--max-row-group-rows` ayarına rağmen daha
+fazla bellek/kaynak kullanmasında** -- 6 worker aynı anda çalışınca bu
+fazla ayak izi container'ın bellek bütçesini Rust'tan önce taşırıyor.
+
+**Doğruluk (başarılı olan durumlarda)**: 6 dosyanın hepsinde -- Rust ve
+Python'un içerik parmak izleri (satır sayısı + sütun toplamları + SHA-256)
+**birebir eşleşti**. Yani hiçbir sessiz veri bozulması yok, sadece
+Python'da (kaynak baskısı altında) tam dosya kaybı riski var.
+
+**Sonuç**: Aynı koşullarda Rust hem daha hızlı (~1,85x, kaybolan dosyanın
+tekrar üretilmesi hesaba katılırsa ~2x) hem daha güvenli (veri kaybı yok).
+Bu, daha önce Rust'ı seçme kararının (Bölüm 4) somut bir doğrulaması.
+
+**Yan not -- disk alanı yönetimi**: Bu test sırasında host diskinin
+(~476GB, dinamik WSL2 vhdx paylaşıyor) %99 dolup 8GB'a kadar düştüğü
+görüldü. Container içinde `.parquet` çıktılarını silmek **host'ta hiçbir
+alan geri kazandırmadı** (WSL2'nin sanal diski thin-provisioned, silme
+sonrası otomatik küçülmüyor -- Bölüm 6'daki bulguyla tutarlı). Gerçek
+geri kazanım için Docker Desktop GUI'sinden "Clean / Purge data"
+gerekiyor (admin gerektirmeyebilir ama GUI etkileşimi gerektiriyor).
+Ayrıca: `wsl --shutdown` komutu sadece bizim container'ı değil, makinedeki
+**diğer projelerin de tüm Docker container'larını durdurdu** (veri kaybı
+yok, sadece durduruldu) -- ileride bu komuta dikkatli yaklaşılmalı.

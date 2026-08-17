@@ -35,8 +35,25 @@ ve C derleyicisi için `winget install BrechtSanders.WinLibs.POSIX.UCRT`
 UAC gerektirdiği için bu makinede kurulamadı; GNU toolchain + portable GCC
 tam bir alternatif.
 
-Crate sentetik bir `.tab` dosyasıyla (25.000 satır, 13 sütun, dokümanın
-3.6'daki trailing-tab formatına uygun) uçtan uca test edildi: satır sayısı
-ve tüm sütun toplamları, kaynak dosyadan bağımsız hesaplanan değerlerle
-tam eşleşti. Gerçek `.tab` örneğiyle doğrulama hâlâ yapılmadı (bkz. plan
-Bölüm 5, madde 1).
+Crate sentetik verilerle (25.000 satırdan 10GB'a kadar) uçtan uca test
+edildi: satır sayısı ve tüm sütun toplamları, kaynak dosyadan bağımsız
+hesaplanan değerlerle tam eşleşti. Gerçek `.tab` örneğiyle doğrulama hâlâ
+yapılmadı (bkz. plan Bölüm 5, madde 1).
+
+## CLI parametreleri
+
+```
+--input <PATH>              Girdi .tab dosyası
+--output <PATH>              Çıktı .parquet dosyası
+--chunk-rows <N>              Okuma/flush granülaritesi (varsayılan 10000)
+--compression <zstd|snappy|gzip|none>
+--max-row-group-rows <N>      Parquet row-group başına azami satır (varsayılan 100000)
+```
+
+**Önemli**: Peak belleği kontrol eden `--max-row-group-rows`'tur,
+`--chunk-rows` değil -- parquet-rs'nin varsayılan row-group boyutu
+(1.048.576 satır) çoğu gerçekçi dosyadan büyük olduğu için, bu ayarlanmazsa
+writer tüm dosyayı `close()`'a kadar bellekte tutabilir. Çoklu-worker
+paralel çalıştırırken (worker sayısı × per-worker peak bellek) mevcut RAM
+bütçesiyle çapraz kontrol edilmeli -- bkz. plan dokümanının "kök neden
+bulundu ve düzeltildi" notu (2026-08-14), gerçek ölçümlerle.
