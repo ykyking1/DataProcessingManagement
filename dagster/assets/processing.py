@@ -1,13 +1,16 @@
 import pandas as pd
 
-from dagster import asset, MaterializeResult
+from dagster import asset, MaterializeResult, MetadataValue
+
+from partitions import daily_partitions
 
 
 @asset(
     group_name="processing",
+    partitions_def=daily_partitions,
     description="Raw telemetri verisini işleyerek curated katmana hazırlar.",
 )
-def processed_telemetry(raw_uav_telemetry):
+def processed_telemetry(context, raw_uav_telemetry):
 
     df = raw_uav_telemetry.copy()
 
@@ -48,11 +51,22 @@ def processed_telemetry(raw_uav_telemetry):
 
     df = df.drop_duplicates()
 
+    # -------------------------------------------------------------------
+    # Şema metadata'sı (kolon adı -> tip)
+    # -------------------------------------------------------------------
+
+    schema = {
+        column: str(dtype)
+        for column, dtype in df.dtypes.items()
+    }
+
     return MaterializeResult(
         value=df,
         metadata={
+            "partition": context.partition_key,
             "row_count": len(df),
             "column_count": len(df.columns),
             "columns": ", ".join(df.columns),
+            "schema": MetadataValue.json(schema),
         },
     )

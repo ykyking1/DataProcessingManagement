@@ -43,6 +43,8 @@ Dashboard bölümleri:
     4. Veri Gözat / Dışa Aktar
        - ClickHouse bağlantısı
        - Time filtresi
+       - Class filtresi
+       - Değer bazlı satır filtresi (örn. altitude < 23)
        - Kolon seçimi
        - Satır sayısı
        - Veri önizleme
@@ -339,6 +341,44 @@ def get_available_columns() -> list:
 
 
 # ============================================================
+# SAYISAL KOLONLAR (değer bazlı satır filtresi için)
+# ============================================================
+
+NUMERIC_TYPE_HINTS = (
+    "Int",
+    "UInt",
+    "Float",
+    "Decimal",
+)
+
+
+@st.cache_data(ttl=30)
+def get_numeric_columns() -> list:
+    """
+    ClickHouse şemasındaki sayısal tipteki kolonları döner.
+
+    Örn: latitude, altitude, box_x, box_w gibi Float64/Int
+    kolonları üzerinden "değeri 23'ten küçük olan satırlar" gibi
+    aramalar yapılabilmesini sağlar.
+    """
+
+    schema = get_clickhouse_schema()
+
+    if schema.empty:
+        return []
+
+    numeric_cols = [
+        row["kolon"]
+        for _, row in schema.iterrows()
+        if str(row["tip"]).startswith(
+            NUMERIC_TYPE_HINTS
+        )
+    ]
+
+    return numeric_cols
+
+
+# ============================================================
 # CLICKHOUSE FLIGHT / CLASS BİLGİLERİ
 # ============================================================
 
@@ -396,11 +436,31 @@ def get_time_range():
 # CLICKHOUSE WHERE OLUŞTURMA
 # ============================================================
 
+# Sadece bu operatörlere izin veriliyor (SQL injection'ı önlemek için)
+VALUE_FILTER_OPERATORS = {
+    "<": "<",
+    "<=": "<=",
+    ">": ">",
+    ">=": ">=",
+    "=": "=",
+    "!=": "!=",
+}
+
+
 def build_clickhouse_where(
     start_time=None,
     end_time=None,
     selected_classes=None,
+    value_filters=None,
 ):
+    """
+    value_filters: [{"column": "altitude", "operator": "<", "value": 23}, ...]
+
+    Her filtre AND ile birleştirilir (örn. "altitude < 23 AND box_w >= 50").
+    Kolon adı ve operatör beyaz listeye (whitelist) karşı doğrulanır,
+    değer ise ClickHouse parametre binding'i ile geçirilir; bu sayede
+    SQL injection riski oluşmaz.
+    """
 
     conditions = []
     parameters = {}
@@ -432,6 +492,37 @@ def build_clickhouse_where(
             for x in selected_classes
         ]
 
+    if value_filters:
+
+        available_columns = set(
+            get_available_columns()
+        )
+
+        for index, value_filter in enumerate(value_filters):
+
+            column = value_filter.get("column")
+            operator = value_filter.get("operator")
+            value = value_filter.get("value")
+
+            if column not in available_columns:
+                continue
+
+            if operator not in VALUE_FILTER_OPERATORS:
+                continue
+
+            if value is None:
+                continue
+
+            param_name = f"value_filter_{index}"
+
+            conditions.append(
+                f"`{column}` "
+                f"{VALUE_FILTER_OPERATORS[operator]} "
+                f"{{{param_name}:Float64}}"
+            )
+
+            parameters[param_name] = float(value)
+
     if not conditions:
         return "1 = 1", parameters
 
@@ -449,6 +540,7 @@ def count_filtered_rows(
     start_time=None,
     end_time=None,
     selected_classes=None,
+    value_filters=None,
 ):
 
     client = get_clickhouse_client()
@@ -457,6 +549,7 @@ def count_filtered_rows(
         start_time,
         end_time,
         selected_classes,
+        value_filters,
     )
 
     query = f"""
@@ -486,6 +579,7 @@ def fetch_filtered_telemetry(
     end_time=None,
     selected_classes=None,
     columns=None,
+    value_filters=None,
 ):
 
     client = get_clickhouse_client()
@@ -494,6 +588,7 @@ def fetch_filtered_telemetry(
         start_time,
         end_time,
         selected_classes,
+        value_filters,
     )
 
     if columns:
@@ -1189,20 +1284,92 @@ def render_alerts(
     alerts_df = load_alerts()
 
     # -----------------------------------------------------------------------
+    # Zaman aralığı filtresi
+    # -----------------------------------------------------------------------
+    #
+    # Test/backfill sırasında biriken çok sayıda eski alert, yeni gelen
+    # gerçek alertleri gözden kaçırmayı kolaylaştırıyor. Bu filtre hem
+    # alert listesine hem de aşağıdaki "Başarısız Run'lar" tablosuna
+    # uygulanır; KPI'lar da seçilen aralığa göre güncellenir.
+
+    TIME_FILTER_OPTIONS = [
+        "Son 1 saat",
+        "Bugün",
+        "Tümü",
+    ]
+
+    time_filter = st.radio(
+        "Zaman aralığı",
+        options=TIME_FILTER_OPTIONS,
+        index=0,
+        horizontal=True,
+        key="alert_time_filter",
+    )
+
+    now_utc = datetime.now(timezone.utc)
+
+    def _filter_by_time(
+        df: pd.DataFrame,
+        time_column: str,
+    ) -> pd.DataFrame:
+
+        if df.empty or time_column not in df.columns:
+            return df
+
+        if time_filter == "Tümü":
+            return df
+
+        series = pd.to_datetime(
+            df[time_column],
+            errors="coerce",
+            utc=True,
+        )
+
+        if time_filter == "Son 1 saat":
+
+            cutoff = now_utc - timedelta(hours=1)
+
+            return df[series >= cutoff]
+
+        if time_filter == "Bugün":
+
+            today = now_utc.date()
+
+            return df[series.dt.date == today]
+
+        return df
+
+    alerts_df_filtered = _filter_by_time(
+        alerts_df,
+        "timestamp",
+    )
+
+    runs_df_filtered = _filter_by_time(
+        runs_df,
+        "start",
+    )
+
+    st.caption(
+        f"Filtre: **{time_filter}** — "
+        f"{len(alerts_df_filtered):,} / {len(alerts_df):,} alert gösteriliyor "
+        f"(tüm zamanlarda toplam {len(alerts_df):,} kayıt var)."
+    )
+
+    # -----------------------------------------------------------------------
     # Üst KPI'lar
     # -----------------------------------------------------------------------
 
     total_alerts = len(
-        alerts_df
+        alerts_df_filtered
     )
 
     failed_runs = 0
 
-    if not runs_df.empty:
+    if not runs_df_filtered.empty:
 
         failed_runs = int(
             (
-                runs_df["status"]
+                runs_df_filtered["status"]
                 == "FAILURE"
             ).sum()
         )
@@ -1221,7 +1388,7 @@ def render_alerts(
 
     if total_alerts > 0:
 
-        last_alert = alerts_df.iloc[0][
+        last_alert = alerts_df_filtered.iloc[0][
             "timestamp"
         ]
 
@@ -1253,13 +1420,13 @@ def render_alerts(
     # JSON alert kayıtları
     # -----------------------------------------------------------------------
 
-    if not alerts_df.empty:
+    if not alerts_df_filtered.empty:
 
         st.subheader(
             "Hook Tarafından Kaydedilen Alertler"
         )
 
-        display = alerts_df.copy()
+        display = alerts_df_filtered.copy()
 
         st.dataframe(
             display[
@@ -1283,7 +1450,7 @@ def render_alerts(
             "Hata Detayı"
         )
 
-        for index, row in alerts_df.iterrows():
+        for index, row in alerts_df_filtered.iterrows():
 
             timestamp = row.get(
                 "timestamp",
@@ -1325,6 +1492,14 @@ def render_alerts(
                     error
                 )
 
+    elif not alerts_df.empty:
+
+        st.info(
+            f"Seçilen zaman aralığında (**{time_filter}**) alert yok. "
+            f"Tüm zamanlarda {len(alerts_df):,} kayıtlı alert var — "
+            f"görmek için filtreyi **Tümü** olarak değiştirin."
+        )
+
     else:
 
         st.success(
@@ -1341,11 +1516,19 @@ def render_alerts(
         "Dagster'daki Başarısız Run'lar"
     )
 
-    if runs_df.empty:
+    if runs_df_filtered.empty:
 
-        st.info(
-            "Henüz Dagster run bilgisi yok."
-        )
+        if runs_df.empty:
+
+            st.info(
+                "Henüz Dagster run bilgisi yok."
+            )
+
+        else:
+
+            st.info(
+                f"Seçilen zaman aralığında (**{time_filter}**) run yok."
+            )
 
         return
 
@@ -1534,6 +1717,142 @@ def render_data_export():
         )
 
     # --------------------------------------------------------
+    # Değer bazlı satır filtresi (örn. altitude < 23)
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Değer Bazlı Filtre (Satır Arama)"
+    )
+
+    st.caption(
+        "Sayısal bir kolon için koşul tanımlayarak satır bazlı arama "
+        "yapabilirsiniz. Örn: `altitude < 23` gibi. Birden fazla "
+        "filtre eklenirse hepsi AND ile birleştirilir."
+    )
+
+    try:
+        numeric_columns = get_numeric_columns()
+    except Exception:
+        numeric_columns = []
+
+    if "value_filters" not in st.session_state:
+        st.session_state["value_filters"] = []
+
+    if "value_filter_next_id" not in st.session_state:
+        st.session_state["value_filter_next_id"] = 0
+
+    if not numeric_columns:
+
+        st.info(
+            "Tabloda sayısal (Int/Float) kolon bulunamadı, "
+            "değer bazlı filtre kullanılamıyor."
+        )
+
+    else:
+
+        if st.button(
+            "➕ Filtre Ekle",
+            key="add_value_filter_btn",
+        ):
+
+            st.session_state["value_filters"].append(
+                {
+                    "id": st.session_state["value_filter_next_id"],
+                    "column": numeric_columns[0],
+                    "operator": "<",
+                    "value": 0.0,
+                }
+            )
+
+            st.session_state["value_filter_next_id"] += 1
+
+        rows_to_remove = []
+
+        for filter_row in st.session_state["value_filters"]:
+
+            row_id = filter_row["id"]
+
+            fcol1, fcol2, fcol3, fcol4 = st.columns(
+                [3, 2, 3, 1]
+            )
+
+            with fcol1:
+
+                filter_row["column"] = st.selectbox(
+                    "Kolon",
+                    options=numeric_columns,
+                    index=numeric_columns.index(
+                        filter_row["column"]
+                    )
+                    if filter_row["column"] in numeric_columns
+                    else 0,
+                    key=f"value_filter_column_{row_id}",
+                )
+
+            with fcol2:
+
+                operator_options = list(
+                    VALUE_FILTER_OPERATORS.keys()
+                )
+
+                filter_row["operator"] = st.selectbox(
+                    "Operatör",
+                    options=operator_options,
+                    index=operator_options.index(
+                        filter_row["operator"]
+                    ),
+                    key=f"value_filter_operator_{row_id}",
+                )
+
+            with fcol3:
+
+                filter_row["value"] = st.number_input(
+                    "Değer",
+                    value=float(filter_row["value"]),
+                    key=f"value_filter_value_{row_id}",
+                    format="%.4f",
+                )
+
+            with fcol4:
+
+                st.write("")
+                st.write("")
+
+                if st.button(
+                    "🗑️",
+                    key=f"value_filter_remove_{row_id}",
+                ):
+                    rows_to_remove.append(row_id)
+
+        if rows_to_remove:
+
+            st.session_state["value_filters"] = [
+                filter_row
+                for filter_row in st.session_state["value_filters"]
+                if filter_row["id"] not in rows_to_remove
+            ]
+
+            st.rerun()
+
+        if st.session_state["value_filters"]:
+
+            filter_summary = " AND ".join(
+                f"{filter_row['column']} "
+                f"{filter_row['operator']} "
+                f"{filter_row['value']}"
+                for filter_row in st.session_state["value_filters"]
+            )
+
+            st.caption(
+                f"Aktif filtre: `{filter_summary}`"
+            )
+
+    value_filters = st.session_state.get(
+        "value_filters",
+        [],
+    )
+
+    # --------------------------------------------------------
     # Kolon seçimi
     # --------------------------------------------------------
 
@@ -1596,6 +1915,7 @@ def render_data_export():
                     start_time=start_time,
                     end_time=end_time,
                     selected_classes=selected_classes,
+                    value_filters=value_filters,
                 )
 
             st.session_state[
@@ -1672,6 +1992,7 @@ def render_data_export():
                     end_time=end_time,
                     selected_classes=selected_classes,
                     columns=columns,
+                    value_filters=value_filters,
                 )
 
             st.session_state[
@@ -1828,6 +2149,7 @@ def main():
             fetch_asset_catalog.clear()
             load_alerts.clear()
             get_available_columns.clear()
+            get_numeric_columns.clear()
             get_clickhouse_schema.clear()
             get_available_classes.clear()
             check_clickhouse_connection.clear()

@@ -1,20 +1,26 @@
 import pandas as pd
 
 from clickhouse_driver import Client
-from dagster import asset, MaterializeResult
+from dagster import asset, MaterializeResult, MetadataValue
+
+from partitions import daily_partitions
 
 
 @asset(
     group_name="storage",
     compute_kind="clickhouse",
+    partitions_def=daily_partitions,
     description="Processed AU-AIR telemetri verisini ClickHouse'a yazar.",
 )
 def clickhouse_telemetry(context, processed_telemetry):
 
     df = processed_telemetry.copy()
 
+    partition_date = context.partition_key
+
     context.log.info(
-        f"ClickHouse'a yazılacak satır sayısı: {len(df)}"
+        f"ClickHouse'a yazılacak satır sayısı "
+        f"(partition={partition_date}): {len(df)}"
     )
 
     # ClickHouse bağlantısı
@@ -51,6 +57,26 @@ def clickhouse_telemetry(context, processed_telemetry):
         PARTITION BY toYYYYMM(time)
         ORDER BY time
     """)
+
+    # -----------------------------------------------------------------------
+    # Backfill idempotency
+    # -----------------------------------------------------------------------
+    #
+    # Bu asset partition'lı (günlük) olduğu için aynı gün birden fazla kez
+    # materialize edilebilir (örn. backfill ile tekrar çalıştırma). Yeniden
+    # INSERT edildiğinde satırların çoğalmasını (duplicate) önlemek için,
+    # yazmadan önce o partition'a (güne) ait mevcut satırları siliyoruz.
+    #
+    # NOT: ClickHouse'da ALTER TABLE ... DELETE bir "mutation"dır ve
+    # asenkron çalışır; büyük tablolarda hemen tamamlanmayabilir. Sık
+    # backfill yapılan üretim ortamlarında bunun yerine
+    # ReplacingMergeTree + FINAL sorgu stratejisi değerlendirilebilir.
+
+    client.execute(
+        "ALTER TABLE default.telemetry "
+        "DELETE WHERE toDate(time) = %(partition_date)s",
+        {"partition_date": partition_date},
+    )
 
     # ClickHouse'a yazılacak kolonlar
     columns = [
@@ -119,14 +145,30 @@ def clickhouse_telemetry(context, processed_telemetry):
         )
 
     context.log.info(
-        f"ClickHouse'a {len(rows)} satır yazıldı."
+        f"ClickHouse'a {len(rows)} satır yazıldı "
+        f"(partition={partition_date})."
     )
+
+    # -----------------------------------------------------------------------
+    # Şema metadata'sı (ClickHouse'daki gerçek tablo şeması)
+    # -----------------------------------------------------------------------
+
+    schema_rows = client.execute(
+        "DESCRIBE TABLE default.telemetry"
+    )
+
+    schema = {
+        row[0]: row[1]
+        for row in schema_rows
+    }
 
     return MaterializeResult(
         metadata={
+            "partition": partition_date,
             "table": "default.telemetry",
             "row_count": len(rows),
             "column_count": len(columns),
             "database": "default",
+            "schema": MetadataValue.json(schema),
         }
     )
