@@ -4,3 +4,8 @@
 __pycache__/
 *.pyc
 /testdata/
+.env
+tmp
+reports
+data
+.venv
