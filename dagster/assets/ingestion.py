@@ -1,29 +1,11 @@
-from dagster import asset, MaterializeResult
+from dagster import asset
 
-
-@asset(
-    group_name="ingestion",
-    description="AU-AIR ham verilerini veri gölüne alır."
-)
-def raw_telemetry():
-    """
-    A1 ingestion pipeline'ını çalıştırır.
-
-    TODO:
-    Burada A1 tarafından geliştirilen gerçek
-    ingestion fonksiyonu çağrılacak.
-    """
-
-    # Örnek:
-    #
-    # from ingestion.ingest import ingest_telemetry
-    #
-    # result = ingest_telemetry()
-
-    print("A1 ingestion çalıştırılıyor...")
-
-    return {
-        "source": "AU-AIR",
-        "status": "success",
-        "data": "test_data",
-    }
+# DailyPartitionsDefinition kısımlarını ve partition_def parametresini kaldırdık
+@asset(compute_kind="python", group_name="raw_layer")
+def raw_uav_telemetry(context):
+    
+    # Tarih aramak yerine direkt işlemin başladığını logluyoruz
+    context.log.info("Yeni İHA telemetri dosyası algılandı ve çekiliyor (A1 Katmanı)...")
+    
+    # Burada veri çekme (Ingestion) ve MinIO'ya yazma mantığın yer alacak
+    return [1, 2, 3] # Örnek veri döndürüyoruz

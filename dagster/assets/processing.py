@@ -1,15 +1,14 @@
 from dagster import asset, MaterializeResult
 
-
 @asset(
     group_name="processing",
     description="Raw telemetri verisini işleyerek curated katmana hazırlar.",
 )
-def processed_telemetry(raw_telemetry):
+def processed_telemetry(raw_uav_telemetry):
     """
     A2 preprocessing pipeline'ını çalıştırır.
 
-    raw_telemetry:
+    raw_uav_telemetry:
         A1 asset'inin çıktısı.
     """
 
@@ -19,12 +18,12 @@ def processed_telemetry(raw_telemetry):
     #
     # from processing.preprocess import preprocess_telemetry
     #
-    # result = preprocess_telemetry(raw_telemetry)
+    # result = preprocess_telemetry(raw_uav_telemetry)
 
     return MaterializeResult(
         metadata={
             "status": "success",
             "layer": "curated",
-            "source": "raw_telemetry",
+            "source": "raw_uav_telemetry",
         }
     )
