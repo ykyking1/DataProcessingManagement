@@ -62,6 +62,10 @@ import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 # ============================================================
 # STREAMLIT CONFIG
