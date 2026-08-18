@@ -21,6 +21,26 @@ row-group'ta biriktirmez). Yani --chunk-rows == --max-row-group-rows
 olduğu sürece (bu karşılaştırmada öyle) davranış zaten eşdeğer; farklı
 olsalar iki taraf da ayrıca ayarlanmalı.
 
+Performans notu (2026-08-17, "en iyi hal" karşılaştırması için iki
+optimizasyon eklendi):
+1. Değer dönüşümü artık satır bazında Python float() ile DEĞİL, chunk
+   sonunda numpy'nin toplu (C seviyesi) string->float64 dönüşümüyle
+   yapılıyor -- 2,3 milyar tekil float() çağrısını (dosya başına) ortadan
+   kaldırıyor, Python'un nesne/çağrı ek yükünün büyük kısmını atlıyor.
+   Bedeli: hatalı bir değer artık ilgili SATIRDA değil, o satırın ait
+   olduğu CHUNK flush edilirken fark ediliyor (satır numarası hassasiyeti
+   azalıyor, sütun SAYISI uyuşmazlığı kontrolü hâlâ satır bazında ve
+   hassas kalıyor).
+2. `order='F'` DENENDİ AMA GERİ ALINDI (2026-08-17): teorik olarak
+   vals_arr[:, i]'nin ardışık olmasını sağlayıp sütun-çıkarma kopyasını
+   önlemesi bekleniyordu -- ama izole ölçümde numpy'nin nested-list'ten
+   doğrudan F-order doldurması YOK, önce C-order dolduruyor sonra F-order'a
+   AYRICA KOPYALIYOR (%31 daha YAVAŞ ölçüldü: 3.62sn vs 2.77sn, n=50000,
+   cols=1000). Yani bu optimizasyon pratikte tam tersi etki yaptı --
+   varsayımı ölçmeden koda koymamak gerektiğinin bir hatırlatıcısı.
+   Madde 1 (toplu string->float dönüşümü) tek başına izole ölçüldü ve
+   gerçekten ~2,5x hızlı çıktı (2,75sn vs 6,80sn) -- o korunuyor.
+
 Kullanım:
     python3 tab_to_parquet.py --input sample.tab --output sample.parquet \
         --chunk-rows 50000 --max-row-group-rows 50000
@@ -72,10 +92,16 @@ def convert(tab_path, parquet_path, chunk_rows, compression, max_row_group_rows)
             nonlocal row_count, chunk_idx
             if not buf_vals:
                 return
+            # Toplu string->float64 donusumu (numpy/C seviyesinde) -- satir
+            # basina Python float() cagrisi yok (~2,5x daha hizli, izole
+            # olculdu). order='F' burada KASITLI OLARAK kullanilmiyor --
+            # denendi, numpy'nin nested-list'ten F-order doldurmasi yerine
+            # once C-order doldurup ayrica kopyaladigi olculdu (%31 daha
+            # yavas), bkz. dosya basi performans notu.
             ts_arr = np.array(buf_ts, dtype=np.float64)
-            vals_arr = np.array(buf_vals, dtype=np.float64)  # (n, num_columns)
+            vals_arr = np.array(buf_vals, dtype=np.float64)  # (n, num_columns), C-order
 
-            col_sum[:] = col_sum + vals_arr.sum(axis=0)
+            np.add(col_sum, vals_arr.sum(axis=0), out=col_sum)
             np.minimum(col_min, vals_arr.min(axis=0), out=col_min)
             np.maximum(col_max, vals_arr.max(axis=0), out=col_max)
 
@@ -102,8 +128,12 @@ def convert(tab_path, parquet_path, chunk_rows, compression, max_row_group_rows)
                     f"sütun sayısı uyuşmazlığı (satır {line_no}): "
                     f"beklenen {num_columns + 1} bulunan {len(parts)}"
                 )
-            buf_ts.append(float(parts[0]))
-            buf_vals.append([float(x) for x in parts[1:]])
+            # NOT: float() burada YOK -- string'ler olduğu gibi buffer'a
+            # giriyor, flush() içinde numpy toplu dönüşüm yapıyor (bkz. dosya
+            # başı performans notu). Hatalı bir sayısal değer artık bu satırda
+            # değil, flush anında (ValueError, numpy'den) fark edilir.
+            buf_ts.append(parts[0])
+            buf_vals.append(parts[1:])
             if len(buf_vals) >= chunk_rows:
                 flush()
         flush()

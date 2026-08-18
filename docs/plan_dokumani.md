@@ -481,3 +481,694 @@ gerekiyor (admin gerektirmeyebilir ama GUI etkileşimi gerektiriyor).
 Ayrıca: `wsl --shutdown` komutu sadece bizim container'ı değil, makinedeki
 **diğer projelerin de tüm Docker container'larını durdurdu** (veri kaybı
 yok, sadece durduruldu) -- ileride bu komuta dikkatli yaklaşılmalı.
+
+## 8. Rust'ta bulunan gereksiz kopya + tekrar test (2026-08-17)
+
+**Kod incelemesi**: Kullanıcının "iki kod da gereksiz iş yapmıyor mu"
+sorusu üzerine `tab-to-parquet/src/main.rs` incelendi. Her flush'ta
+`buf_ts.clone()` ve her sütun için `col.clone()` yapılıp hemen ardından
+`.clear()` ile orijinaller atılıyordu -- `Float64Array` zaten
+`Vec<f64>`'ün sahipliğini alabildiği için bu tam bir kopya boşa
+gidiyordu (1000 sütunda flush başına ~400MB, dosya başına ~46 flush ~=
+~18GB boşa memcpy). **Düzeltme**: `.clone()` yerine
+`std::mem::replace(&mut buf, Vec::with_capacity(chunk_rows))` ile
+sahiplik devri yapıldı, kopya ortadan kalktı. Python tarafında eşdeğer
+bir sorun YOK -- `np.array(buf_ts, ...)` zaten kaçınılmaz tek bir
+dönüşüm kopyası (liste -> array, farklı bellek yapıları).
+
+Küçük ölçekte (50.000 satır) bağımsız doğrulamayla (satır sayısı + sütun
+toplamları) düzeltmenin doğruluğu teyit edildi.
+
+**Disk sorunu çözüldü**: Docker Desktop GUI'sinden "Clean / Purge data"
+(WSL2 seçilerek) çalıştırıldı -- host disk boşluğu **8,1GB'dan
+160GB'a** çıktı. Diğer projelerin (iha-video-search, anomalydetection)
+Docker verileri de silindi (kullanıcı onayıyla, önemli değildi).
+
+**Tekrar test (düzeltilmiş Rust + aynı Python, 6 worker, aynı 6 dosya,
+aynı parametreler)**:
+
+| | Rust (düzeltilmiş) | Python |
+|---|---|---|
+| 6 worker paralel süre | **1136sn** (6/6 başarı) | 2326sn (**5/6** -- dataset_05 kayboldu) |
+| Kayıp dosyayı tamamlamak | -- | +618,5sn (tek başına, sorunsuz) |
+| **6/6 için toplam** | **1136sn** | **2944,5sn** |
+| Önceki testle kıyas | 1377sn -> 1136sn (**~%17,5 daha hızlı**, clone düzeltmesi sayesinde) | değişmedi (koda dokunulmadı) |
+
+**İki önemli doğrulama**:
+1. Clone düzeltmesi ölçülebilir bir fayda sağladı -- Rust ~%17,5 daha
+   hızlandı, Rust/Python farkı ~2,0x'ten **~2,59x**'e çıktı.
+2. **Veri kaybı tekrarlandı** -- bu kez farklı bir dosyada (dataset_05,
+   öncekinde dataset_06). Yani bu tek seferlik bir talihsizlik değil,
+   Python/pyarrow'un 6-worker senaryosunda **tekrarlanabilir bir
+   güvenilirlik sorunu**. Kaybolan dosya yine tek başına (rekabet
+   olmadan) sorunsuz tamamlandı ve Rust'la birebir aynı fingerprint'i
+   verdi (`74cb439da58407ed`) -- veri/mantık hatası değil, kaynak
+   rekabeti teyidi tekrar doğrulandı.
+
+**Sonuç**: Rust kararı (Bölüm 4) iki bağımsız testle de doğrulandı --
+hem daha hızlı hem güvenilir. Python/pyarrow'un 6-worker altında veri
+kaybetme riski, farklı dosyalarla iki kez tekrarlandığı için tesadüf
+değil, gerçek/sistematik bir davranış olarak kabul edilmeli.
+
+## 9. "En iyi hal" karşılaştırması -- kod optimizasyonları ve DuckDB denemesi (2026-08-17)
+
+Kullanıcının "iki koda da en iyi halini vererek adil karşılaştıralım"
+isteği üzerine hem Rust hem Python'da ek incelemeler ve düzeltmeler
+yapıldı.
+
+**Rust**: `split_tab_line` her veri satırında bir `Vec<&str>` tahsis
+ediyordu (1000 sütunda satır başına ~16KB, 2,3M satırda ~36GB'lık gereksiz
+küçük tahsis toplamı). Ana döngü iterator'ü doğrudan tüketecek şekilde
+yeniden yazıldı (`strip_trailing_tab` + `.split('\t')` üzerinde `Vec`'e
+toplamadan). Doğruluğu küçük ölçekte teyit edildi. **Ölçülen etki: yok
+denecek kadar az / gürültü seviyesinde** (1136sn -> 1196sn, hatta hafif
+kötüleşme) -- clone düzeltmesinin aksine bu optimizasyonun gerçek dünya
+faydası ölçülemedi.
+
+**Python -- iki optimizasyon denendi, biri geri alındı**:
+1. `order='F'` (Fortan/sütun-öncelikli numpy dizisi) -- teoride
+   `vals_arr[:, i]` sütun çıkarmayı kopyasız yapması bekleniyordu. İzole
+   ölçümde **%31 daha YAVAŞ** çıktı (numpy nested-list'ten önce C-order
+   dolduruyor, sonra F-order'a ayrıca kopyalıyor) -- **GERİ ALINDI**. Ölçmeden
+   varsayılan bir optimizasyonun tersine tepebileceğinin somut örneği.
+2. Satır bazlı `float()` çağrılarını kaldırıp string'leri buffer'da tutup
+   flush'ta numpy'a toplu (C seviyesi) string->float64 dönüşümü yaptırmak --
+   izole mikro-benchmark'ta **~2,5x hızlı** ölçüldü (2,75sn vs 6,80sn,
+   n=50000, cols=1000) ve doğruluğu (satır sayısı + sütun toplamları, max
+   fark 0,0) teyit edildi. **KORUNDU.**
+
+**Gerçek pipeline'da ölçülen etki -- mikro-benchmark'ın aksine küçük
+çıktı**: Tam dönüşüm (I/O + zstd sıkıştırma + parquet encode dahil) için
+Python'un izole süresi optimizasyon öncesi ~618,5-641,6sn, sonrası
+**621,5sn** -- pratikte fark yok. Demek ki string->float dönüşüm adımı,
+toplam sürenin küçük bir parçasıymış; asıl darboğaz başka yerde (muhtemelen
+zstd sıkıştırma/parquet encode). **Önemli yan bulgu**: optimize kodla 6-worker
+testi bu kez **6/6 dosyayı kaybetmeden tamamladı** (önceki iki denemede
+her seferinde 1 dosya OOM ile kayboluyordu) -- string tabanlı buffer'ın
+daha düşük bellek ayak izi, hız kazandırmasa da güvenilirliği artırmış
+olabilir (kesin neden-sonuç kanıtlanmadı, gözlem düzeyinde).
+
+**Doğru "izole vs paralel" karşılaştırması (düzeltilmiş metodoloji)**:
+İlk yapılan "toplam süre / 6 = per-worker süre" hesaplaması YANLIŞTI --
+6 worker paralel çalışırken `wait` en yavaş worker'ı beklediği için, HER
+worker'ın gerçek süresi toplam duvar saatine yakın (ortalamaya değil).
+Düzeltilmiş tablo:
+
+| | İzole (tek dosya, rekabetsiz) | 6-worker paralel (gerçek süre) | Rekabet cezası |
+|---|---|---|---|
+| Rust | 294sn | ~1136-1196sn | ~3,9-4,1x |
+| Python (optimize) | 621,5sn | 2078sn (6/6 başarı) | ~3,3x |
+| Rust/Python oranı | **2,11x** | **~1,78x** | -- |
+
+**Sonuç**: Rust izole halde ~2,1x daha hızlı; paralel ortamda fark daralıyor
+(~1,78x) çünkü **Rust orantısal olarak Python'dan daha fazla rekabet
+cezası ödüyor** (muhtemelen zaten çok hızlı olduğu için paylaşılan disk/
+bellek bant genişliği tavanına daha çabuk/sert çarpıyor) -- ama mutlak
+hızı o kadar yüksek ki bu daha büyük orantısal ceza bile Rust'ı öne
+geçirmeye yetiyor. "İkisi benzer oranda ceza ödüyor" ilk varsayımı
+YANLIŞTI, ölçümle düzeltildi.
+
+**DuckDB denemesi (kısmi, tamamlanmadı)**: `.tab` formatındaki trailing-tab
+sorunu `null_padding=true, strict_mode=false` ile aşılabiliyor (fazladan
+hayalet bir sütun oluşuyor, `EXCLUDE` ile atılıyor), tüm sütunlar
+`COLUMNS(*)::DOUBLE` ile zorlanabiliyor. Tek dosya, izole, DuckDB'nin
+kendi dahili çoklu-thread'liğiyle: **205,7sn, sıkıştırma 2,12x** (Rust/
+Python'un 1,61x'inden belirgin daha iyi). AMA bu, Rust/Python'un
+"tek-thread worker" modeliyle mimari olarak farklı (DuckDB tek süreçte
+kendi içinde paralel) -- 6 dosyalık adil bir karşılaştırma için mimari
+netleştirilmeli (kullanıcı isteğiyle bu tur ertelendi, ileride
+değerlendirilebilir).
+
+## 10. Bind-mount I/O darboğazı ayıklanmış karşılaştırma (2026-08-17)
+
+Kullanıcı "optimizasyon neden işe yaramadı" sorusuna cevap ararken, üç
+aşamalı bir profiling (`tools/profile_python_convert.py`: oku+böl /
+dönüştür / yaz) yapıldı. **Bind-mount üzerinden okurken**: oku+böl **%59,5**
+(285,3sn), dönüştür %24,7 (118,2sn), yaz %15,8 (76,0sn) -- yani optimize
+ettiğimiz "dönüştür" adımı zaten toplamın küçük bir dilimiydi (Amdahl
+Yasası), asıl pay okuma+bölmedeydi.
+
+Kullanıcının önerisiyle aynı dosya container'ın kendi iç diskine
+kopyalanıp (bind-mount'suz) profiling tekrarlandı: oku+böl payı **%59,5 ->
+%15,7**'ye düştü (285,3sn -> 63,6sn, ~4,5x azalma) -- bind-mount okumasının
+gerçekten ciddi bir maliyet olduğu doğrulandı (Trellix mi, Docker'ın
+virtiofs/9p çeviri katmanı mı olduğu ayırt edilemedi, ikisi de olası).
+
+**Asıl soru**: I/O darboğazı olmadan Rust/Python farkı değişir mi? Aynı
+yerel (bind-mount'suz) dosyada temiz bir karşılaştırma yapıldı:
+
+| | Bind-mount (I/O darboğazlı) | Yerel disk (darboğazsız) |
+|---|---|---|
+| Rust | 294sn | 329sn |
+| Python (optimize) | 621,5sn | 567sn |
+| **Rust/Python oranı** | **2,11x** | **1,72x** |
+
+Fingerprint'ler birebir eşleşti (`ae9e0e5a28669e98`), veri doğru.
+
+**Sonuç**: Hipotez KISMEN doğrulandı -- I/O darboğazı farkı gerçekten
+şişiriyordu (2,11x -> 1,72x), ama farkın büyük kısmı hâlâ duruyor. Yani
+Rust/Python farkı esasen I/O'dan değil, **gerçekten CPU/dil seviyesinden**
+(derlenmiş kod vs yorumlanan kod, Python'un nesne ek yükü) kaynaklanıyor.
+İlginç yan not: yerel diskte Rust hafifçe yavaşladı (294->329sn), Python
+hafifçe hızlandı (621,5->567sn) -- muhtemelen ölçüm varyansı + Rust'ın
+zaten I/O'ya daha az bağımlı olması (okuma+işleme o kadar hızlı ki I/O'nun
+payı baştan beri küçüktü).
+
+## 11. `pyarrow.csv` ile Python'u Rust'a yetiştirme denemesi -- BAŞARILI (2026-08-17)
+
+"Python'u daha da hızlandırmanın yolu yok mu" sorusuna cevap arandı.
+Elle satır/değer ayrıştırma (mevcut `tab_to_parquet.py`) yerine, okuma +
+tip dönüşümünü tamamen Arrow'un C++ CSV okuyucusuna (`pyarrow.csv.open_csv`)
+devreden yeni bir implementasyon yazıldı: `tab-to-parquet-py/
+tab_to_parquet_pyarrow_csv.py`. Mantık: Python artık elle `split('\t')` +
+`float()` yapmıyor, sadece Arrow'un ürettiği batch'leri chunk'layıp
+Float64'e cast edip parquet'e yazıyor (satır bazlı iş Python'da değil,
+C++'ta).
+
+**Format uyumu**: pyarrow.csv, DuckDB'nin aksine trailing-tab formatını
+**hiçbir özel ayara gerek kalmadan** kabul etti -- otomatik olarak adı
+boş (`''`) bir "hayalet" sütun oluşturuyor (DuckDB'deki `column1001` ile
+aynı fikir), bu `table.select(real_names)` ile atılıyor. Binary sütunlar
+`int64` olarak algılanıyor, `target_schema`'ya `.cast()` ile Float64'e
+zorlanıyor.
+
+**İlk deneme OOM'a çarptı (kendi hatam)**: `ReadOptions(block_size=
+chunk_rows * 20_000)` ifadesi ~954MB'lık TEK bir okuma bloğu demekti --
+ilk chunk'a bile ulaşmadan SIGKILL (log tamamen boş, parquet 4 byte --
+tanıdık imza). `block_size=4MB` (makul, sabit bir değer) ile düzeltildi
+-- `chunk_rows` kontrolü zaten `buf_rows >= chunk_rows` mantığıyla ayrıca
+sağlanıyor, block_size'ın onunla birebir eşleşmesi gerekmiyor.
+
+**Sonuç (izole, yerel/I/O-darboğazsız dosyada)**:
+
+| | Süre |
+|---|---|
+| Rust | 329sn |
+| Python (elle parse, optimize) | 567sn |
+| **Python + pyarrow.csv** | **329sn -- Rust ile BİREBİR AYNI** |
+
+Doğruluk DuckDB'nin SQL agregasyonuyla (Python'a veri çekmeden, bellek
+güvenli) doğrulandı: satır sayısı tam eşleşti (2.300.000), sütun
+toplamları göreceli toleransla (rtol=1e-9) tam eşleşti (max fark
+2,28e-08 -- floating-point toplama sırası farkı, veri bozulması değil).
+Bellek kullanımı sağlıklı kaldı (OOM yok, kullanılan bellek ~1,5-2,6GB,
+artan kısım sadece Linux dosya önbelleği).
+
+**Sonuç/çıkarım**: "Python dilinde" Rust'ı yakalayamazsınız (yorumlanan
+dil + nesne ek yükü yapısal bir fark), AMA "Python'dan çağrılan C++
+kütüphanesiyle" (pyarrow.csv, zaten mevcut bağımlılığımız, DuckDB gibi
+yeni bir bağımlılık gerektirmiyor) yetişebilirsiniz -- çünkü bu noktada
+karşılaştırma artık "Rust vs Python" değil, "elle yazılmış parser vs
+optimize edilmiş C++ parser" haline geliyor. Bu, mevcut worker-per-process
+mimarimize (Rust ile birebir aynı CLI sözleşmesi, --chunk-rows/--max-row-
+group-rows) hiçbir mimari değişiklik olmadan oturuyor -- DuckDB'nin
+aksine paralellik modeli sorunu yok.
+
+**Sıradaki adım (henüz yapılmadı)**: Bu sonuç sadece izole (1 dosya,
+rekabetsiz) ortamda ölçüldü. 6-worker paralel senaryoda (asıl üretim
+senaryomuz) bu üstünlüğün korunup korunmadığı, ve bellek ayak izinin
+paralel yükte OOM riski taşıyıp taşımadığı henüz test edilmedi.
+
+## 12. `pyarrow.csv` 6-worker testi -- disk %100 dolma olayı + OOM (2026-08-17)
+
+**Disk %100 dolma olayı**: 6-worker `pyarrow.csv` testi ilk denemede
+host diskini tamamen doldurdu (476G/476G, 0 boş alan) -- önceki turlardan
+kalan test dosyaları (local_dataset_03.tab kopyası, rust_local/py_local/
+pyarrowcsv_local parquet'leri, hepsi container içi volume'de, hiç
+silinmemiş) + yeni ~39GB'lık çıktı toplamda taştı. Sonuç: `Input/output
+error`, `Bus error (core dumped)`, Docker daemon 500 hatası vermeye
+başladı, container tamamen kayboldu (`docker ps -a` boş döndü). Disk
+kendiliğinden (WSL2/Docker'ın kendi kurtarma mekanizmasıyla) ve
+kullanıcının Docker Desktop GUI'den "Clean/Purge data" çalıştırmasıyla
+161GB boşa döndü -- **host'taki `testdata/dataset_*.tab` kaynak dosyaları
+tamamen sağlam kaldı** (bunlar container'ın vhdx'inde değil, doğrudan
+Windows NTFS'te). Ders: uzun test turları arasında ara/geçici dosyaları
+düzenli temizlemek gerekiyor, disk kullanımını sadece test başında değil
+sürekli izlemek şart.
+
+**Temiz container ile tekrar deneme**: Container sıfırdan kuruldu, disk
+156GB boşla başladı (temiz durum). 6-worker `pyarrow.csv` testi 559sn'de
+"bitti" ama **doğrulamada veri kaybı bulundu**:
+
+```
+OSError: [Errno 12] Error reading bytes from file.
+Detail: [errno 12] Cannot allocate memory
+```
+
+`dataset_02` işlenirken (8. parçadan sonra, ~402.000 satır işlenmişken)
+bu hata fırlatıldı, süreç düzgün bir Python traceback'iyle sonlandı
+(sessiz SIGKILL değil -- bu, elle-parse Python/Rust'taki "boş log, 4 byte
+parquet" imzasından FARKLI, daha "nazik" bir OOM davranışı, ama sonuç
+aynı: dataset_02.parquet sadece ~1,19GB'da yarım kaldı, beklenen ~6,47GB
+yerine). Diğer 5 dosya sorunsuz tamamlandı (2.300.000 satır her biri).
+
+**Sonuç**: `pyarrow.csv` izole halde Rust'la eşit hız + düşük bellek
+gösterdi (Bölüm 11), ama **6 paralel worker'da yine OOM riski taşıyor**
+-- elle-parse Python'daki sorunun aynısı, sadece hata daha görünür/nazik.
+559sn'lik süre 6/6 tamamlanmadığı için geçerli bir karşılaştırma sayısı
+DEĞİL. `--max-row-group-rows`'u küçültmek (Rust'ta işe yaramış çözüm)
+burada da denenmeli -- henüz yapılmadı.
+
+## 13. `pyarrow.csv` 6-worker OOM'unun kök nedeni bulundu ve düzeltildi (2026-08-17)
+
+**Önce `--max-row-group-rows` küçültme denendi (Rust'taki çözümle
+simetri için) -- işe yaramadı.** `--chunk-rows 20000 --max-row-group-rows
+20000` ile 6-worker tekrar denendi: 436sn'de "bitti" ama yine
+`dataset_06`'da aynı hata (`OSError: [Errno 12] Cannot allocate memory`)
+ile veri kaybı oldu. Bu, sorunun PARQUET YAZMA tarafında (row-group
+boyutu, bizim zaten kontrol ettiğimiz parametre) değil, **CSV OKUMA
+tarafında** olduğunu gösterdi.
+
+**Gerçek kök neden**: `pyarrow.csv.ReadOptions` varsayılan olarak
+`use_threads=True` -- yani her Python worker süreci, CSV okurken **kendi
+içinde de ayrıca çoklu thread** açıyordu. Worker-per-process mimarimizde
+(6 ayrı Python süreci) her sürecin İÇİNDE de fazladan thread açması,
+beklenenden çok daha fazla eşzamanlı bellek/CPU rekabetine yol açıyordu
+-- 6 süreç × (içeride) N thread, sadece 6 tek-thread sürecin toplamından
+çok daha fazla kaynak talebi demek.
+
+**Düzeltme**: `ReadOptions(use_threads=False)`. Container sıfırlanıp
+(temiz disk, 96GB boş) `--chunk-rows 20000 --max-row-group-rows 20000
+use_threads=False` ile tekrar test edildi:
+
+| | Süre | Doğruluk |
+|---|---|---|
+| Rust (bind-mount, 6-worker) | 1136-1196sn | 6/6 |
+| Python elle-parse (bind-mount, 6-worker) | 2078sn | 6/6 |
+| Python + pyarrow.csv (düzeltilmiş, `use_threads=False`) | **497sn** | **6/6 -- veri kaybı YOK** |
+
+Satır sayısı tam doğrulandı (13.800.000 = 13.800.000). Bellek kullanımı
+da düzeldi -- önceki denemede ~9,7GB'a çıkan kullanım, bu sefer ~4,8-
+5,1GB'da kaldı (container'ın 12GB sınırına çok daha rahat bir marj).
+
+**SONUÇ (bu bölümün en önemli bulgusu)**: Doğru ayarlanmış
+`pyarrow.csv` tabanlı Python implementasyonu, 6-worker paralel
+senaryoda **Rust'tan ~2,3-2,4x, elle-parse Python'dan ~4,2x daha hızlı**
+-- VE veri kaybı riski yok. Bu, "Python'u Rust'a yetiştirme" sorusunun
+sadece izole değil, **asıl üretim senaryomuzda (çoklu worker paralel)**
+da geçerli olduğunu kanıtlıyor. Kritik ayar: `use_threads=False` --
+worker-per-process mimarisinde CSV okuyucunun kendi içindeki
+paralelliğini kapatmak şart, aksi halde çift paralellik (süreç x thread)
+OOM'a yol açıyor.
+
+**Yan not (disk hijyeni)**: Bu turda disk her adımda kontrol edilip
+gereksiz çıktılar temizlendi (Bölüm 12'deki "%100 dolma" olayından ders
+alınarak) -- disk hiçbir noktada 70GB'ın altına inmedi.
+
+## 14. DuckDB'yi de adil koşullarda (6-worker) test etme -- kullanıcı isteğiyle (2026-08-17)
+
+Kullanıcı haklı bir noktaya değindi: amaç "hangi araç kazanır" değil,
+"60GB'ı en hızlı/ucuz/doğru nasıl dönüştürürüz" -- bu yüzden DuckDB'yi de
+worker-per-process mimarimize uyarlanmış şekilde (6 ayrı DuckDB süreci,
+her biri `PRAGMA threads=1` ile kendi iç paralelliği kapatılmış --
+pyarrow.csv'deki `use_threads=False` ile aynı mantık) test ettik. Yeni
+script: `tab-to-parquet-py/tab_to_parquet_duckdb.py`.
+
+**Format/kod notu**: `COLUMNS({...})` sözdizimi DuckDB'de çalışmadı,
+her sütun için açık `"col"::DOUBLE AS "col"` SELECT listesi kullanıldı.
+Ayrıca DuckDB'nin hayalet (trailing-tab) sütununa verdiği otomatik isim
+sürümden sürüme değişebileceği için (`c != ""` kontrolü işe yaramadı,
+DuckDB ona boş string değil "column1001" gibi bir isim vermişti), gerçek
+sütun adları DuckDB'ye sormak yerine **header satırından doğrudan**
+okunuyor.
+
+**Sonuç (izole, threads=1)**: DuckDB **188sn** -- Rust'tan (294-329sn)
+ve pyarrow.csv'den (329sn) bile hızlı, ÜSTELİK tek thread'le. Sıkıştırma
+**2,09x** -- Rust/pyarrow.csv'nin 1,61x'inden belirgin iyi.
+
+**Sonuç (6-worker paralel, threads=1)**: **565sn, 6/6 satır tam doğru
+(2.300.000 her biri), veri kaybı YOK.**
+
+| | Süre | Doğruluk | Sıkıştırma | Toplam çıktı (6 dosya) |
+|---|---|---|---|---|
+| Rust | 1136-1196sn | 6/6 | 1,61x | ~40,7GB |
+| Python elle-parse | 2078sn | 6/6 | 1,61x | ~40,7GB |
+| **Python + pyarrow.csv** | **497sn** | 6/6 | 1,61x | ~40,7GB |
+| **DuckDB (threads=1)** | 565sn | 6/6 | **2,09x** | **~31,4GB** |
+
+**Çıkarım -- tek kazanan yok, hedefe göre değişir**:
+- **Hız önceliğiyse**: pyarrow.csv (%14 daha hızlı)
+- **Depolama maliyeti önceliğiyse**: DuckDB (~%23 daha az disk/MinIO
+  alanı -- 1,5M dosyalık üretim ölçeğinde ciddi bir fark yaratabilir)
+- İkisi de doğru, güvenilir, aynı worker-per-process mimarisine
+  (Postgres manifest'in SKIP LOCKED deseniyle) sorunsuz oturuyor
+- DuckDB'nin daha iyi sıkıştırmasının nedeni araştırılmadı (muhtemelen
+  farklı bir encoding stratejisi/varsayılan -- ileride merak edilirse
+  incelenebilir)
+
+**Genel oturum sonucu**: Başlangıçta "Rust vs Python" sorusuyla
+başlanan bu araştırma, sonunda "elle yazılmış parser (dil fark etmez)
+vs optimize edilmiş C++ motoru (pyarrow.csv/DuckDB)" sonucuna vardı --
+ikisi de mevcut hand-written Rust/Python implementasyonlarından çok daha
+hızlı ve güvenilir çıktı.
+
+## 15. Sıkıştırma farkının kök nedeni -- binary sütunlarda dictionary encoding (2026-08-17)
+
+DuckDB'nin Rust'tan (2,09x vs 1,61x) neden daha iyi sıkıştığı, spekülasyon
+yerine parquet dosyalarının kendi meta verisi (`pyarrow.parquet.
+ParquetFile(...).metadata`) incelenerek araştırıldı -- her iki dosya aynı
+küçük kaynaktan (`small_test.tab`, 999 satır), aynı row-group ayarıyla
+(tek row group) yeniden üretilip sütun bazında karşılaştırıldı.
+
+| | Float sütunlar (300 adet) | Binary sütunlar (700 adet) |
+|---|---|---|
+| Rust (parquet-rs) | 1,04x | **0,93x** (sıkıştırma sonrası BÜYÜYOR) |
+| DuckDB | 1,05x | **1,33x** (gerçek kazanç) |
+
+**Fark tamamen binary (0/1) sütunlardan geliyor** -- float sütunlarda
+(rastgele veri, zaten iyi sıkışmıyor) ikisi de neredeyse aynı. Encoding
+meta verisi: Rust'ın binary sütun için "kullanılabilir" listesi
+`(PLAIN, RLE, RLE_DICTIONARY)` gösteriyor ama net sonuç kötü (negatif
+sıkıştırma); DuckDB binary sütun için açıkça **`PLAIN_DICTIONARY`**
+kullanmış -- sadece 2 farklı değer (0.0/1.0) olduğu için veriyi
+sözlük+referans şeklinde çok daha kompakt kodluyor.
+
+**Sonuç**: DuckDB'nin parquet yazıcısı, düşük-kardinaliteli (az farklı
+değerli) sütunlar için dictionary encoding'i parquet-rs'den (Rust) daha
+agresif/etkili kullanıyor. Bizim veri setimizin şekli (1000 sütunun
+700'ü binary) tam olarak bu fırsatı öne çıkaran bir senaryo -- bu yüzden
+fark bu kadar belirgin (2,09x vs 1,61x). Gerçek `.ham` verisinde kaç
+sütunun düşük-kardinaliteli (flag/durum/binary tipi) olduğu netleşince,
+bu fark üretim ölçeğinde ne kadar önemli olacağı daha iyi tahmin
+edilebilir -- düşük-kardinaliteli sütun oranı yüksekse DuckDB'nin
+depolama avantajı büyür, tamamen sürekli/analog sensör verisiyse (GPS,
+ivme vb.) fark küçülür.
+
+**Kök neden parquet-rs (Rust) tarafında düzeltilebilir mi?** Muhtemelen
+evet -- `WriterProperties::builder().set_dictionary_enabled(true)` gibi
+bir ayar zaten var olabilir (varsayılan davranış farklı bir eşiğe/
+sezgisel kurala dayanıyor olabilir), ama bu henüz araştırılmadı/
+denenmedi. İleride Rust implementasyonunun sıkıştırmasını iyileştirmek
+istenirse buradan başlanabilir.
+
+**Deneme: `use_dictionary=True` pyarrow.csv'de açıkça zorlandı --
+İŞE YARAMADI.** `tab-to-parquet-py/tab_to_parquet_pyarrow_csv.py`'de
+`ParquetWriter`'a `use_dictionary=True` eklendi. Küçük ölçekte (999
+satır) meta veri incelendi: encoding listesi Rust'la BİREBİR aynı
+(`PLAIN, RLE, RLE_DICTIONARY`), binary sütunda yine negatif sıkıştırma.
+Küçük ölçekte zstd'nin sabit paket ek yükünün orantısal olarak abartılı
+görünebileceği düşünülüp TAM ölçekte (10GB, dataset_01) doğrulandı:
+sonuç yine **1,61x** -- değişmedi. **Sonuç: bu basit bir ayar sorunu
+değil, DuckDB'nin dictionary encoding algoritması gerçekten farklı/daha
+etkili** (parquet-rs ve pyarrow/Arrow-C++ -- iki bağımsız implementasyon
+-- ikisi de aynı, daha zayıf sonucu veriyor). Daha derin bir çözüm
+(örn. dictionary page boyutu limitleri, farklı encoding versiyonu
+zorlama) mümkün ama giderek azalan getiri bölgesi -- şimdilik
+denenmedi, gerekirse ileride konu olabilir.
+
+## 16. zstd maksimum sıkıştırma seviyesi denemesi -- kötü trade-off (2026-08-17)
+
+Kullanıcının isteğiyle pyarrow.csv'ye `compression_level` parametresi
+eklendi, zstd seviye **22 (maksimum)** ile tam ölçekli (10GB,
+dataset_01) test edildi.
+
+| | Süre | Sıkıştırma | Doğruluk |
+|---|---|---|---|
+| Varsayılan zstd seviyesi | 214sn | 1,61x | ✓ |
+| **zstd seviye 22 (max)** | **717sn (~3,35x yavaş)** | **1,96x (%22 daha iyi)** | ✓ (veri bozulmadı) |
+
+Doğruluk `tools/compare_parquets.py` ile teyit edildi -- satır sayısı
+tam eşleşti, sütun toplamları göreceli toleransla (rtol=1e-9) tam
+eşleşti (max fark 1,9e-6, floating-point toplama sırası farkı,
+zararsız).
+
+**Sonuç: KÖTÜ trade-off, önerilmiyor.** Süre ~3,35x artıyor ama
+sıkıştırma sadece %22 iyileşiyor -- ve hâlâ DuckDB'nin varsayılan
+ayarının (2,09x) gerisinde kalıyor. Üretim ölçeğinde (1,5M dosya) bu,
+dönüşüm süresini üçe katlayıp disk tasarrufunu ancak kısmen artırmak
+demek. **zstd max seviye kullanılmamalı.** Orta seviyeler (örn. 9-12)
+denenmedi, daha makul bir denge sunabilir ama henüz test edilmedi.
+
+## 17. DuckDB varsayılan ayarlarla test -- mevcut ayarların zaten optimal olduğu doğrulandı (2026-08-17)
+
+Kullanıcının "DuckDB için de en iyi hali bulalım, hiç talimat vermezsek
+ne olur" sorusu üzerine `tab_to_parquet_duckdb.py`'ye `threads=None` /
+`row_group_size=None` desteği eklendi (PRAGMA/ROW_GROUP_SIZE hiç
+verilmiyor, DuckDB'nin tam kendi varsayılanına bırakılıyor).
+
+**İzole (tek dosya)**: varsayılan 218sn/2,12x -- `threads=1` ile
+aldığımız (188sn/2,09x) sonuca göre **biraz daha yavaş, biraz daha iyi
+sıkışan**. Fark küçük, yön belirsiz (ölçüm gürültüsü olabilir).
+
+**6-worker paralel (asıl önemli test)**: varsayılan (threads sınırsız)
+547sn -- ama **`dataset_03` ve `dataset_06`'da veri kaybı**:
+
+```
+_duckdb.IOException: IO Error: Could not read from file "...":
+Cannot allocate memory
+```
+
+Bu, pyarrow.csv'de bulduğumuz kök nedenin (Bölüm 13) BİREBİR AYNISI --
+DuckDB da varsayılan halde kendi içinde çoklu-thread açıyor, 6 paralel
+süreçte çifte paralellik OOM'a yol açıyor. Bellek izlemesi de bunu
+destekledi -- varsayılan halde kullanım daha değişken/yüksek (~4,3-9,5GB
+dalgalı) `threads=1`'in (~4-5GB istikrarlı) aksine.
+
+**Sonuç**: Bizim zaten kullandığımız `threads=1` ayarı tesadüf/aşırı
+temkinli bir önlem DEĞİL, **gerçekten gerekli**. Varsayılan hali ~%3
+daha hızlı görünüyor (547sn vs 565sn) ama güvenilmez olduğu için bu
+kazanç geçersiz. `row_group_size` için de: izole testte DuckDB kendi
+varsayılanıyla ~50.417 satırlık gruplar seçmişti -- bizim elle verdiğimiz
+50.000 zaten DuckDB'nin kendi optimal aralığına çok yakın, ekstra bir
+kazanç fırsatı yok. **Şu anki ayarlar (`threads=1`,
+`row_group_size=50000`) zaten optimal/gerekli.**
+
+## 18. DuckDB worker-sayısı ölçekleme eğrisi -- N=1..6 (2026-08-17)
+
+Kullanıcının "45 dakikalığına AFK olacağım, gerekli görürsen farklı
+sayıda worker'larla da dene" talimatı üzerine, Rust'ta çok daha önce
+yapılan N=1,2,4,6,8,12 ölçekleme metodolojisinin DuckDB karşılığı
+kuruldu. Her testte `threads=1`, `row_group_size=50000` (Bölüm 17'de
+zorunlu olduğu doğrulanan ayarlar) kullanıldı, N ayrı OS süreci paralel
+çalıştırıldı (N farklı dosya, birer worker).
+
+Ek olarak, öncesinde tek bir DuckDB sürecinin 6 dosyayı SIRAYLA, kendi
+iç paralelliğine (PRAGMA sınırı yok) bırakarak işlemesi de test edildi
+("DuckDB'ye kendi karar versin" senaryosu, `duckdb_single_process_batch.py`):
+toplam **1305,4sn** (dosya başına 185,4 - 247,0sn), bellek güvenli
+(~1,4-2,3GB) ama 6-paralel-süreç yaklaşımından (565sn) **~2,3 kat daha
+yavaş** -- yani DuckDB'nin kendi iç paralelliği, bizim manuel N-worker
+paralelliğimizin yerini tutmuyor, ikisi birlikte gerekiyor.
+
+Sonuçlar (her N için toplam duvar-saati süresi, tüm dosyalar 6/6 doğru
+-- satır sayısı + sütun toplamları eşleşti):
+
+| N | Süre | Dosya başına (min-max) | Agregat throughput (satır/sn) | Hızlanma (N=1'e göre) | Verimlilik |
+|---|---|---|---|---|---|
+| 1 (izole) | 188sn | -- | 12.234 | 1,00x | %100 |
+| 1 (sıralı, tek süreç, tüm 6 dosya) | 1305,4sn | 185,4-247,0sn | 10.575 | -- | -- (paralellik yok) |
+| 2 | 240sn | 236,9-239,1sn | 19.167 | 1,57x | %78,4 |
+| 3 | 337sn | 331,6-336,7sn | 20.474 | 1,67x | %55,7 |
+| 4 | 393sn | 380,1-392,1sn | 23.410 | 1,91x | %47,8 |
+| 6 | 565sn | (Bölüm 14) | 24.425 | 2,00x | %33,3 |
+
+**Yorum**:
+- Verimlilik N arttıkça düzgün azalıyor -- klasik azalan getiri deseni,
+  Rust'ın N=1..12 eğrisiyle aynı şekilde. Ama DuckDB genel olarak daha
+  iyi verim koruyor: Rust N=6'da ~%20 verimlilikteydi, DuckDB N=6'da
+  %33,3 -- disk I/O + CPU örtüşmesi (pyarrow.csv'de gördüğümüz 104-116%
+  CPU kullanımına benzer şekilde) DuckDB'de de daha iyi durumda.
+- **Agregat throughput hiç durmadan artıyor** (N=1: 12.234 → N=6:
+  24.425 satır/sn) -- yani elimizdeki 6 dosyayı toplamda **en hızlı
+  bitirme** açısından hâlâ N=6 en iyisi. Kısmi paralellik (N=2,3,4)
+  denemek, kalan dosyaları beklemeye bırakır ve toplam süreyi uzatır.
+- N=8 veya N=12 test edilemedi çünkü elimizde sadece 6 farklı dosya
+  var; aynı dosyayı birden fazla worker'a vermek farklı bir rekabet
+  senaryosu olur, gerçek üretim senaryomuzu (her worker farklı dosya)
+  temsil etmez. Daha fazla test dosyası üretmek (~90dk/dosya) bu
+  noktada disk alanı (33GB serbest) ve zaman açısından gerekçesiz
+  görüldü.
+- **Pratik sonuç -- bizim gerçek 1,5M dosyalık üretim senaryomuz
+  için**: elimizdeki 6 dosyalık test seti için N=6 (hepsi paralel) en
+  iyisi. Ama gerçek üretimde işlenecek dosya sayısı worker havuzu
+  boyutundan çok daha fazla olacağı için (sürekli akan iş kuyruğu),
+  asıl soru "havuzda kaç worker sürekli tutulmalı" sorusu -- bu eğri bu
+  soruyu N=6'ya kadar yanıtlıyor: verimlilik kaybı olsa da N arttıkça
+  toplam iş hep daha hızlı bitiyor, bu yüzden mevcut 6-worker/12-core
+  makine sınırı içinde 6 worker'ı sürdürmek mantıklı; makine
+  büyütülürse (daha fazla çekirdek) N=8-12 aralığının da test edilmesi
+  gerekir.
+
+## 19. N=20 testi -- pratik tavan bulundu, %35 veri kaybı (2026-08-17)
+
+Kullanıcının "bütün çekirdekler çalışacağı için" sorusu üzerine, N=20'yi
+gerçekten test ettik. Elimizde sadece 6 dosya olduğu için, mevcut 6
+dosya (`tools/split_tab.py` ile, streaming/RAM-güvenli) toplam 20
+parçaya bölündü (2 dosya x4 parça + 4 dosya x3 parça = 20, her parça
+2,74GB ya da 3,65GB, header her parçada korunuyor). Split ve
+dönüştürme çıktıları host'un sıkışık `C:` diskine değil, container'ın
+kendi iç hacmine (`/work`, 1TB, o an 912GB boş) yazıldı -- host disk
+alanı hiç etkilenmedi. 20 parça satır bazında doğrulandı (toplam
+13.800.000 satır, kaynakla birebir eşleşti).
+
+20 worker (`threads=1`, `row_group_size=50000`) paralel başlatıldı.
+Sonuç:
+
+- **7/20 worker (%35) OOM/SIGKILL (exit 137) ile öldü** -- parquet
+  çıktıları temiz 0 byte kaldı (sessiz bozulma yok, kolayca tespit
+  edilebilir bir hata: exit kod + boş dosya).
+- **13/20 başarılı olan da ciddi yavaşladı**: dosya başına 511,9-
+  662,8sn (dosyalar 2,74-3,65GB, izole halde N=1 eğrisine göre ~47-
+  63sn beklenirdi -- yani başarılı worker'lar bile **~10,6-10,9x**
+  yavaşladı, N=6'daki normal paralellik cezasından (izoleye göre ~3x)
+  çok farklı, gerçek bir bellek-thrashing/swap rejimi).
+- Toplam duvar saati: 664sn. Container belleği (`free -h`) test
+  boyunca sürekli ~11GiB/11GiB dolu kaldı (sadece 85-200MB boş),
+  swap'a da girdi (aynı `.wslconfig`/bellek-büyütme deneyinde
+  gördüğümüz "sürekli dolu bellek -> ciddi yavaşlama" paterniyle
+  birebir aynı, Bölüm 6).
+- Agregat throughput (sadece başarılı satırlar): ~12.990 satır/sn --
+  **N=1 izolenin (12.234) bile sadece ~%6 üstünde**, N=6'nın
+  (24.425) neredeyse yarısı. Yani N=20, N=6'ya göre neredeyse hiçbir
+  hız kazancı vermiyor VE verinin %35'ini kaybediyor.
+
+**Sonuç: N=20 bu makinede kesinlikle pratik tavanın üzerinde.**
+Gerçek tavan 6 ile 20 arasında bir yerde -- container RAM bütçesi
+(~11-12GB) ve N=6'nın kullandığı ~4-5GB'a bakılırsa tahmini 12-14
+civarı olabilir, ama bu ayrıca test edilmedi (kullanıcı isterse
+N=8/12/16 ile aralık daraltılabilir). Root cause N=6 testindeki
+(Bölüm 13/17) çifte paralellik OOM'unun aynı ailesi değil -- burada
+`threads=1` zaten doğru ayarlanmış, sorun sadece ham worker SAYISININ
+container'ın sabit ~11-12GB bellek bütçesini aşması.
+
+## 20. Final Karşılaştırma -- Rust vs Python vs pyarrow.csv vs DuckDB (2026-08-17)
+
+Bu bölüm, önceki 19 bölüme dağılmış tüm ölçümleri tek bir yerde
+topluyor. Dört implementasyon da aynı veri setiyle (6×10GB, 1000 sütun
+[300 float64 + 700 binary 0/1], 6 worker/süreç, worker-per-process
+mimarisi) test edildi.
+
+### Özet tablo
+
+| | Rust | Python (elle parse) | Python+pyarrow.csv | DuckDB |
+|---|---|---|---|---|
+| **İzole (tek dosya, tek worker)** | 294-329sn | 567-621,5sn | 329sn | **188sn** |
+| **6-worker paralel (toplam)** | 1136-1196sn | 2078-2944,5sn | **497sn** | 565sn |
+| **6-worker'da veri kaybı** | Hiç (6/6 hep) | **Sistematik** (2 ayrı denemede, 2 farklı dosya kayboldu) | Düzeltme öncesi kayıp, düzeltme sonrası 0 | Düzeltme öncesi kayıp, düzeltme sonrası 0 |
+| **Sıkıştırma oranı** | 1,61x | 1,61x | 1,61x | **2,09x** |
+| **6-worker bellek (toplam)** | Düşük/istikrarlı (`--max-row-group-rows` ile) | **En yüksek** (kayıpların kök nedeni) | ~9,7GB→~4,8-5,1GB (`use_threads=False` sonrası) | ~4-5GB istikrarlı |
+| **Kök neden düzeltmesi gerekli mi** | Hayır (baştan doğru) | Denendi, tam çözülemedi | Evet -- `use_threads=False` (çifte paralellik) | Evet -- `threads=1` (çifte paralellik) |
+| **Worker-sayısı tavanı (bu makinede)** | ~6 (N=12'de verim %20'ye düşüyor) | test edilmedi | test edilmedi | **6 güvenli, 20 başarısız (%35 kayıp)**, gerçek tavan tahmini 12-14 |
+| **Yeni bağımlılık gerekiyor mu** | Rust toolchain (zaten kurulu) | Yok (numpy/pyarrow zaten var) | Yok (pyarrow zaten parquet için gerekli) | Evet (`pip install duckdb`) |
+| **Kod karmaşıklığı** | Orta (row-group/ownership yönetimi) | En yüksek (elle parse) | Düşük (CSV okuyucusuna devret) | **En düşük** (tek SQL COPY komutu) |
+
+### Neden bu sonuçlar çıktı -- kısa nedensellik zinciri
+
+1. **"Rust vs Python" sorusu yanlış çerçeveydi.** Elle yazılmış parser'lar
+   (Rust dahil) optimize edilmiş native motorlardan (pyarrow'un C++ CSV
+   okuyucusu, DuckDB'nin C++ analitik motoru) yapısal olarak daha yavaş.
+   Asıl fark "derlenmiş dil vs yorumlanan dil" değil, "elle satır-satır
+   parse vs vektörize/toplu okuma motoru" (Bölüm 11 sonucu).
+2. **Python'un elle-parse sürümü güvenilmezliği hiç çözülemedi** -- iki
+   ayrı 6-worker denemesinde iki farklı dosya sessizce kayboldu (OOM/
+   SIGKILL, boş log). Kayıp dosyalar tek başına çalıştırıldığında
+   Rust'la birebir aynı veri parmak izini verdi -- yani mantık hatası
+   değil, saf bellek ayak izi sorunu, kod optimizasyonlarıyla (deferred
+   parsing, numpy toplu dönüşüm) iyileşmedi (Bölüm 8-9).
+3. **pyarrow.csv ve DuckDB'nin ikisi de aynı "çifte paralellik" tuzağına
+   düştü, ikisi de aynı ilaçla düzeldi**: worker-per-process mimarisinde
+   kütüphanenin kendi iç thread havuzunu (`use_threads`/`threads`)
+   KAPATMAK şart -- aksi halde N süreç × M iç thread container bellek
+   bütçesini aşıyor (Bölüm 13 ve 17). Bu düzeltmeden sonra ikisi de
+   %100 güvenilir.
+4. **DuckDB'nin sıkıştırma avantajı köküne inildi** (Bölüm 15): parquet
+   yazıcısı düşük-kardinaliteli (binary 0/1) sütunlarda dictionary
+   encoding'i parquet-rs'den (Rust) daha agresif kullanıyor -- veri
+   setimizin 700/1000 sütunu binary olduğu için bu fark büyüyor.
+5. **DuckDB'nin worker-sayısı tavanı diğerlerinden daha net ölçüldü**
+   (Bölüm 18-19) çünkü sadece DuckDB için N=1..6..20 tam eğri
+   çıkarıldı -- N=6 sağlam, N=20 verinin %35'ini kaybediyor. Rust'ta
+   benzer bir eğri N=1..12 için çıkarılmıştı (tavan ~6, ama orada
+   sorun veri kaybı değil sadece azalan verimlilikti -- Rust hiçbir
+   worker sayısında veri kaybetmedi, sadece yavaşladı). Python
+   (elle-parse) ve pyarrow.csv için worker-sayısı ölçekleme eğrisi hiç
+   çıkarılmadı (N=6 dışında test edilmedi).
+
+### Final karar
+
+**Tek kazanan yok, öncelik neyse ona göre değişir:**
+- **Hız önceliğiyse**: `Python + pyarrow.csv` (497sn @ 6-worker, en
+  hızlısı, yeni bağımlılık gerektirmiyor).
+- **Depolama maliyeti önceliğiyse**: `DuckDB` (565sn, sadece ~%14 daha
+  yavaş ama ~%23 daha az disk -- 1,5M dosyalık üretim ölçeğinde bu
+  MinIO/ClickHouse depolama maliyetinde belirgin fark yaratabilir).
+- **Kesinlikle ELENEN**: Python elle-parse implementasyonu -- hem en
+  yavaş hem tek sistematik veri kaybı riski taşıyan seçenek, hiçbir
+  senaryoda tercih edilir değil.
+- **Rust**: artık "varsayılan/tek seçenek" değil ama tamamen elenmiş de
+  değil -- güvenilir, orta hızlı, ekstra bağımlılık gerektirmiyor (zaten
+  kurulu toolchain). pyarrow.csv/DuckDB'nin ikisi de hız ve/veya
+  sıkıştırmada onu geçtiği için üretim varsayılanı olarak öncelik
+  taşımıyor, ama üçüncü güvenli alternatif olarak durur.
+- **Worker sayısı**: 6, bu makinede hem hız hem güvenilirlik açısından
+  doğrulanmış en iyi nokta (Bölüm 18-19) -- ne daha azı (verim kaybı,
+  toplam iş daha yavaş biter) ne daha fazlası (N=20'de %35 veri kaybı)
+  mantıklı.
+
+  **GÜNCELLEME: bkz. Bölüm 21 -- bu sonuç `row_group_size` küçültülerek
+  aşıldı, N=20 artık güvenli VE daha hızlı çıktı.**
+
+## 21. N=20'yi kurtarma -- `row_group_size` küçültme ile %100 başarı ve 2x hız (2026-08-18)
+
+Kullanıcının "chunk boyutlarını 20 worker aynı anda RAM'e sığacak
+şekilde ayarlayıp deneyelim" talimatı üzerine, DuckDB'nin
+`row_group_size` parametresi (Bölüm 20'deki N=20 başarısızlığının
+olası çözümü) gerçekten ölçülerek test edildi.
+
+**Önce izole/küçük ölçekli profil çıkarıldı** (300.000 satırlık örnek
+dosya, `resource.getrusage(RUSAGE_CHILDREN).ru_maxrss` ile tek worker
+tepe belleği ölçüldü -- container'da `/usr/bin/time` olmadığı için bu
+yönteme geçildi):
+
+| row_group_size | Peak bellek (örnek ölçek) | Sıkıştırma | Süre |
+|---|---|---|---|
+| 50.000 (mevcut) | 1235MB | 2,09x | 20,0sn |
+| 20.000 | 654MB | 2,12x | 19,3sn |
+| 10.000 | 513MB | 1,99x | 17,4sn |
+| 5.000 | 464MB | 1,97x | 17,6sn |
+
+20.000'e düşürmek belleği ~yarıya indirirken sıkıştırmaya zarar
+vermiyor (hatta hafif iyileşiyor) -- ama en temkinli/güvenli seçenek
+olarak **5.000** gerçek ölçekte test edildi (20 worker × ~464MB ≈
+9,3GB, 11GB bütçenin altında marj bırakıyor).
+
+**Gerçek ölçek sonucu (6 kaynak dosya yeniden 20 parçaya bölündü,
+`threads=1`, `row_group_size=5000`, 20 worker paralel)**:
+
+| | N=6 (rgs=50.000, Bölüm 14) | N=20 (rgs=50.000, Bölüm 19) | **N=20 (rgs=5.000)** |
+|---|---|---|---|
+| Toplam süre | 565sn | 664sn | **290sn** |
+| Başarı | 6/6 | 13/20 (%65) | **20/20 (%100)** |
+| Agregat throughput | 24.425 satır/sn | ~12.990 satır/sn | **47.586 satır/sn** |
+| Sıkıştırma | 2,09x | 2,09x (sadece hayatta kalanlar) | 1,97x |
+| Peak bellek (`free -h`) | ~4-5GB | 11GB/11GB (doldu, OOM) | ~5,9-6,9GB (rahat marj, hiç OOM yok) |
+
+**`row_group_size`'ı küçültmek hem hipotezi doğruladı hem beklenenden
+iyi sonuç verdi**: N=20 sadece güvenli hale gelmekle kalmadı, AYNI
+toplam veriyi (60GB, 13.800.000 satır) N=6'nın **neredeyse yarı
+sürede** işledi (290sn vs 565sn, ~1,95x hızlanma) -- sıkıştırma sadece
+~%6 düşük (1,97x vs 2,09x), kabul edilebilir bir bedel.
+
+**Metodolojik dürüstlük notu**: bu testte üç değişken aynı anda
+değişti -- worker sayısı (6->20), `row_group_size` (50.000->5.000),
+VE dosya boyutu (10GB->2,74-3,65GB parça, çünkü sadece 6 kaynak
+dosyamız var). Hızlanmanın tam olarak hangi değişkenden geldiği (daha
+küçük row-group'un kendisi mi, daha küçük dosyaların I/O paralelliğini
+daha iyi kullanması mı, yoksa ikisinin birleşimi mi) ayrıştırılmadı --
+bunu izole etmek için N=6'yı da aynı küçük parçalarla ve
+`row_group_size=5000` ile tekrar test etmek gerekir (yapılmadı).
+Pratik/eyleme geçirilebilir sonuç yine de net: **bu kombinasyon
+(N=20, `row_group_size=5000`, ~3GB'lık parçalar) hem güvenilir hem
+mevcut N=6/rgs=50000 yaklaşımından belirgin daha hızlı.**
+
+**Sonuç -- Bölüm 20'nin "worker sayısı 6" tavsiyesi güncellendi**:
+Sabit `row_group_size=50000` varsayımı altında 6 doğruydu. Ama
+`row_group_size` de bir ayar değişkeni olarak ele alınınca, daha
+yüksek worker sayıları (20'ye kadar test edildi, daha da yükseği
+denenmedi) hem güvenli hem daha hızlı olabiliyor -- **doğru üretim
+ayarı tek bir sabit worker sayısı değil, worker sayısı VE
+`row_group_size`'ın birlikte, hedef makinenin RAM bütçesine göre
+ayarlanması gereken bir çift.** Üretim sunucusunda (256 çekirdek,
+farklı RAM bütçesi) bu ikili yeniden ölçülmeli; bu makinedeki 20/5.000
+kombinasyonu doğrudan oraya taşınabilir bir "sihirli sayı" değil,
+metodoloji taşınabilir.

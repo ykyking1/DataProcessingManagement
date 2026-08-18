@@ -81,8 +81,18 @@ fn parse_compression(name: &str) -> Compression {
 /// docs/plan_dokumani.md Bölüm 3.6: her satır sonunda fazladan bir '\t' var.
 /// split'ten önce temizlenmezse, beklenen sütun sayısından bir fazla (boş)
 /// eleman çıkar ve sütun hizalaması kayar.
+/// docs/plan_dokumani.md Bölüm 3.6: her satır sonunda fazladan bir '\t' var --
+/// split'ten önce temizlenmezse beklenen sütun sayısından bir fazla (boş)
+/// eleman çıkar ve sütun hizalaması kayar.
+fn strip_trailing_tab(line: &str) -> &str {
+    line.strip_suffix('\t').unwrap_or(line)
+}
+
+/// Header (bir kez çağrılır) gibi rastgele erişim gereken durumlar için --
+/// veri satırları için KULLANILMAZ, bkz. ana döngüdeki iterator-bazlı
+/// işleme (Vec<&str> tahsisini önlemek için, 2026-08-17 düzeltmesi).
 fn split_tab_line(line: &str) -> Vec<&str> {
-    line.strip_suffix('\t').unwrap_or(line).split('\t').collect()
+    strip_trailing_tab(line).split('\t').collect()
 }
 
 fn convert(
@@ -196,27 +206,48 @@ fn convert(
         };
     }
 
+    // NOT (2026-08-17 düzeltmesi): split_tab_line yerine burada iterator
+    // doğrudan tüketiliyor -- eskiden her satırda bir Vec<&str> tahsis
+    // ediliyordu (1000 sütunda satır başına ~16KB, 2,3M satırda ~36GB'lık
+    // gereksiz küçük tahsis toplamı). Rust/Python "en iyi hal" karşılaştırması
+    // için Python tarafında da eşdeğer bir optimizasyon yapıldı (bkz.
+    // tab-to-parquet-py/tab_to_parquet.py).
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.unwrap_or_else(|e| panic!("satır okunamadı (satır {}): {e}", line_no + 2));
-        let fields = split_tab_line(&line);
-        if fields.len() != num_columns + 1 {
-            panic!(
-                "sütun sayısı uyuşmazlığı (satır {}): beklenen {} bulunan {}",
-                line_no + 2,
-                num_columns + 1,
-                fields.len()
-            );
-        }
-        let ts: f64 = fields[0]
+        let mut fields = strip_trailing_tab(&line).split('\t');
+
+        let ts_str = fields
+            .next()
+            .unwrap_or_else(|| panic!("boş satır (satır {})", line_no + 2));
+        let ts: f64 = ts_str
             .parse()
             .unwrap_or_else(|e| panic!("timestamp parse hatası (satır {}): {e}", line_no + 2));
         buf_ts.push(ts);
-        for (i, f) in fields[1..].iter().enumerate() {
+
+        let mut count = 0usize;
+        for (i, f) in fields.enumerate() {
+            if i >= num_columns {
+                panic!(
+                    "sütun sayısı uyuşmazlığı (satır {}): beklenen {} ama daha fazla alan var",
+                    line_no + 2,
+                    num_columns + 1
+                );
+            }
             let v: f64 = f.parse().unwrap_or_else(|e| {
                 panic!("sayısal değer parse hatası (satır {}, sütun {}): {e}", line_no + 2, i + 1)
             });
             buf_vals[i].push(v);
+            count = i + 1;
         }
+        if count != num_columns {
+            panic!(
+                "sütun sayısı uyuşmazlığı (satır {}): beklenen {} bulunan {}",
+                line_no + 2,
+                num_columns + 1,
+                count + 1
+            );
+        }
+
         if buf_ts.len() >= chunk_rows {
             flush!();
         }
