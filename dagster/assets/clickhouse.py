@@ -35,7 +35,7 @@ def _get_clickhouse_user() -> str:
 
 
 def _get_clickhouse_password() -> str:
-    return os.environ.get("CLICKHOUSE_PASSWORD", "HalukCH123!")
+    return os.environ.get("CLICKHOUSE_PASSWORD", "")
 
 
 def _get_clickhouse_database() -> str:

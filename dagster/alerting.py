@@ -24,7 +24,7 @@ import os
 
 import requests
 
-from dagster import failure_hook, HookContext
+from dagster import failure_hook, success_hook, HookContext
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +203,51 @@ def alert_on_failure(context: HookContext):
     # -----------------------------------------------------------------------
 
     _send_webhook(alert_data)
+
+
+# ---------------------------------------------------------------------------
+# Dagster Success Hook
+# ---------------------------------------------------------------------------
+
+@success_hook
+def clear_alert_on_success(context: HookContext):
+    """
+    Dagster job'ındaki bir step başarılı olduğunda çalışır.
+    Eğer bu step için daha önce alert.json'a 'FAILURE' yazılmışsa,
+    durumu 'RESOLVED' olarak günceller.
+    """
+    job_name = context.job_name
+
+    try:
+        step_name = context.op.name
+    except Exception:
+        step_name = "unknown"
+
+    if not ALERT_FILE.exists():
+        return
+
+    try:
+        existing_alerts = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
+        if not isinstance(existing_alerts, list):
+            return
+
+        is_updated = False
+
+        for alert in existing_alerts:
+            if (alert.get("job_name") == job_name and 
+                alert.get("step_name") == step_name and 
+                alert.get("status") == "FAILURE"):
+                
+                alert["status"] = "RESOLVED"
+                alert["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                is_updated = True
+
+        if is_updated:
+            ALERT_FILE.write_text(
+                json.dumps(existing_alerts, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            context.log.info(f"Geçmiş hata çözüldü olarak işaretlendi: Job={job_name}, Step={step_name}")
+
+    except Exception as exc:
+        context.log.error(f"Alert durumu güncellenirken hata oluştu: {exc}")

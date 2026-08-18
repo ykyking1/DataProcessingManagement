@@ -62,7 +62,22 @@ import clickhouse_connect
 import pandas as pd
 import requests
 import streamlit as st
+from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
+
+
+# ============================================================
+# .ENV DOSYASI
+# ============================================================
+#
+# Dosya adı sabit "app.py" olduğu için (Streamlit çalışma dizini script'in
+# bulunduğu yer olmayabilir), .env her zaman bu dosyayla aynı klasörden
+# okunur. Böylece "streamlit run" nereden çalıştırılırsa çalıştırılsın
+# dashboard/.env içeriği (CLICKHOUSE_* vb.) doğru şekilde yüklenir.
+
+load_dotenv(
+    Path(__file__).resolve().parent / ".env"
+)
 
 
 # ============================================================
@@ -252,7 +267,7 @@ def get_clickhouse_user() -> str:
 def get_clickhouse_password() -> str:
     return os.environ.get(
         "CLICKHOUSE_PASSWORD",
-        "HalukCH123!",
+        "",
     )
 
 
@@ -1323,6 +1338,66 @@ def render_catalog(
             )
 
 # ===========================================================================
+# ALERT TOAST BİLDİRİMİ
+# ===========================================================================
+
+def notify_new_alerts(alerts_df: pd.DataFrame) -> None:
+    """
+    Yeni bir hata oluştuğunda (veya daha önce hatalı olan bir adım
+    başarıyla çözüldüğünde) ekranın köşesinde kısa süreli, küçük bir
+    bildirim (st.toast) gösterir.
+
+    Hangi tab açık olursa olsun her rerun'da çalışır. İlk sayfa
+    yüklemesinde geçmişte birikmiş tüm alertler için toast spam'i
+    yapmamak amacıyla, yalnızca bu oturumda daha önce görülmemiş
+    (session_state'te izi olmayan) durum değişiklikleri bildirilir.
+    """
+
+    if alerts_df.empty:
+        return
+
+    seen_status = st.session_state.setdefault(
+        "_seen_alert_status", {}
+    )
+
+    is_first_load = "_alerts_initialized" not in st.session_state
+
+    for _, row in alerts_df.iterrows():
+
+        key = (
+            f"{row.get('job_name')}|"
+            f"{row.get('step_name')}|"
+            f"{row.get('timestamp')}"
+        )
+
+        status = row.get("status", "")
+        previous_status = seen_status.get(key)
+
+        if is_first_load:
+
+            seen_status[key] = status
+            continue
+
+        if previous_status is None and status == "FAILURE":
+
+            st.toast(
+                f"Yeni hata: {row.get('job_name')} → {row.get('step_name')}",
+                icon="🚨",
+            )
+
+        elif previous_status == "FAILURE" and status == "RESOLVED":
+
+            st.toast(
+                f"Çözüldü: {row.get('job_name')} → {row.get('step_name')}",
+                icon="✅",
+            )
+
+        seen_status[key] = status
+
+    st.session_state["_alerts_initialized"] = True
+
+
+# ===========================================================================
 # ALERT DASHBOARD
 # ===========================================================================
 
@@ -1335,6 +1410,18 @@ def render_alerts(
     )
 
     alerts_df = load_alerts()
+
+    # -----------------------------------------------------------------------
+    # Aktif hata filtresi
+    # -----------------------------------------------------------------------
+    show_only_active = st.checkbox(
+        "Sadece aktif (çözülmemiş) hataları göster",
+        value=True,
+        help="Geçmişte yaşanıp sonradan başarılı (RESOLVED) olan adımları gizler."
+    )
+
+    if show_only_active and not alerts_df.empty and "status" in alerts_df.columns:
+        alerts_df = alerts_df[alerts_df["status"] == "FAILURE"]
 
     # -----------------------------------------------------------------------
     # Zaman aralığı filtresi
@@ -1405,7 +1492,7 @@ def render_alerts(
     st.caption(
         f"Filtre: **{time_filter}** — "
         f"{len(alerts_df_filtered):,} / {len(alerts_df):,} alert gösteriliyor "
-        f"(tüm zamanlarda toplam {len(alerts_df):,} kayıt var)."
+        f"(seçili filtrelere uyan toplam {len(alerts_df):,} kayıt var)."
     )
 
     # -----------------------------------------------------------------------
@@ -1549,14 +1636,14 @@ def render_alerts(
 
         st.info(
             f"Seçilen zaman aralığında (**{time_filter}**) alert yok. "
-            f"Tüm zamanlarda {len(alerts_df):,} kayıtlı alert var — "
+            f"Filtreye uyan toplam {len(alerts_df):,} kayıtlı alert var — "
             f"görmek için filtreyi **Tümü** olarak değiştirin."
         )
 
     else:
 
         st.success(
-            "🎉 Henüz kayıtlı bir pipeline alert'i yok."
+            "🎉 Henüz kayıtlı veya aktif bir pipeline alert'i yok."
         )
 
     # -----------------------------------------------------------------------
@@ -2381,6 +2468,7 @@ def main():
             get_numeric_columns.clear()
             get_clickhouse_schema.clear()
             get_available_classes.clear()
+            get_available_flights.clear()
             check_clickhouse_connection.clear()
 
             st.rerun()
@@ -2418,6 +2506,18 @@ def main():
         st.error(
             f"Dagster'a bağlanılamadı: {exc}"
         )
+
+    # ========================================================
+    # YENİ ALERT BİLDİRİMİ (TOAST)
+    # ========================================================
+    #
+    # Hangi sekme açık olursa olsun, yeni bir hata oluştuğunda (veya
+    # bir hata çözüldüğünde) ekranın köşesinde küçük bir bildirim
+    # gösterilir. Auto-refresh açıksa bu her yenilemede tetiklenir.
+
+    notify_new_alerts(
+        load_alerts()
+    )
 
     # ========================================================
     # TABS
