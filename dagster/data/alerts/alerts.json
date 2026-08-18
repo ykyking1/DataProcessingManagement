@@ -22,5 +22,29 @@
     "error": "Telemetri dosyası bulunamadı: data\\raw\\flight_3_2026-05-29.parquet",
     "status": "RESOLVED",
     "resolved_at": "2026-08-18T10:52:48.478697+00:00"
+  },
+  {
+    "timestamp": "2026-08-18T13:42:43.676437+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "[Errno 2] No such file or directory: 'D:\\\\Haluk Yıldız\\\\DataProcessingManagement\\\\dagster\\\\.tmp_dagster_home_lsxr0x_8\\\\storage\\\\processed_telemetry\\\\2026-08-17'",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-18T13:43:49.914345+00:00"
+  },
+  {
+    "timestamp": "2026-08-18T14:03:30.539412+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "[Errno 2] No such file or directory: 'D:\\\\Haluk Yıldız\\\\DataProcessingManagement\\\\dagster\\\\.tmp_dagster_home_lsxr0x_8\\\\storage\\\\processed_telemetry\\\\2026-08-17'",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-18T14:05:22.505925+00:00"
+  },
+  {
+    "timestamp": "2026-08-18T14:04:31.586292+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "[Errno 2] No such file or directory: 'D:\\\\Haluk Yıldız\\\\DataProcessingManagement\\\\dagster\\\\.tmp_dagster_home_lsxr0x_8\\\\storage\\\\processed_telemetry\\\\2026-08-16'",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-18T14:05:22.505934+00:00"
   }
 ]

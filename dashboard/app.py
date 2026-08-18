@@ -1412,88 +1412,98 @@ def render_alerts(
     alerts_df = load_alerts()
 
     # -----------------------------------------------------------------------
-    # Aktif hata filtresi
-    # -----------------------------------------------------------------------
-    show_only_active = st.checkbox(
-        "Sadece aktif (çözülmemiş) hataları göster",
-        value=True,
-        help="Geçmişte yaşanıp sonradan başarılı (RESOLVED) olan adımları gizler."
-    )
-
-    if show_only_active and not alerts_df.empty and "status" in alerts_df.columns:
-        alerts_df = alerts_df[alerts_df["status"] == "FAILURE"]
-
-    # -----------------------------------------------------------------------
-    # Zaman aralığı filtresi
+    # Filtreler (aktif hata + zaman aralığı)
     # -----------------------------------------------------------------------
     #
     # Test/backfill sırasında biriken çok sayıda eski alert, yeni gelen
-    # gerçek alertleri gözden kaçırmayı kolaylaştırıyor. Bu filtre hem
+    # gerçek alertleri gözden kaçırmayı kolaylaştırıyor. Zaman filtresi hem
     # alert listesine hem de aşağıdaki "Başarısız Run'lar" tablosuna
     # uygulanır; KPI'lar da seçilen aralığa göre güncellenir.
 
     TIME_FILTER_OPTIONS = [
-        "Son 1 saat",
-        "Bugün",
-        "Tümü",
+        "🕐 Son 1 saat",
+        "📅 Bugün",
+        "🗓️ Tümü",
     ]
 
-    time_filter = st.radio(
-        "Zaman aralığı",
-        options=TIME_FILTER_OPTIONS,
-        index=0,
-        horizontal=True,
-        key="alert_time_filter",
-    )
+    with st.container(border=True):
 
-    now_utc = datetime.now(timezone.utc)
-
-    def _filter_by_time(
-        df: pd.DataFrame,
-        time_column: str,
-    ) -> pd.DataFrame:
-
-        if df.empty or time_column not in df.columns:
-            return df
-
-        if time_filter == "Tümü":
-            return df
-
-        series = pd.to_datetime(
-            df[time_column],
-            errors="coerce",
-            utc=True,
+        filter_col1, filter_col2 = st.columns(
+            [1, 2]
         )
 
-        if time_filter == "Son 1 saat":
+        with filter_col1:
 
-            cutoff = now_utc - timedelta(hours=1)
+            show_only_active = st.toggle(
+                "🔴 Sadece aktif hatalar",
+                value=True,
+                help=(
+                    "Açıkken, geçmişte yaşanıp sonradan başarılı (RESOLVED) "
+                    "olan adımlar listeden gizlenir."
+                ),
+            )
 
-            return df[series >= cutoff]
+        with filter_col2:
 
-        if time_filter == "Bugün":
+            time_filter = st.radio(
+                "Zaman aralığı",
+                options=TIME_FILTER_OPTIONS,
+                index=0,
+                horizontal=True,
+                key="alert_time_filter",
+            )
 
-            today = now_utc.date()
+        if show_only_active and not alerts_df.empty and "status" in alerts_df.columns:
+            alerts_df = alerts_df[alerts_df["status"] == "FAILURE"]
 
-            return df[series.dt.date == today]
+        now_utc = datetime.now(timezone.utc)
 
-        return df
+        def _filter_by_time(
+            df: pd.DataFrame,
+            time_column: str,
+        ) -> pd.DataFrame:
 
-    alerts_df_filtered = _filter_by_time(
-        alerts_df,
-        "timestamp",
-    )
+            if df.empty or time_column not in df.columns:
+                return df
 
-    runs_df_filtered = _filter_by_time(
-        runs_df,
-        "start",
-    )
+            if time_filter == "🗓️ Tümü":
+                return df
 
-    st.caption(
-        f"Filtre: **{time_filter}** — "
-        f"{len(alerts_df_filtered):,} / {len(alerts_df):,} alert gösteriliyor "
-        f"(seçili filtrelere uyan toplam {len(alerts_df):,} kayıt var)."
-    )
+            series = pd.to_datetime(
+                df[time_column],
+                errors="coerce",
+                utc=True,
+            )
+
+            if time_filter == "🕐 Son 1 saat":
+
+                cutoff = now_utc - timedelta(hours=1)
+
+                return df[series >= cutoff]
+
+            if time_filter == "📅 Bugün":
+
+                today = now_utc.date()
+
+                return df[series.dt.date == today]
+
+            return df
+
+        alerts_df_filtered = _filter_by_time(
+            alerts_df,
+            "timestamp",
+        )
+
+        runs_df_filtered = _filter_by_time(
+            runs_df,
+            "start",
+        )
+
+        st.caption(
+            f"🔎 **{time_filter}**"
+            + (" · sadece aktif hatalar" if show_only_active else "")
+            + f" — **{len(alerts_df_filtered):,}** / {len(alerts_df):,} alert gösteriliyor."
+        )
 
     # -----------------------------------------------------------------------
     # Üst KPI'lar
@@ -1672,8 +1682,8 @@ def render_alerts(
 
         return
 
-    failures = runs_df[
-        runs_df["status"]
+    failures = runs_df_filtered[
+        runs_df_filtered["status"]
         == "FAILURE"
     ].copy()
 
@@ -1808,276 +1818,265 @@ def render_data_export():
 
     st.divider()
 
-    # --------------------------------------------------------
-    # Filtreler
-    # --------------------------------------------------------
-
-    st.subheader(
-        "Veri Filtreleme"
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        start_time = st.datetime_input(
-            "Başlangıç zamanı",
-            value=min_time,
-        )
-
-    with col2:
-
-        end_time = st.datetime_input(
-            "Bitiş zamanı",
-            value=max_time,
-        )
-
-    # --------------------------------------------------------
-    # Uçuş seçimi (flight_id)
-    # --------------------------------------------------------
+    # ==========================================================
+    # ADIM 1 — FİLTRELE
+    # ==========================================================
     #
-    # Her uçuş bir kaynak dosyaya karşılık gelir (bkz. ingestion.py).
-    # Burada seçilen uçuşlar, aşağıdaki tüm filtrelerle birlikte
-    # kullanılır; en altta ise her uçuş için ayrı ayrı (ya da hepsi
-    # birden ZIP olarak) CSV indirme imkanı sunulur.
-
-    try:
-        available_flights = get_available_flights()
-    except Exception:
-        available_flights = []
-
-    selected_flights = []
-
-    if available_flights:
-
-        st.subheader(
-            "Uçuş Seçimi"
-        )
-
-        selected_flights = st.multiselect(
-            "Uçuş(lar)",
-            options=available_flights,
-            help=(
-                "Boş bırakılırsa tüm uçuşlar dahil edilir. Birden fazla "
-                "uçuş seçerseniz, aşağıdaki filtrelere uyan satırlar her "
-                "uçuş için ayrı ayrı CSV olarak indirilebilir."
-            ),
-        )
-
-    else:
-
-        st.info(
-            "Tabloda 'flight_id' kolonu bulunamadı, uçuş bazlı filtre "
-            "kullanılamıyor. Pipeline'ı bu güncellemeyle tekrar "
-            "çalıştırdığınızda bu alan otomatik olarak dolacaktır."
-        )
-
-    # --------------------------------------------------------
-    # Class filtresi
-    # --------------------------------------------------------
-
-    try:
-
-        available_classes = (
-            get_available_classes()
-        )
-
-    except Exception:
-
-        available_classes = []
-
-    selected_classes = []
-
-    if available_classes:
-
-        selected_classes = st.multiselect(
-            "Class",
-            options=available_classes,
-            help="Boş bırakılırsa tüm class değerleri seçilir.",
-        )
-
-    # --------------------------------------------------------
-    # Değer bazlı satır filtresi (örn. altitude < 23)
-    # --------------------------------------------------------
+    # Tüm filtreler burada, kapanabilir bölümler (expander) hâlinde
+    # gruplanır. En sık kullanılan "Zaman ve Uçuş" varsayılan olarak
+    # açık gelir; daha az kullanılan filtreler kapalı başlar ki sayfa
+    # ilk bakışta sade görünsün.
 
     st.subheader(
-        "Değer Bazlı Filtre (Satır Arama)"
+        "1️⃣ Filtrele"
     )
 
-    st.caption(
-        "Sayısal bir kolon için koşul tanımlayarak satır bazlı arama "
-        "yapabilirsiniz. Örn: `altitude < 23` gibi. Birden fazla "
-        "filtre eklenirse hepsi AND ile birleştirilir."
-    )
+    with st.expander(
+        "🕒 Zaman ve Uçuş",
+        expanded=True,
+    ):
 
-    try:
-        numeric_columns = get_numeric_columns()
-    except Exception:
-        numeric_columns = []
+        col1, col2 = st.columns(2)
 
-    if "value_filters" not in st.session_state:
-        st.session_state["value_filters"] = []
+        with col1:
 
-    if "value_filter_next_id" not in st.session_state:
-        st.session_state["value_filter_next_id"] = 0
+            start_time = st.datetime_input(
+                "Başlangıç zamanı",
+                value=min_time,
+            )
 
-    if not numeric_columns:
+        with col2:
 
-        st.info(
-            "Tabloda sayısal (Int/Float) kolon bulunamadı, "
-            "değer bazlı filtre kullanılamıyor."
+            end_time = st.datetime_input(
+                "Bitiş zamanı",
+                value=max_time,
+            )
+
+        # Uçuş seçimi (flight_id)
+        #
+        # Her uçuş bir kaynak dosyaya karşılık gelir (bkz. ingestion.py).
+        # Burada seçilen uçuşlar, aşağıdaki tüm filtrelerle birlikte
+        # kullanılır; en altta ise her uçuş için ayrı ayrı (ya da hepsi
+        # birden ZIP olarak) CSV indirme imkanı sunulur.
+
+        try:
+            available_flights = get_available_flights()
+        except Exception:
+            available_flights = []
+
+        selected_flights = []
+
+        if available_flights:
+
+            selected_flights = st.multiselect(
+                "Uçuş(lar)",
+                options=available_flights,
+                help=(
+                    "Boş bırakılırsa tüm uçuşlar dahil edilir. Birden fazla "
+                    "uçuş seçerseniz, aşağıdaki filtrelere uyan satırlar her "
+                    "uçuş için ayrı ayrı CSV olarak indirilebilir."
+                ),
+            )
+
+        else:
+
+            st.info(
+                "Tabloda 'flight_id' kolonu bulunamadı, uçuş bazlı filtre "
+                "kullanılamıyor. Pipeline'ı bu güncellemeyle tekrar "
+                "çalıştırdığınızda bu alan otomatik olarak dolacaktır."
+            )
+
+    with st.expander(
+        "🎯 Class ve Değer Bazlı Filtreler",
+        expanded=False,
+    ):
+
+        # Class filtresi
+
+        try:
+            available_classes = get_available_classes()
+        except Exception:
+            available_classes = []
+
+        selected_classes = []
+
+        if available_classes:
+
+            selected_classes = st.multiselect(
+                "Class",
+                options=available_classes,
+                help="Boş bırakılırsa tüm class değerleri seçilir.",
+            )
+
+        # Değer bazlı satır filtresi (örn. altitude < 23)
+
+        st.caption(
+            "Sayısal bir kolon için koşul tanımlayarak satır bazlı arama "
+            "yapabilirsiniz. Örn: `altitude < 23` gibi. Birden fazla "
+            "filtre eklenirse hepsi AND ile birleştirilir."
         )
 
-    else:
+        try:
+            numeric_columns = get_numeric_columns()
+        except Exception:
+            numeric_columns = []
 
-        if st.button(
-            "➕ Filtre Ekle",
-            key="add_value_filter_btn",
-        ):
+        if "value_filters" not in st.session_state:
+            st.session_state["value_filters"] = []
 
-            st.session_state["value_filters"].append(
-                {
-                    "id": st.session_state["value_filter_next_id"],
-                    "column": numeric_columns[0],
-                    "operator": "<",
-                    "value": 0.0,
-                }
+        if "value_filter_next_id" not in st.session_state:
+            st.session_state["value_filter_next_id"] = 0
+
+        if not numeric_columns:
+
+            st.info(
+                "Tabloda sayısal (Int/Float) kolon bulunamadı, "
+                "değer bazlı filtre kullanılamıyor."
             )
 
-            st.session_state["value_filter_next_id"] += 1
+        else:
 
-        rows_to_remove = []
+            if st.button(
+                "➕ Filtre Ekle",
+                key="add_value_filter_btn",
+            ):
 
-        for filter_row in st.session_state["value_filters"]:
+                st.session_state["value_filters"].append(
+                    {
+                        "id": st.session_state["value_filter_next_id"],
+                        "column": numeric_columns[0],
+                        "operator": "<",
+                        "value": 0.0,
+                    }
+                )
 
-            row_id = filter_row["id"]
+                st.session_state["value_filter_next_id"] += 1
 
-            fcol1, fcol2, fcol3, fcol4 = st.columns(
-                [3, 2, 3, 1]
-            )
+            rows_to_remove = []
 
-            with fcol1:
+            for filter_row in st.session_state["value_filters"]:
 
-                filter_row["column"] = st.selectbox(
-                    "Kolon",
-                    options=numeric_columns,
-                    index=numeric_columns.index(
-                        filter_row["column"]
+                row_id = filter_row["id"]
+
+                fcol1, fcol2, fcol3, fcol4 = st.columns(
+                    [3, 2, 3, 1]
+                )
+
+                with fcol1:
+
+                    filter_row["column"] = st.selectbox(
+                        "Kolon",
+                        options=numeric_columns,
+                        index=numeric_columns.index(
+                            filter_row["column"]
+                        )
+                        if filter_row["column"] in numeric_columns
+                        else 0,
+                        key=f"value_filter_column_{row_id}",
                     )
-                    if filter_row["column"] in numeric_columns
-                    else 0,
-                    key=f"value_filter_column_{row_id}",
+
+                with fcol2:
+
+                    operator_options = list(
+                        VALUE_FILTER_OPERATORS.keys()
+                    )
+
+                    filter_row["operator"] = st.selectbox(
+                        "Operatör",
+                        options=operator_options,
+                        index=operator_options.index(
+                            filter_row["operator"]
+                        ),
+                        key=f"value_filter_operator_{row_id}",
+                    )
+
+                with fcol3:
+
+                    filter_row["value"] = st.number_input(
+                        "Değer",
+                        value=float(filter_row["value"]),
+                        key=f"value_filter_value_{row_id}",
+                        format="%.4f",
+                    )
+
+                with fcol4:
+
+                    st.write("")
+                    st.write("")
+
+                    if st.button(
+                        "🗑️",
+                        key=f"value_filter_remove_{row_id}",
+                    ):
+                        rows_to_remove.append(row_id)
+
+            if rows_to_remove:
+
+                st.session_state["value_filters"] = [
+                    filter_row
+                    for filter_row in st.session_state["value_filters"]
+                    if filter_row["id"] not in rows_to_remove
+                ]
+
+                st.rerun()
+
+            if st.session_state["value_filters"]:
+
+                filter_summary = " AND ".join(
+                    f"{filter_row['column']} "
+                    f"{filter_row['operator']} "
+                    f"{filter_row['value']}"
+                    for filter_row in st.session_state["value_filters"]
                 )
 
-            with fcol2:
-
-                operator_options = list(
-                    VALUE_FILTER_OPERATORS.keys()
+                st.caption(
+                    f"Aktif filtre: `{filter_summary}`"
                 )
-
-                filter_row["operator"] = st.selectbox(
-                    "Operatör",
-                    options=operator_options,
-                    index=operator_options.index(
-                        filter_row["operator"]
-                    ),
-                    key=f"value_filter_operator_{row_id}",
-                )
-
-            with fcol3:
-
-                filter_row["value"] = st.number_input(
-                    "Değer",
-                    value=float(filter_row["value"]),
-                    key=f"value_filter_value_{row_id}",
-                    format="%.4f",
-                )
-
-            with fcol4:
-
-                st.write("")
-                st.write("")
-
-                if st.button(
-                    "🗑️",
-                    key=f"value_filter_remove_{row_id}",
-                ):
-                    rows_to_remove.append(row_id)
-
-        if rows_to_remove:
-
-            st.session_state["value_filters"] = [
-                filter_row
-                for filter_row in st.session_state["value_filters"]
-                if filter_row["id"] not in rows_to_remove
-            ]
-
-            st.rerun()
-
-        if st.session_state["value_filters"]:
-
-            filter_summary = " AND ".join(
-                f"{filter_row['column']} "
-                f"{filter_row['operator']} "
-                f"{filter_row['value']}"
-                for filter_row in st.session_state["value_filters"]
-            )
-
-            st.caption(
-                f"Aktif filtre: `{filter_summary}`"
-            )
 
     value_filters = st.session_state.get(
         "value_filters",
         [],
     )
 
-    # --------------------------------------------------------
-    # Kolon seçimi
-    # --------------------------------------------------------
+    with st.expander(
+        "📋 Kolonlar",
+        expanded=False,
+    ):
 
-    st.subheader(
-        "Kolon Seçimi"
-    )
-
-    available_columns = (
-        get_available_columns()
-    )
-
-    default_columns = [
-        column
-        for column in AU_AIR_COLUMNS
-        if column in available_columns
-    ]
-
-    selected_columns = st.multiselect(
-        "Gösterilecek / dışa aktarılacak kolonlar",
-        options=available_columns,
-        default=default_columns,
-    )
-
-    columns = (
-        selected_columns
-        if selected_columns
-        else None
-    )
-
-    # flight_id kolonu, aşağıdaki "uçuş bazlı ayrı dosyalar" bölümünün
-    # doğru çalışabilmesi için (satırları uçuşa göre gruplamak amacıyla)
-    # her zaman sorguya dahil edilir — kullanıcı Kolon Seçimi'nden onu
-    # çıkarmış olsa bile.
-    if available_flights and columns is not None and "flight_id" not in columns:
-
-        columns = columns + ["flight_id"]
-
-        st.caption(
-            "ℹ️ `flight_id` kolonu, uçuş bazlı dışa aktarma için "
-            "otomatik olarak dahil edildi."
+        available_columns = (
+            get_available_columns()
         )
 
-    # --------------------------------------------------------
-    # Tarih kontrolü
-    # --------------------------------------------------------
+        default_columns = [
+            column
+            for column in AU_AIR_COLUMNS
+            if column in available_columns
+        ]
+
+        selected_columns = st.multiselect(
+            "Gösterilecek / dışa aktarılacak kolonlar",
+            options=available_columns,
+            default=default_columns,
+        )
+
+        columns = (
+            selected_columns
+            if selected_columns
+            else None
+        )
+
+        # flight_id kolonu, aşağıdaki "uçuş bazlı ayrı dosyalar" bölümünün
+        # doğru çalışabilmesi için (satırları uçuşa göre gruplamak amacıyla)
+        # her zaman sorguya dahil edilir — kullanıcı Kolon Seçimi'nden onu
+        # çıkarmış olsa bile.
+        if available_flights and columns is not None and "flight_id" not in columns:
+
+            columns = columns + ["flight_id"]
+
+            st.caption(
+                "ℹ️ `flight_id` kolonu, uçuş bazlı dışa aktarma için "
+                "otomatik olarak dahil edildi."
+            )
 
     if start_time > end_time:
 
@@ -2087,14 +2086,80 @@ def render_data_export():
 
         return
 
+    # Seçilen filtrelerin kısa özeti — expander'ları açmadan da hangi
+    # filtrelerin aktif olduğu tek bakışta görülsün diye.
+
+    active_filters = []
+
+    if selected_flights:
+        active_filters.append(f"{len(selected_flights)} uçuş")
+
+    if selected_classes:
+        active_filters.append(f"{len(selected_classes)} class")
+
+    if value_filters:
+        active_filters.append(f"{len(value_filters)} değer filtresi")
+
+    if active_filters:
+        st.caption("🔎 Aktif filtre: " + " · ".join(active_filters))
+    else:
+        st.caption("🔎 Aktif filtre yok — tüm veri dahil edilecek.")
+
+    # Filtreler, en son "Satır Sayısını Hesapla" / "Veriyi Getir ve
+    # Önizle" ile hesaplanan sonuçtan farklıysa (kullanıcı bir filtreyi
+    # tamamlayıp yeni bir filtrelemeye geçtiyse), aşağıda eski filtreye
+    # ait satır sayısı / önizleme / indirme hâlâ açık kalmasın diye
+    # session_state'teki eski sonuçlar temizlenir.
+
+    filter_signature = (
+        start_time,
+        end_time,
+        tuple(sorted(selected_classes)),
+        tuple(sorted(selected_flights)),
+        tuple(columns) if columns else None,
+        tuple(
+            (value_filter["column"], value_filter["operator"], value_filter["value"])
+            for value_filter in value_filters
+        ),
+    )
+
+    if st.session_state.get("export_filters_signature") != filter_signature:
+
+        had_stale_result = (
+            st.session_state.get("export_row_count") is not None
+            or st.session_state.get("export_df") is not None
+        )
+
+        st.session_state.pop("export_row_count", None)
+        st.session_state.pop("export_df", None)
+
+        if had_stale_result:
+            st.info(
+                "Filtreler değişti. Güncel sonucu görmek için satır "
+                "sayısını yeniden hesaplayın."
+            )
+
     st.divider()
 
-    # --------------------------------------------------------
-    # SATIR SAYISI
-    # --------------------------------------------------------
+    # ==========================================================
+    # ADIM 2 — VERİYİ GETİR
+    # ==========================================================
+    #
+    # İki adımlı: önce satır sayısı hesaplanır (export limitini aşan
+    # bir sorguyu ClickHouse'a göndermemek için), ardından veri
+    # gerçekten getirilip önizlenir.
+
+    st.subheader(
+        "2️⃣ Veriyi Getir"
+    )
+
+    st.caption(
+        f"Önce satır sayısını hesaplayın (limit: {MAX_EXPORT_ROWS:,} satır), "
+        "ardından veriyi getirip önizleyin."
+    )
 
     if st.button(
-        "Satır Sayısını Hesapla",
+        "🔢 Satır Sayısını Hesapla",
         type="secondary",
     ):
 
@@ -2116,6 +2181,10 @@ def render_data_export():
                 "export_row_count"
             ] = row_count
 
+            st.session_state[
+                "export_filters_signature"
+            ] = filter_signature
+
             st.success(
                 f"Filtreye uyan satır sayısı: "
                 f"**{row_count:,}**"
@@ -2136,10 +2205,6 @@ def render_data_export():
     if row_count is None:
         return
 
-    # --------------------------------------------------------
-    # SONUÇ YOK
-    # --------------------------------------------------------
-
     if row_count == 0:
 
         st.warning(
@@ -2147,10 +2212,6 @@ def render_data_export():
         )
 
         return
-
-    # --------------------------------------------------------
-    # EXPORT LIMIT
-    # --------------------------------------------------------
 
     if row_count > MAX_EXPORT_ROWS:
 
@@ -2166,12 +2227,8 @@ def render_data_export():
 
         return
 
-    # --------------------------------------------------------
-    # VERİ GETİR
-    # --------------------------------------------------------
-
     if st.button(
-        "Veriyi Getir ve Önizle",
+        "📥 Veriyi Getir ve Önizle",
         type="primary",
     ):
 
@@ -2209,65 +2266,81 @@ def render_data_export():
     if dataframe is None:
         return
 
-    # --------------------------------------------------------
-    # ÖNİZLEME
-    # --------------------------------------------------------
-
-    st.divider()
-
-    st.subheader(
-        "Veri Önizleme"
-    )
-
     st.info(
         f"Toplam {len(dataframe):,} satır getirildi."
     )
 
-    st.dataframe(
-        dataframe.head(200),
-        use_container_width=True,
-        hide_index=True,
-    )
+    with st.expander(
+        "👁️ Önizleme (ilk 200 satır)",
+        expanded=True,
+    ):
 
-    st.caption(
-        "Yukarıdaki tablo ilk 200 satırı gösterir. "
-        "CSV dosyasında seçilen tüm satırlar bulunur."
-    )
+        st.dataframe(
+            dataframe.head(200),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    # --------------------------------------------------------
-    # CSV EXPORT
-    # --------------------------------------------------------
+        st.caption(
+            "Yukarıdaki tablo ilk 200 satırı gösterir. "
+            "CSV dosyasında seçilen tüm satırlar bulunur."
+        )
 
     st.divider()
 
+    # ==========================================================
+    # ADIM 3 — İNDİR
+    # ==========================================================
+    #
+    # İndirme seçenekleri sekmeler hâlinde ayrılır: tüm veri tek bir
+    # CSV olarak, ya da (flight_id mevcutsa) uçuş bazlı ayrı dosyalar
+    # hâlinde indirilebilir. Böylece her yöntem kendi sekmesinde
+    # kalır ve aynı anda ekranda üst üste görünmez.
+
     st.subheader(
-        "Dışa Aktar"
+        "3️⃣ İndir"
     )
 
-    csv_data = dataframe.to_csv(
-        index=False
-    ).encode(
-        "utf-8-sig"
+    has_flight_breakdown = (
+        "flight_id" in dataframe.columns
+        and dataframe["flight_id"].notna().any()
     )
 
-    filename = (
-        f"au_air_telemetry_"
-        f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-        f"{end_time.strftime('%Y%m%d_%H%M%S')}.csv"
-    )
+    if has_flight_breakdown:
+        tab_all, tab_flights = st.tabs(
+            ["📄 Tüm Veri", "✈️ Uçuş Bazlı"]
+        )
+    else:
+        tab_all, = st.tabs(
+            ["📄 Tüm Veri"]
+        )
 
-    st.download_button(
-        label="CSV olarak indir",
-        data=csv_data,
-        file_name=filename,
-        mime="text/csv",
-        type="primary",
-    )
+    with tab_all:
 
-    st.caption(
-        f"CSV dosyası: {len(dataframe):,} satır, "
-        f"{len(dataframe.columns)} kolon"
-    )
+        csv_data = dataframe.to_csv(
+            index=False
+        ).encode(
+            "utf-8-sig"
+        )
+
+        filename = (
+            f"au_air_telemetry_"
+            f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
+            f"{end_time.strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+
+        st.download_button(
+            label="CSV olarak indir",
+            data=csv_data,
+            file_name=filename,
+            mime="text/csv",
+            type="primary",
+        )
+
+        st.caption(
+            f"CSV dosyası: {len(dataframe):,} satır, "
+            f"{len(dataframe.columns)} kolon"
+        )
 
     # --------------------------------------------------------
     # UÇUŞ BAZLI AYRI DOSYALAR
@@ -2279,116 +2352,112 @@ def render_data_export():
     # ayrı ayrı CSV indirilebilir; ayrıca hepsi tek bir ZIP içinde de
     # toplu indirilebilir.
 
-    if "flight_id" in dataframe.columns and dataframe["flight_id"].notna().any():
+    if has_flight_breakdown:
 
-        st.divider()
+        with tab_flights:
 
-        st.subheader(
-            "Uçuş Bazlı Ayrı Dosyalar"
-        )
+            flight_groups = {
+                flight: group_df
+                for flight, group_df in dataframe.groupby("flight_id")
+                if flight not in (None, "")
+            }
 
-        flight_groups = {
-            flight: group_df
-            for flight, group_df in dataframe.groupby("flight_id")
-            if flight not in (None, "")
-        }
+            if not flight_groups:
 
-        if not flight_groups:
+                st.info(
+                    "Getirilen veride ayırt edilebilir bir uçuş bulunamadı."
+                )
 
-            st.info(
-                "Getirilen veride ayırt edilebilir bir uçuş bulunamadı."
-            )
+            else:
 
-        else:
+                summary_rows = [
+                    {
+                        "uçuş": flight,
+                        "satır_sayısı": len(group_df),
+                    }
+                    for flight, group_df in sorted(flight_groups.items())
+                ]
 
-            summary_rows = [
-                {
-                    "uçuş": flight,
-                    "satır_sayısı": len(group_df),
-                }
-                for flight, group_df in sorted(flight_groups.items())
-            ]
+                st.dataframe(
+                    pd.DataFrame(summary_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            st.dataframe(
-                pd.DataFrame(summary_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
+                def _flight_csv_bytes(flight_df: pd.DataFrame) -> bytes:
 
-            def _flight_csv_bytes(flight_df: pd.DataFrame) -> bytes:
+                    return flight_df.to_csv(
+                        index=False
+                    ).encode("utf-8-sig")
 
-                return flight_df.to_csv(
-                    index=False
-                ).encode("utf-8-sig")
+                time_suffix = (
+                    f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
+                    f"{end_time.strftime('%Y%m%d_%H%M%S')}"
+                )
 
-            time_suffix = (
-                f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-                f"{end_time.strftime('%Y%m%d_%H%M%S')}"
-            )
+                # ---- Toplu ZIP indirme ----
 
-            # ---- Toplu ZIP indirme ----
+                zip_buffer = io.BytesIO()
 
-            zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(
+                    zip_buffer,
+                    mode="w",
+                    compression=zipfile.ZIP_DEFLATED,
+                ) as zip_file:
 
-            with zipfile.ZipFile(
-                zip_buffer,
-                mode="w",
-                compression=zipfile.ZIP_DEFLATED,
-            ) as zip_file:
+                    for flight, group_df in flight_groups.items():
 
-                for flight, group_df in flight_groups.items():
-
-                    zip_file.writestr(
-                        f"ucus_{flight}_{time_suffix}.csv",
-                        _flight_csv_bytes(group_df),
-                    )
-
-            st.download_button(
-                label=(
-                    f"📦 Tüm Uçuşları ZIP Olarak İndir "
-                    f"({len(flight_groups)} dosya)"
-                ),
-                data=zip_buffer.getvalue(),
-                file_name=f"ucuslar_{time_suffix}.zip",
-                mime="application/zip",
-                type="primary",
-                key="download_all_flights_zip",
-            )
-
-            st.caption(
-                "Her uçuş için ayrı bir CSV dosyası içerir. "
-                "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
-            )
-
-            # ---- Tek tek indirme ----
-
-            with st.expander(
-                "Uçuşları tek tek indir"
-            ):
-
-                for flight, group_df in sorted(flight_groups.items()):
-
-                    col_a, col_b = st.columns(
-                        [3, 1]
-                    )
-
-                    with col_a:
-
-                        st.write(
-                            f"**{flight}** — {len(group_df):,} satır"
+                        zip_file.writestr(
+                            f"ucus_{flight}_{time_suffix}.csv",
+                            _flight_csv_bytes(group_df),
                         )
 
-                    with col_b:
+                st.download_button(
+                    label=(
+                        f"📦 Tüm Uçuşları ZIP Olarak İndir "
+                        f"({len(flight_groups)} dosya)"
+                    ),
+                    data=zip_buffer.getvalue(),
+                    file_name=f"ucuslar_{time_suffix}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    key="download_all_flights_zip",
+                )
 
-                        st.download_button(
-                            label="CSV indir",
-                            data=_flight_csv_bytes(group_df),
-                            file_name=(
-                                f"ucus_{flight}_{time_suffix}.csv"
-                            ),
-                            mime="text/csv",
-                            key=f"download_flight_{flight}",
+                st.caption(
+                    "Her uçuş için ayrı bir CSV dosyası içerir. "
+                    "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
+                )
+
+                # ---- Tek tek indirme ----
+
+                with st.expander(
+                    "Uçuşları tek tek indir"
+                ):
+
+                    for flight, group_df in sorted(flight_groups.items()):
+
+                        col_a, col_b = st.columns(
+                            [3, 1]
                         )
+
+                        with col_a:
+
+                            st.write(
+                                f"**{flight}** — {len(group_df):,} satır"
+                            )
+
+                        with col_b:
+
+                            st.download_button(
+                                label="CSV indir",
+                                data=_flight_csv_bytes(group_df),
+                                file_name=(
+                                    f"ucus_{flight}_{time_suffix}.csv"
+                                ),
+                                mime="text/csv",
+                                key=f"download_flight_{flight}",
+                            )
 
 
 # ============================================================
