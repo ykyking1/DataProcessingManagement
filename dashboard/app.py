@@ -51,8 +51,10 @@ Dashboard bölümleri:
        - CSV dışa aktarma
 """
 
+import io
 import json
 import os
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -62,10 +64,6 @@ import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-from dotenv import load_dotenv
-
-
-load_dotenv()
 
 # ============================================================
 # STREAMLIT CONFIG
@@ -112,6 +110,7 @@ AU_AIR_COLUMNS = [
     "box_w",
     "box_h",
     "class",
+    "flight_id",
 ]
 
 
@@ -253,7 +252,7 @@ def get_clickhouse_user() -> str:
 def get_clickhouse_password() -> str:
     return os.environ.get(
         "CLICKHOUSE_PASSWORD",
-        "",
+        "HalukCH123!",
     )
 
 
@@ -410,6 +409,39 @@ def get_available_classes() -> list:
     ]
 
 
+@st.cache_data(ttl=60)
+def get_available_flights() -> list:
+    """
+    ClickHouse tablosundaki farklı uçuşları (flight_id) döner.
+
+    Her uçuş bir kaynak dosyaya karşılık gelir (bkz. ingestion.py).
+    Tablo bu güncellemeden önce oluşturulmuşsa flight_id kolonu
+    olmayabilir; bu durumda boş liste döner ve dashboard uçuş bazlı
+    filtre bölümünü otomatik olarak gizler.
+    """
+
+    columns = get_available_columns()
+
+    if "flight_id" not in columns:
+        return []
+
+    client = get_clickhouse_client()
+
+    query = f"""
+    SELECT DISTINCT flight_id
+    FROM {get_clickhouse_table()}
+    WHERE flight_id != ''
+    ORDER BY flight_id
+    """
+
+    result = client.query(query)
+
+    return [
+        row[0]
+        for row in result.result_rows
+    ]
+
+
 # ============================================================
 # TIME ARALIĞI
 # ============================================================
@@ -456,9 +488,11 @@ def build_clickhouse_where(
     end_time=None,
     selected_classes=None,
     value_filters=None,
+    selected_flights=None,
 ):
     """
     value_filters: [{"column": "altitude", "operator": "<", "value": 23}, ...]
+    selected_flights: ["flight_1", "flight_2", ...] -> flight_id IN (...)
 
     Her filtre AND ile birleştirilir (örn. "altitude < 23 AND box_w >= 50").
     Kolon adı ve operatör beyaz listeye (whitelist) karşı doğrulanır,
@@ -494,6 +528,17 @@ def build_clickhouse_where(
         parameters["classes"] = [
             str(x)
             for x in selected_classes
+        ]
+
+    if selected_flights:
+
+        conditions.append(
+            "flight_id IN {flight_ids:Array(String)}"
+        )
+
+        parameters["flight_ids"] = [
+            str(x)
+            for x in selected_flights
         ]
 
     if value_filters:
@@ -545,6 +590,7 @@ def count_filtered_rows(
     end_time=None,
     selected_classes=None,
     value_filters=None,
+    selected_flights=None,
 ):
 
     client = get_clickhouse_client()
@@ -554,6 +600,7 @@ def count_filtered_rows(
         end_time,
         selected_classes,
         value_filters,
+        selected_flights,
     )
 
     query = f"""
@@ -584,6 +631,7 @@ def fetch_filtered_telemetry(
     selected_classes=None,
     columns=None,
     value_filters=None,
+    selected_flights=None,
 ):
 
     client = get_clickhouse_client()
@@ -593,6 +641,7 @@ def fetch_filtered_telemetry(
         end_time,
         selected_classes,
         value_filters,
+        selected_flights,
     )
 
     if columns:
@@ -1697,6 +1746,46 @@ def render_data_export():
         )
 
     # --------------------------------------------------------
+    # Uçuş seçimi (flight_id)
+    # --------------------------------------------------------
+    #
+    # Her uçuş bir kaynak dosyaya karşılık gelir (bkz. ingestion.py).
+    # Burada seçilen uçuşlar, aşağıdaki tüm filtrelerle birlikte
+    # kullanılır; en altta ise her uçuş için ayrı ayrı (ya da hepsi
+    # birden ZIP olarak) CSV indirme imkanı sunulur.
+
+    try:
+        available_flights = get_available_flights()
+    except Exception:
+        available_flights = []
+
+    selected_flights = []
+
+    if available_flights:
+
+        st.subheader(
+            "Uçuş Seçimi"
+        )
+
+        selected_flights = st.multiselect(
+            "Uçuş(lar)",
+            options=available_flights,
+            help=(
+                "Boş bırakılırsa tüm uçuşlar dahil edilir. Birden fazla "
+                "uçuş seçerseniz, aşağıdaki filtrelere uyan satırlar her "
+                "uçuş için ayrı ayrı CSV olarak indirilebilir."
+            ),
+        )
+
+    else:
+
+        st.info(
+            "Tabloda 'flight_id' kolonu bulunamadı, uçuş bazlı filtre "
+            "kullanılamıyor. Pipeline'ı bu güncellemeyle tekrar "
+            "çalıştırdığınızda bu alan otomatik olarak dolacaktır."
+        )
+
+    # --------------------------------------------------------
     # Class filtresi
     # --------------------------------------------------------
 
@@ -1886,6 +1975,19 @@ def render_data_export():
         else None
     )
 
+    # flight_id kolonu, aşağıdaki "uçuş bazlı ayrı dosyalar" bölümünün
+    # doğru çalışabilmesi için (satırları uçuşa göre gruplamak amacıyla)
+    # her zaman sorguya dahil edilir — kullanıcı Kolon Seçimi'nden onu
+    # çıkarmış olsa bile.
+    if available_flights and columns is not None and "flight_id" not in columns:
+
+        columns = columns + ["flight_id"]
+
+        st.caption(
+            "ℹ️ `flight_id` kolonu, uçuş bazlı dışa aktarma için "
+            "otomatik olarak dahil edildi."
+        )
+
     # --------------------------------------------------------
     # Tarih kontrolü
     # --------------------------------------------------------
@@ -1920,6 +2022,7 @@ def render_data_export():
                     end_time=end_time,
                     selected_classes=selected_classes,
                     value_filters=value_filters,
+                    selected_flights=selected_flights,
                 )
 
             st.session_state[
@@ -1997,6 +2100,7 @@ def render_data_export():
                     selected_classes=selected_classes,
                     columns=columns,
                     value_filters=value_filters,
+                    selected_flights=selected_flights,
                 )
 
             st.session_state[
@@ -2077,6 +2181,127 @@ def render_data_export():
         f"CSV dosyası: {len(dataframe):,} satır, "
         f"{len(dataframe.columns)} kolon"
     )
+
+    # --------------------------------------------------------
+    # UÇUŞ BAZLI AYRI DOSYALAR
+    # --------------------------------------------------------
+    #
+    # Yukarıdaki filtrelere (zaman, class, değer bazlı filtreler) uyan
+    # veri, seçilen her uçuş için ayrı bir CSV dosyasına bölünür.
+    # Örn: "altitude > 30" filtresiyle uçuş 1, 2 ve 3'ün her biri için
+    # ayrı ayrı CSV indirilebilir; ayrıca hepsi tek bir ZIP içinde de
+    # toplu indirilebilir.
+
+    if "flight_id" in dataframe.columns and dataframe["flight_id"].notna().any():
+
+        st.divider()
+
+        st.subheader(
+            "Uçuş Bazlı Ayrı Dosyalar"
+        )
+
+        flight_groups = {
+            flight: group_df
+            for flight, group_df in dataframe.groupby("flight_id")
+            if flight not in (None, "")
+        }
+
+        if not flight_groups:
+
+            st.info(
+                "Getirilen veride ayırt edilebilir bir uçuş bulunamadı."
+            )
+
+        else:
+
+            summary_rows = [
+                {
+                    "uçuş": flight,
+                    "satır_sayısı": len(group_df),
+                }
+                for flight, group_df in sorted(flight_groups.items())
+            ]
+
+            st.dataframe(
+                pd.DataFrame(summary_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            def _flight_csv_bytes(flight_df: pd.DataFrame) -> bytes:
+
+                return flight_df.to_csv(
+                    index=False
+                ).encode("utf-8-sig")
+
+            time_suffix = (
+                f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
+                f"{end_time.strftime('%Y%m%d_%H%M%S')}"
+            )
+
+            # ---- Toplu ZIP indirme ----
+
+            zip_buffer = io.BytesIO()
+
+            with zipfile.ZipFile(
+                zip_buffer,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as zip_file:
+
+                for flight, group_df in flight_groups.items():
+
+                    zip_file.writestr(
+                        f"ucus_{flight}_{time_suffix}.csv",
+                        _flight_csv_bytes(group_df),
+                    )
+
+            st.download_button(
+                label=(
+                    f"📦 Tüm Uçuşları ZIP Olarak İndir "
+                    f"({len(flight_groups)} dosya)"
+                ),
+                data=zip_buffer.getvalue(),
+                file_name=f"ucuslar_{time_suffix}.zip",
+                mime="application/zip",
+                type="primary",
+                key="download_all_flights_zip",
+            )
+
+            st.caption(
+                "Her uçuş için ayrı bir CSV dosyası içerir. "
+                "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
+            )
+
+            # ---- Tek tek indirme ----
+
+            with st.expander(
+                "Uçuşları tek tek indir"
+            ):
+
+                for flight, group_df in sorted(flight_groups.items()):
+
+                    col_a, col_b = st.columns(
+                        [3, 1]
+                    )
+
+                    with col_a:
+
+                        st.write(
+                            f"**{flight}** — {len(group_df):,} satır"
+                        )
+
+                    with col_b:
+
+                        st.download_button(
+                            label="CSV indir",
+                            data=_flight_csv_bytes(group_df),
+                            file_name=(
+                                f"ucus_{flight}_{time_suffix}.csv"
+                            ),
+                            mime="text/csv",
+                            key=f"download_flight_{flight}",
+                        )
 
 
 # ============================================================

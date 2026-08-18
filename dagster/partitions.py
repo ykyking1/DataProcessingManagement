@@ -18,8 +18,8 @@ Gerçek veri kaynağınızın en eski tarihine göre güncelleyin.
 
 from dagster import DailyPartitionsDefinition
 
-
+#SADECE BU TARİHTEN GÜNÜMÜZE KADAR OLAN KAYITLAR İÇİN RUN ÇALIŞTIRILIR
 daily_partitions = DailyPartitionsDefinition(
-    start_date="2026-08-01",
+    start_date="2026-01-01",
     timezone="UTC",
 )

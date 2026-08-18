@@ -1,9 +1,49 @@
+import os
+
 import pandas as pd
 
 from clickhouse_driver import Client
 from dagster import asset, MaterializeResult, MetadataValue
 
 from partitions import daily_partitions
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse bağlantı ayarları
+# ---------------------------------------------------------------------------
+#
+# Dashboard'daki (app.py) get_clickhouse_*() fonksiyonlarıyla aynı ortam
+# değişkenlerini okur. Böylece şifre/host/port gibi bilgiler TEK bir yerden
+# (ortam değişkenleri) yönetilir; Dagster tarafı ile dashboard tarafı
+# birbirinden bağımsız iki farklı sabit değer olarak senkronizasyon dışı
+# kalmaz. Hiçbir ortam değişkeni set edilmezse, önceki sabit kodlanmış
+# değerler varsayılan olarak kullanılmaya devam eder (geriye dönük uyumluluk).
+
+def _get_clickhouse_native_host() -> str:
+    return os.environ.get("CLICKHOUSE_HOST", "localhost")
+
+
+def _get_clickhouse_native_port() -> int:
+    # NOT: Bu, native protokol portudur (varsayılan 9000).
+    # Dashboard'un kullandığı HTTP portu (varsayılan 8123) ile KARIŞTIRMAYIN;
+    # ikisi farklı ortam değişkenleriyle yönetilir.
+    return int(os.environ.get("CLICKHOUSE_NATIVE_PORT", "9000"))
+
+
+def _get_clickhouse_user() -> str:
+    return os.environ.get("CLICKHOUSE_USER", "default")
+
+
+def _get_clickhouse_password() -> str:
+    return os.environ.get("CLICKHOUSE_PASSWORD", "HalukCH123!")
+
+
+def _get_clickhouse_database() -> str:
+    return os.environ.get("CLICKHOUSE_DATABASE", "default")
+
+
+def _get_clickhouse_table() -> str:
+    return os.environ.get("CLICKHOUSE_TABLE", "telemetry")
 
 
 @asset(
@@ -25,16 +65,20 @@ def clickhouse_telemetry(context, processed_telemetry):
 
     # ClickHouse bağlantısı
     client = Client(
-        host="localhost",
-        port=9000,
-        user="default",
-        password="HalukCH123!",
-        database="default",
+        host=_get_clickhouse_native_host(),
+        port=_get_clickhouse_native_port(),
+        user=_get_clickhouse_user(),
+        password=_get_clickhouse_password(),
+        database=_get_clickhouse_database(),
     )
 
+    database = _get_clickhouse_database()
+    table = _get_clickhouse_table()
+    table_fqn = f"{database}.{table}"
+
     # Tabloyu oluştur
-    client.execute("""
-        CREATE TABLE IF NOT EXISTS default.telemetry
+    client.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table_fqn}
         (
             time DateTime64(3),
             latitude Float64,
@@ -51,11 +95,20 @@ def clickhouse_telemetry(context, processed_telemetry):
             box_y Float64,
             box_w Float64,
             box_h Float64,
-            `class` String
+            `class` String,
+            flight_id String DEFAULT ''
         )
         ENGINE = MergeTree
         PARTITION BY toYYYYMM(time)
         ORDER BY time
+    """)
+
+    # Tablo daha önce flight_id olmadan oluşturulmuş olabilir
+    # (bu güncellemeden önceki run'lar). Var olan tabloları geriye
+    # dönük uyumlu şekilde güncelle.
+    client.execute(f"""
+        ALTER TABLE {table_fqn}
+        ADD COLUMN IF NOT EXISTS flight_id String DEFAULT ''
     """)
 
     # -----------------------------------------------------------------------
@@ -65,18 +118,47 @@ def clickhouse_telemetry(context, processed_telemetry):
     # Bu asset partition'lı (günlük) olduğu için aynı gün birden fazla kez
     # materialize edilebilir (örn. backfill ile tekrar çalıştırma). Yeniden
     # INSERT edildiğinde satırların çoğalmasını (duplicate) önlemek için,
-    # yazmadan önce o partition'a (güne) ait mevcut satırları siliyoruz.
+    # yazmadan önce bu partition'a (güne) VE bu run'daki uçuşlara ait
+    # mevcut satırları siliyoruz.
+    #
+    # ÖNEMLİ: Silme yalnızca toDate(time) = partition_date şartına göre
+    # yapılırsa, aynı güne denk gelen FARKLI bir uçuşun verisi de silinip
+    # üzerine yazılmamış olur (yani o uçuş sessizce kaybolur). Bu yüzden
+    # silme koşuluna flight_id de eklenmiştir: yalnızca bu run'da işlenen
+    # uçuş(lar)ın o güne ait satırları silinir, diğer uçuşlara dokunulmaz.
     #
     # NOT: ClickHouse'da ALTER TABLE ... DELETE bir "mutation"dır ve
     # asenkron çalışır; büyük tablolarda hemen tamamlanmayabilir. Sık
     # backfill yapılan üretim ortamlarında bunun yerine
     # ReplacingMergeTree + FINAL sorgu stratejisi değerlendirilebilir.
 
-    client.execute(
-        "ALTER TABLE default.telemetry "
-        "DELETE WHERE toDate(time) = %(partition_date)s",
-        {"partition_date": partition_date},
+    flight_ids_in_batch = (
+        sorted(df["flight_id"].dropna().unique().tolist())
+        if "flight_id" in df.columns
+        else []
     )
+
+    if flight_ids_in_batch:
+
+        client.execute(
+            f"ALTER TABLE {table_fqn} "
+            "DELETE WHERE toDate(time) = %(partition_date)s "
+            "AND flight_id IN %(flight_ids)s",
+            {
+                "partition_date": partition_date,
+                "flight_ids": tuple(flight_ids_in_batch),
+            },
+        )
+
+    else:
+
+        # flight_id bilgisi yoksa (örn. eski/manuel veri) eski davranışa
+        # geri dön: yalnızca tarihe göre sil.
+        client.execute(
+            f"ALTER TABLE {table_fqn} "
+            "DELETE WHERE toDate(time) = %(partition_date)s",
+            {"partition_date": partition_date},
+        )
 
     # ClickHouse'a yazılacak kolonlar
     columns = [
@@ -96,6 +178,7 @@ def clickhouse_telemetry(context, processed_telemetry):
         "box_w",
         "box_h",
         "class",
+        "flight_id",
     ]
 
     df = df[columns].copy()
@@ -119,8 +202,8 @@ def clickhouse_telemetry(context, processed_telemetry):
 
     if rows:
         client.execute(
-            """
-            INSERT INTO default.telemetry
+            f"""
+            INSERT INTO {table_fqn}
             (
                 time,
                 latitude,
@@ -137,7 +220,8 @@ def clickhouse_telemetry(context, processed_telemetry):
                 box_y,
                 box_w,
                 box_h,
-                `class`
+                `class`,
+                flight_id
             )
             VALUES
         """,
@@ -154,7 +238,7 @@ def clickhouse_telemetry(context, processed_telemetry):
     # -----------------------------------------------------------------------
 
     schema_rows = client.execute(
-        "DESCRIBE TABLE default.telemetry"
+        f"DESCRIBE TABLE {table_fqn}"
     )
 
     schema = {
@@ -165,10 +249,11 @@ def clickhouse_telemetry(context, processed_telemetry):
     return MaterializeResult(
         metadata={
             "partition": partition_date,
-            "table": "default.telemetry",
+            "flights": ", ".join(flight_ids_in_batch) if flight_ids_in_batch else "-",
+            "table": table_fqn,
             "row_count": len(rows),
             "column_count": len(columns),
-            "database": "default",
+            "database": database,
             "schema": MetadataValue.json(schema),
         }
     )

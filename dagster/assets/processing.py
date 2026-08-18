@@ -60,6 +60,12 @@ def processed_telemetry(context, raw_uav_telemetry):
         for column, dtype in df.dtypes.items()
     }
 
+    flights = (
+        sorted(df["flight_id"].unique().tolist())
+        if "flight_id" in df.columns
+        else []
+    )
+
     return MaterializeResult(
         value=df,
         metadata={
@@ -67,6 +73,7 @@ def processed_telemetry(context, raw_uav_telemetry):
             "row_count": len(df),
             "column_count": len(df.columns),
             "columns": ", ".join(df.columns),
+            "flights": ", ".join(flights) if flights else "-",
             "schema": MetadataValue.json(schema),
         },
     )

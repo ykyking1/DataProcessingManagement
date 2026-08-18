@@ -22,6 +22,16 @@ class RawTelemetryConfig(Config):
 
     file_path: str = "data/au_air/telemetry.parquet"
 
+    flight_id: str = ""
+    """
+    Bu dosyanın ait olduğu uçuşun kimliği (örn. "flight_1", "ucus_003").
+
+    Boş bırakılırsa dosya adının uzantısız hali (path.stem) kullanılır.
+    Sensor tarafından tetiklenen run'larda genelde boş bırakılır; dosya
+    adı zaten uçuşu ayırt etmeye yeter (örn. telemetry_013.parquet ->
+    flight_id = "telemetry_013").
+    """
+
 
 # ---------------------------------------------------------------------------
 # Asset
@@ -108,6 +118,18 @@ def raw_uav_telemetry(context, config: RawTelemetryConfig):
     )
 
     # -----------------------------------------------------------------------
+    # Uçuş kimliği (flight_id)
+    # -----------------------------------------------------------------------
+    #
+    # Her kaynak dosya bir "uçuşu" temsil eder. Bu kolon, dashboard'daki
+    # "Veri Gözat / Dışa Aktar" ekranında kullanıcının belirli uçuşları
+    # seçip her biri için ayrı filtrelenmiş CSV indirebilmesini sağlar.
+
+    flight_id = config.flight_id.strip() or path.stem
+
+    df["flight_id"] = flight_id
+
+    # -----------------------------------------------------------------------
     # Partition filtresi
     # -----------------------------------------------------------------------
     #
@@ -130,7 +152,7 @@ def raw_uav_telemetry(context, config: RawTelemetryConfig):
 
     context.log.info(
         f"AU-AIR verisi okundu (partition={partition_date}, "
-        f"dosya={path}): {len(df)} satır"
+        f"flight_id={flight_id}, dosya={path}): {len(df)} satır"
     )
 
     context.log.info(
@@ -150,6 +172,7 @@ def raw_uav_telemetry(context, config: RawTelemetryConfig):
         value=df,
         metadata={
             "partition": partition_date,
+            "flight_id": flight_id,
             "source_file": str(path),
             "row_count": len(df),
             "column_count": len(df.columns),
