@@ -1,0 +1,44 @@
+{# Extract data lineage trailers from the release's conventional commits. #}{%  set metadata = namespace(
+      pipeline_version="",
+      pipeline_git_sha="",
+      raw_batches="",
+      dvc_target=""
+    )
+%}{%  for _, commits in release["elements"] | dictsort
+%}{%    for commit in commits
+%}{%      for line in (commit.commit.message | string).split("\n")
+%}{%        if line.startswith("Pipeline-Version:")
+%}{%          set metadata.pipeline_version = line | replace("Pipeline-Version:", "", 1) | trim
+%}{%        elif line.startswith("Pipeline-Git-SHA:")
+%}{%          set metadata.pipeline_git_sha = line | replace("Pipeline-Git-SHA:", "", 1) | trim
+%}{%        elif line.startswith("Raw-Batches:")
+%}{%          set metadata.raw_batches = line | replace("Raw-Batches:", "", 1) | trim
+%}{%        elif line.startswith("DVC-Target:")
+%}{%          set metadata.dvc_target = line | replace("DVC-Target:", "", 1) | trim
+%}{%        endif
+%}{%      endfor
+%}{%    endfor
+%}{%  endfor
+%}{%  if metadata.pipeline_version or metadata.pipeline_git_sha or metadata.raw_batches or metadata.dvc_target
+%}{{    "\n"
+}}{%    if metadata.pipeline_version and metadata.pipeline_git_sha
+%}{{      "**Data processed with `%s` (`%s`)**\n" | format(
+          metadata.pipeline_version,
+          metadata.pipeline_git_sha
+        )
+}}{%    elif metadata.pipeline_version
+%}{{      "**Data processed with `%s`**\n" | format(metadata.pipeline_version)
+}}{%    elif metadata.pipeline_git_sha
+%}{{      "**Data processed with pipeline commit `%s`**\n" | format(metadata.pipeline_git_sha)
+}}{%    endif
+%}{%    if metadata.raw_batches or metadata.dvc_target
+%}{{      "\n"
+}}{%    endif
+%}{%    if metadata.raw_batches
+%}{{      "- Raw batches: `%s`\n" | format(metadata.raw_batches)
+}}{%    endif
+%}{%    if metadata.dvc_target
+%}{{      "- DVC target: `%s`\n" | format(metadata.dvc_target)
+}}{%    endif
+%}{%  endif
+%}

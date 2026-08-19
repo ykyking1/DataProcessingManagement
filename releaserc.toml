@@ -16,5 +16,8 @@ allowed_tags = ["schema", "data", "build", "chore", "ci", "docs", "refactor", "s
 parse_squash_commits = true
 ignore_merge_commits = true
 
+[semantic_release.changelog]
+template_dir = "templates/data_changelog"
+
 [semantic_release.changelog.default_templates]
 changelog_file = "CHANGELOG_DATA.md"
