@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.2 (2026-08-19)
+
+**Data processed with `template-test` (`0573a77`)**
+
+- Raw batches: `none-template-test`
+- DVC target: `data/test_data/test_data.csv.dvc`
+
+### Data
+
+- **metadata**: Add pipeline lineage to release notes
+  ([`042779a`](https://github.com/ykyking1/DataProcessingManagement/commit/042779a56abd792a89b9542c0d445451ffbc18f4))
+
+
 ## v0.2.1 (2026-08-18)
 
 ### Chores
