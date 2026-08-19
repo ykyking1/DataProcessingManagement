@@ -1,0 +1,23 @@
+[semantic_release]
+commit_parser = "conventional"
+tag_format = "test-data-v{version}"
+allow_zero_version = true
+major_on_zero = true
+
+[semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[semantic_release.commit_parser_options]
+minor_tags = ["schema"]
+patch_tags = ["data"]
+other_allowed_tags = ["build", "chore", "ci", "docs", "refactor", "style", "test"]
+allowed_tags = ["schema", "data", "build", "chore", "ci", "docs", "refactor", "style", "test"]
+parse_squash_commits = true
+ignore_merge_commits = true
+
+[semantic_release.changelog]
+template_dir = "templates/data_changelog"
+
+[semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG_DATA.md"
