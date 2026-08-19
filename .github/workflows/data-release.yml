@@ -3,7 +3,7 @@ name: Test Data Release
 on:
   push:
     branches:
-      - test/dvc-release-automation
+      - main
   workflow_dispatch:
 
 permissions:

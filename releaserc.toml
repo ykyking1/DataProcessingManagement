@@ -4,8 +4,8 @@ tag_format = "test-data-v{version}"
 allow_zero_version = true
 major_on_zero = true
 
-[semantic_release.branches.test_data]
-match = "test/dvc-release-automation"
+[semantic_release.branches.main]
+match = "main"
 prerelease = false
 
 [semantic_release.commit_parser_options]
