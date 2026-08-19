@@ -1,8 +1,12 @@
 """
 Paylaşılan Partition Tanımı
 
-raw_uav_telemetry -> processed_telemetry -> clickhouse_telemetry
+raw_uav_telemetry -> processed_telemetry
 zincirindeki tüm asset'ler bu günlük partition'ı kullanır.
+
+processed_telemetry, işlenmiş veriyi data/processed/ klasörüne parquet
+olarak yazar; ClickHouse bu dosyaları sorgu zamanında (file() tablo
+fonksiyonuyla) doğrudan okur, ayrıca bir depolama adımı yoktur.
 
 Bunun sağladığı şeyler:
 

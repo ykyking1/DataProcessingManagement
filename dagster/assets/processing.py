@@ -1,8 +1,24 @@
+from pathlib import Path
+
 import pandas as pd
 
 from dagster import asset, MaterializeResult, MetadataValue
 
 from partitions import daily_partitions
+
+
+# ---------------------------------------------------------------------------
+# İşlenmiş verinin diske kaydedileceği klasör
+# ---------------------------------------------------------------------------
+#
+# ClickHouse dashboard'un ana veri kaynağı olmaya devam eder (filtreleme,
+# CSV dışa aktarma vb. hep ClickHouse üzerinden yapılır). Bu klasör, her
+# run'da üretilen curated veriyi dosya olarak da saklar; böylece işlenmiş
+# veri yedeklenmiş/denetlenebilir olur ve ClickHouse dışında da incelenebilir.
+#
+# "raw_uav_telemetry" ile aynı çalışma dizini varsayımını kullanır (dagster
+# dev, dagster/ klasöründen çalıştırılır -> data/processed = dagster/data/processed).
+PROCESSED_DATA_DIR = Path("data/processed")
 
 
 @asset(
@@ -66,14 +82,60 @@ def processed_telemetry(context, raw_uav_telemetry):
         else []
     )
 
+    # -------------------------------------------------------------------
+    # İşlenmiş veriyi /processed klasörüne parquet olarak kaydet
+    # -------------------------------------------------------------------
+    #
+    # ClickHouse asset'indeki (clickhouse.py) silme/yeniden-yazma mantığıyla
+    # aynı granülerlikte (partition_date + flight_id) dosyalıyoruz; böylece
+    # aynı güne (partition) ait farklı bir uçuşun dosyası, bu run'da
+    # üzerine yazılmaz.
+
+    partition_date = context.partition_key
+
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    processed_files = []
+
+    if not df.empty:
+
+        if flights:
+            groups = df.groupby("flight_id")
+        else:
+            groups = [(None, df)]
+
+        for flight_id, group_df in groups:
+
+            file_name = (
+                f"{flight_id}_{partition_date}.parquet"
+                if flight_id
+                else f"{partition_date}.parquet"
+            )
+
+            file_path = PROCESSED_DATA_DIR / file_name
+
+            group_df.to_parquet(file_path, index=False)
+
+            processed_files.append(str(file_path))
+
+        context.log.info(
+            f"İşlenmiş veri diske kaydedildi (partition={partition_date}): "
+            f"{processed_files}"
+        )
+
     return MaterializeResult(
         value=df,
         metadata={
-            "partition": context.partition_key,
+            "partition": partition_date,
             "row_count": len(df),
             "column_count": len(df.columns),
             "columns": ", ".join(df.columns),
             "flights": ", ".join(flights) if flights else "-",
             "schema": MetadataValue.json(schema),
+            "processed_files": (
+                MetadataValue.json(processed_files)
+                if processed_files
+                else "-"
+            ),
         },
     )

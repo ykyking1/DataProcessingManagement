@@ -7,19 +7,18 @@ from dagster import (
 )
 from dotenv import load_dotenv
 
-# CLICKHOUSE_* / ALERT_WEBHOOK_URL gibi ortam değişkenleri bu dosyadan
-# okunur. assets/clickhouse.py ve alerting.py bu değerleri sadece
-# çalışma zamanında (fonksiyon çağrıldığında) os.environ üzerinden
-# okuduğu için, .env'in en geç bu modül import edilirken yüklenmiş
-# olması yeterlidir. "dagster dev" nereden çalıştırılırsa çalıştırılsın
-# doğru dosyayı bulmak için mutlak yol kullanılıyor.
+# ALERT_WEBHOOK_URL gibi ortam değişkenleri bu dosyadan okunur.
+# alerting.py bu değerleri sadece çalışma zamanında (fonksiyon
+# çağrıldığında) os.environ üzerinden okuduğu için, .env'in en geç bu
+# modül import edilirken yüklenmiş olması yeterlidir. "dagster dev"
+# nereden çalıştırılırsa çalıştırılsın doğru dosyayı bulmak için mutlak
+# yol kullanılıyor.
 load_dotenv(
     Path(__file__).resolve().parent / ".env"
 )
 
 from assets import ingestion
 from assets import processing
-from assets import clickhouse
 
 from schedules.telemetry_sensor import telemetry_sensor
 
@@ -35,7 +34,6 @@ all_assets = load_assets_from_modules(
     [
         ingestion,
         processing,
-        clickhouse,
     ]
 )
 

@@ -3,7 +3,9 @@ A3 - İHA Veri Platformu
 Pipeline Metrikleri + Asset Kataloğu + Telemetri Gözat/Dışa Aktar
 
 Backend:
-    ClickHouse
+    ClickHouse (file() tablo fonksiyonuyla, dagster/data/processed
+    klasöründeki parquet dosyalarını sorgu zamanında okur — veri
+    ayrıca ClickHouse'un kendi depolama motoruna INSERT edilmez)
 
 AU-AIR telemetry kolonları:
 
@@ -278,10 +280,35 @@ def get_clickhouse_database() -> str:
     )
 
 
-def get_clickhouse_table() -> str:
+def get_processed_files_glob() -> str:
+    """
+    ClickHouse container'ına bağlı user_files_path altında, işlenmiş
+    parquet dosyalarını bulmak için kullanılan glob deseni.
+
+    dagster/assets/processing.py, işlenmiş veriyi
+    dagster/data/processed/ klasörüne yazar; bu klasör ClickHouse
+    container'ında /var/lib/clickhouse/user_files/processed olarak
+    bind mount edilmiştir (bkz. docker run --volume ayarı).
+    """
     return os.environ.get(
-        "CLICKHOUSE_TABLE",
-        "telemetry",
+        "CLICKHOUSE_PROCESSED_GLOB",
+        "processed/*.parquet",
+    )
+
+
+def get_clickhouse_source() -> str:
+    """
+    Sorgulanacak veri kaynağını, ClickHouse'un `file()` tablo
+    fonksiyonu ifadesi olarak döner.
+
+    ÖNEMLİ: Veri artık ClickHouse'un kendi depolama motoruna (MergeTree
+    tablosuna) INSERT edilmiyor. Her sorgu, dagster'ın ürettiği parquet
+    dosyalarını doğrudan (sorgu anında) okur. Bu fonksiyonun döndürdüğü
+    ifade, aşağıdaki tüm SELECT/DESCRIBE sorgularında `FROM` yerine
+    geçer.
+    """
+    return (
+        f"file('{get_processed_files_glob()}', 'Parquet')"
     )
 
 
@@ -326,10 +353,25 @@ def get_clickhouse_schema() -> pd.DataFrame:
     client = get_clickhouse_client()
 
     query = f"""
-    DESCRIBE TABLE {get_clickhouse_table()}
+    DESCRIBE TABLE {get_clickhouse_source()}
     """
 
-    result = client.query(query)
+    try:
+
+        result = client.query(query)
+
+    except Exception as exc:
+
+        # Henüz hiç işlenmiş parquet dosyası yoksa (örn. pipeline hiç
+        # çalışmadıysa) ClickHouse'un file() fonksiyonu
+        # CANNOT_EXTRACT_TABLE_STRUCTURE hatası fırlatır. Bu, gerçek bir
+        # bağlantı/yetki hatasından ayırt edilip boş şema olarak
+        # ele alınır; render_data_export bu durumda zaten kullanıcı
+        # dostu bir uyarı gösteriyor (bkz. "schema.empty" kontrolü).
+        if "CANNOT_EXTRACT_TABLE_STRUCTURE" in str(exc):
+            return pd.DataFrame()
+
+        raise
 
     rows = []
 
@@ -385,10 +427,23 @@ def get_numeric_columns() -> list:
     if schema.empty:
         return []
 
+    # NOT: file() ile Parquet okurken ClickHouse tüm kolon tiplerini
+    # "Nullable(...)" ile sarar (örn. "Nullable(Float64)"); eskiden
+    # MergeTree tablosunda tipler sarmalanmadan (örn. "Float64")
+    # geliyordu. Bu yüzden prefix kontrolünden önce "Nullable(...)"
+    # sarmalayıcısını soyuyoruz.
+
+    def _unwrap_nullable(type_name: str) -> str:
+
+        if type_name.startswith("Nullable(") and type_name.endswith(")"):
+            return type_name[len("Nullable("):-1]
+
+        return type_name
+
     numeric_cols = [
         row["kolon"]
         for _, row in schema.iterrows()
-        if str(row["tip"]).startswith(
+        if _unwrap_nullable(str(row["tip"])).startswith(
             NUMERIC_TYPE_HINTS
         )
     ]
@@ -412,7 +467,7 @@ def get_available_classes() -> list:
 
     query = f"""
     SELECT DISTINCT class
-    FROM {get_clickhouse_table()}
+    FROM {get_clickhouse_source()}
     ORDER BY class
     """
 
@@ -444,7 +499,7 @@ def get_available_flights() -> list:
 
     query = f"""
     SELECT DISTINCT flight_id
-    FROM {get_clickhouse_table()}
+    FROM {get_clickhouse_source()}
     WHERE flight_id != ''
     ORDER BY flight_id
     """
@@ -469,7 +524,7 @@ def get_time_range():
     SELECT
         min(time),
         max(time)
-    FROM {get_clickhouse_table()}
+    FROM {get_clickhouse_source()}
     """
 
     result = client.query(query)
@@ -621,7 +676,7 @@ def count_filtered_rows(
     query = f"""
     SELECT count() FROM (
         SELECT DISTINCT *
-        FROM {get_clickhouse_table()}
+        FROM {get_clickhouse_source()}
         WHERE {where}
     )
     """
@@ -686,7 +741,7 @@ def fetch_filtered_telemetry(
 
     query = f"""
     SELECT DISTINCT {col_expr}
-    FROM {get_clickhouse_table()}
+    FROM {get_clickhouse_source()}
     WHERE {where}
     ORDER BY time
     """
@@ -1743,8 +1798,8 @@ def render_data_export():
     )
 
     st.caption(
-        f"Backend: **ClickHouse** | "
-        f"Tablo: `{get_clickhouse_database()}.{get_clickhouse_table()}`"
+        f"Backend: **ClickHouse** (file() ile sorgu zamanında okuma) | "
+        f"Kaynak: `{get_processed_files_glob()}`"
     )
 
     # --------------------------------------------------------
@@ -1774,7 +1829,7 @@ def render_data_export():
     except Exception as exc:
 
         st.error(
-            f"ClickHouse tablo şeması okunamadı: {exc}"
+            f"Şema okunamadı: {exc}"
         )
 
         return
@@ -1782,7 +1837,10 @@ def render_data_export():
     if schema.empty:
 
         st.warning(
-            "ClickHouse tablosunda kolon bulunamadı."
+            f"`{get_processed_files_glob()}` altında henüz işlenmiş "
+            "parquet dosyası bulunamadı. Dagster pipeline'ı en az bir "
+            "kez çalışıp `processed_telemetry` asset'ini materialize "
+            "ettikten sonra burada veri görünecektir."
         )
 
         return
@@ -1806,7 +1864,7 @@ def render_data_export():
     if min_time is None or max_time is None:
 
         st.warning(
-            "Telemetry tablosunda veri bulunamadı."
+            "İşlenmiş parquet dosyalarında veri bulunamadı."
         )
 
         return
@@ -2497,9 +2555,8 @@ def main():
         )
 
         st.caption(
-            f"Tablo: "
-            f"{get_clickhouse_database()}."
-            f"{get_clickhouse_table()}"
+            f"Kaynak (parquet): "
+            f"{get_processed_files_glob()}"
         )
 
         st.divider()

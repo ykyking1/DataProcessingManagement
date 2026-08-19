@@ -1,6 +1,5 @@
 dagster
 dagster-webserver
-clickhouse-driver
 pandas
 pyarrow
 requests
