@@ -280,15 +280,24 @@ def get_clickhouse_database() -> str:
     )
 
 
+def get_clickhouse_table() -> str:
+    # dagster/assets/clickhouse.py bu isimde bir tabloya (aynı ortam
+    # değişkeniyle, CLICKHOUSE_TABLE) INSERT yapar; burada aynı isim
+    # kullanılarak iki taraf senkron kalır.
+    return os.environ.get(
+        "CLICKHOUSE_TABLE",
+        "telemetry",
+    )
+
+
 def get_processed_files_glob() -> str:
     """
-    ClickHouse container'ına bağlı user_files_path altında, işlenmiş
-    parquet dosyalarını bulmak için kullanılan glob deseni.
-
-    dagster/assets/processing.py, işlenmiş veriyi
-    dagster/data/processed/ klasörüne yazar; bu klasör ClickHouse
-    container'ında /var/lib/clickhouse/user_files/processed olarak
-    bind mount edilmiştir (bkz. docker run --volume ayarı).
+    dagster/assets/processing.py, ClickHouse'a INSERT etmeye ek olarak
+    işlenmiş veriyi yedek/denetim amacıyla dagster/data/processed/
+    klasörüne parquet olarak da yazar. Bu fonksiyon sadece o yedek
+    klasörü UI'da bilgi amaçlı göstermek için kullanılır; sorgular
+    artık bu dosyaları değil, doğrudan ClickHouse tablosunu okur
+    (bkz. get_clickhouse_source()).
     """
     return os.environ.get(
         "CLICKHOUSE_PROCESSED_GLOB",
@@ -298,17 +307,15 @@ def get_processed_files_glob() -> str:
 
 def get_clickhouse_source() -> str:
     """
-    Sorgulanacak veri kaynağını, ClickHouse'un `file()` tablo
-    fonksiyonu ifadesi olarak döner.
-
-    ÖNEMLİ: Veri artık ClickHouse'un kendi depolama motoruna (MergeTree
-    tablosuna) INSERT edilmiyor. Her sorgu, dagster'ın ürettiği parquet
-    dosyalarını doğrudan (sorgu anında) okur. Bu fonksiyonun döndürdüğü
+    Sorgulanacak veri kaynağını ClickHouse tablosunun tam adı
+    (database.table) olarak döner. dagster/assets/clickhouse.py,
+    processed_telemetry çıktısını bu tabloya INSERT eder; dashboard
+    ise aynı tabloyu sorgu zamanında okur. Bu fonksiyonun döndürdüğü
     ifade, aşağıdaki tüm SELECT/DESCRIBE sorgularında `FROM` yerine
     geçer.
     """
     return (
-        f"file('{get_processed_files_glob()}', 'Parquet')"
+        f"`{get_clickhouse_database()}`.`{get_clickhouse_table()}`"
     )
 
 
@@ -362,13 +369,18 @@ def get_clickhouse_schema() -> pd.DataFrame:
 
     except Exception as exc:
 
-        # Henüz hiç işlenmiş parquet dosyası yoksa (örn. pipeline hiç
-        # çalışmadıysa) ClickHouse'un file() fonksiyonu
-        # CANNOT_EXTRACT_TABLE_STRUCTURE hatası fırlatır. Bu, gerçek bir
-        # bağlantı/yetki hatasından ayırt edilip boş şema olarak
-        # ele alınır; render_data_export bu durumda zaten kullanıcı
-        # dostu bir uyarı gösteriyor (bkz. "schema.empty" kontrolü).
-        if "CANNOT_EXTRACT_TABLE_STRUCTURE" in str(exc):
+        # Pipeline henüz hiç çalışmadıysa (clickhouse_telemetry asset'i
+        # tabloyu henüz oluşturmadıysa) ClickHouse "UNKNOWN_TABLE" /
+        # "doesn't exist" hatası fırlatır. Bu, gerçek bir bağlantı/yetki
+        # hatasından ayırt edilip boş şema olarak ele alınır;
+        # render_data_export bu durumda zaten kullanıcı dostu bir uyarı
+        # gösteriyor (bkz. "schema.empty" kontrolü).
+        exc_text = str(exc)
+
+        if (
+            "UNKNOWN_TABLE" in exc_text
+            or "doesn't exist" in exc_text
+        ):
             return pd.DataFrame()
 
         raise
@@ -1791,6 +1803,173 @@ def render_alerts(
 # VERİ GÖZAT / DIŞA AKTAR
 # ============================================================
 
+def render_download_section(
+    dataframe: pd.DataFrame,
+    start_time: datetime,
+    end_time: datetime,
+) -> None:
+    """
+    "3️⃣ İndir" adımının içeriği.
+
+    İki bağımsız blok art arda gösterilir (birbirine bağlı bir sekme/
+    radio seçimi YOKTUR — böylece herhangi bir widget durumuna bağlı
+    kalmadan en azından "Tüm Veriyi İndir" butonu her zaman görünür):
+
+      1. Tüm veriyi tek bir CSV olarak indirme (her zaman gösterilir).
+      2. flight_id kolonu anlamlı veri içeriyorsa, uçuş bazlı ayrı
+         CSV'ler + toplu ZIP indirme (koşullu gösterilir).
+    """
+
+    time_suffix = (
+        f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
+        f"{end_time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    # --------------------------------------------------------
+    # 1) TÜM VERİ — TEK CSV
+    # --------------------------------------------------------
+
+    all_data_csv = dataframe.to_csv(
+        index=False
+    ).encode(
+        "utf-8-sig"
+    )
+
+    st.download_button(
+        label="📄 Tüm Veriyi CSV Olarak İndir",
+        data=all_data_csv,
+        file_name=f"au_air_telemetry_{time_suffix}.csv",
+        mime="text/csv",
+        type="primary",
+        key="download_all_data_csv",
+    )
+
+    st.caption(
+        f"CSV dosyası: {len(dataframe):,} satır, "
+        f"{len(dataframe.columns)} kolon"
+    )
+
+    # --------------------------------------------------------
+    # 2) UÇUŞ BAZLI AYRI DOSYALAR (varsa)
+    # --------------------------------------------------------
+    #
+    # Yukarıdaki filtrelere (zaman, class, değer bazlı filtreler) uyan
+    # veri, her uçuş için ayrı bir CSV dosyasına bölünür; ayrıca hepsi
+    # tek bir ZIP içinde de toplu indirilebilir.
+
+    if "flight_id" not in dataframe.columns:
+        return
+
+    # pandas.groupby varsayılan olarak NaN/None grup anahtarlarını zaten
+    # otomatik eler; burada ek olarak sadece boş string ("") ve gerçekten
+    # boş/whitespace-only değerler dışlanır (eski, flight_id kolonu
+    # eklenmeden önce yazılmış satırlar boş string içerebilir).
+
+    flight_groups = {
+        str(flight): group_df
+        for flight, group_df in dataframe.groupby("flight_id")
+        if str(flight).strip()
+    }
+
+    if not flight_groups:
+        return
+
+    st.divider()
+
+    st.markdown(
+        "**✈️ Uçuş Bazlı İndirme**"
+    )
+
+    summary_rows = [
+        {
+            "uçuş": flight,
+            "satır_sayısı": len(group_df),
+        }
+        for flight, group_df in sorted(flight_groups.items())
+    ]
+
+    st.dataframe(
+        pd.DataFrame(summary_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Her uçuşun CSV baytları burada bir kere hesaplanıp önbelleğe
+    # alınır; hem ZIP hem de tek tek indirme butonları aynı sonucu
+    # kullanır. Büyük veri setlerinde bu işlem biraz sürebileceği için
+    # spinner ile sarmalanır (geri bildirimsiz uzun bekleme, sayfanın
+    # "donmuş" gibi görünmesine yol açıyordu).
+
+    with st.spinner(
+        f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
+    ):
+
+        flight_csv_bytes = {
+            flight: group_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
+            for flight, group_df in flight_groups.items()
+        }
+
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(
+            zip_buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
+
+            for flight, csv_bytes in flight_csv_bytes.items():
+
+                zip_file.writestr(
+                    f"ucus_{flight}_{time_suffix}.csv",
+                    csv_bytes,
+                )
+
+    st.download_button(
+        label=(
+            f"📦 Tüm Uçuşları ZIP Olarak İndir "
+            f"({len(flight_groups)} dosya)"
+        ),
+        data=zip_buffer.getvalue(),
+        file_name=f"ucuslar_{time_suffix}.zip",
+        mime="application/zip",
+        type="primary",
+        key="download_all_flights_zip",
+    )
+
+    st.caption(
+        "Her uçuş için ayrı bir CSV dosyası içerir. "
+        "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
+    )
+
+    with st.expander(
+        "Uçuşları tek tek indir"
+    ):
+
+        for flight, group_df in sorted(flight_groups.items()):
+
+            col_a, col_b = st.columns(
+                [3, 1]
+            )
+
+            with col_a:
+
+                st.write(
+                    f"**{flight}** — {len(group_df):,} satır"
+                )
+
+            with col_b:
+
+                st.download_button(
+                    label="CSV indir",
+                    data=flight_csv_bytes[flight],
+                    file_name=f"ucus_{flight}_{time_suffix}.csv",
+                    mime="text/csv",
+                    key=f"download_flight_{flight}",
+                )
+
+
 def render_data_export():
 
     st.subheader(
@@ -1798,8 +1977,8 @@ def render_data_export():
     )
 
     st.caption(
-        f"Backend: **ClickHouse** (file() ile sorgu zamanında okuma) | "
-        f"Kaynak: `{get_processed_files_glob()}`"
+        f"Backend: **ClickHouse** | "
+        f"Tablo: `{get_clickhouse_database()}.{get_clickhouse_table()}`"
     )
 
     # --------------------------------------------------------
@@ -1837,9 +2016,9 @@ def render_data_export():
     if schema.empty:
 
         st.warning(
-            f"`{get_processed_files_glob()}` altında henüz işlenmiş "
-            "parquet dosyası bulunamadı. Dagster pipeline'ı en az bir "
-            "kez çalışıp `processed_telemetry` asset'ini materialize "
+            f"`{get_clickhouse_database()}.{get_clickhouse_table()}` "
+            "tablosu henüz oluşturulmamış. Dagster pipeline'ı en az bir "
+            "kez çalışıp `clickhouse_telemetry` asset'ini materialize "
             "ettikten sonra burada veri görünecektir."
         )
 
@@ -2349,173 +2528,32 @@ def render_data_export():
     # ==========================================================
     # ADIM 3 — İNDİR
     # ==========================================================
-    #
-    # İndirme seçenekleri sekmeler hâlinde ayrılır: tüm veri tek bir
-    # CSV olarak, ya da (flight_id mevcutsa) uçuş bazlı ayrı dosyalar
-    # hâlinde indirilebilir. Böylece her yöntem kendi sekmesinde
-    # kalır ve aynı anda ekranda üst üste görünmez.
 
     st.subheader(
         "3️⃣ İndir"
     )
 
-    has_flight_breakdown = (
-        "flight_id" in dataframe.columns
-        and dataframe["flight_id"].notna().any()
-    )
+    try:
 
-    if has_flight_breakdown:
-        tab_all, tab_flights = st.tabs(
-            ["📄 Tüm Veri", "✈️ Uçuş Bazlı"]
-        )
-    else:
-        tab_all, = st.tabs(
-            ["📄 Tüm Veri"]
+        render_download_section(
+            dataframe,
+            start_time,
+            end_time,
         )
 
-    with tab_all:
+    except Exception as exc:
 
-        csv_data = dataframe.to_csv(
-            index=False
-        ).encode(
-            "utf-8-sig"
+        # Bu bölüm daha önce (belirli filtre kombinasyonlarında) hiçbir
+        # hata göstermeden sessizce boş kalıyordu. Nedeni tam olarak
+        # tekrar üretilemedi; bu yüzden burada olası bir istisna artık
+        # yutulmuyor, doğrudan ekranda gösteriliyor ki bir daha "hiçbir
+        # şey görünmüyor, hata da yok" durumuna düşülmesin.
+
+        st.error(
+            "İndirme seçenekleri hazırlanırken beklenmeyen bir hata oluştu."
         )
 
-        filename = (
-            f"au_air_telemetry_"
-            f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-            f"{end_time.strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-
-        st.download_button(
-            label="CSV olarak indir",
-            data=csv_data,
-            file_name=filename,
-            mime="text/csv",
-            type="primary",
-        )
-
-        st.caption(
-            f"CSV dosyası: {len(dataframe):,} satır, "
-            f"{len(dataframe.columns)} kolon"
-        )
-
-    # --------------------------------------------------------
-    # UÇUŞ BAZLI AYRI DOSYALAR
-    # --------------------------------------------------------
-    #
-    # Yukarıdaki filtrelere (zaman, class, değer bazlı filtreler) uyan
-    # veri, seçilen her uçuş için ayrı bir CSV dosyasına bölünür.
-    # Örn: "altitude > 30" filtresiyle uçuş 1, 2 ve 3'ün her biri için
-    # ayrı ayrı CSV indirilebilir; ayrıca hepsi tek bir ZIP içinde de
-    # toplu indirilebilir.
-
-    if has_flight_breakdown:
-
-        with tab_flights:
-
-            flight_groups = {
-                flight: group_df
-                for flight, group_df in dataframe.groupby("flight_id")
-                if flight not in (None, "")
-            }
-
-            if not flight_groups:
-
-                st.info(
-                    "Getirilen veride ayırt edilebilir bir uçuş bulunamadı."
-                )
-
-            else:
-
-                summary_rows = [
-                    {
-                        "uçuş": flight,
-                        "satır_sayısı": len(group_df),
-                    }
-                    for flight, group_df in sorted(flight_groups.items())
-                ]
-
-                st.dataframe(
-                    pd.DataFrame(summary_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                def _flight_csv_bytes(flight_df: pd.DataFrame) -> bytes:
-
-                    return flight_df.to_csv(
-                        index=False
-                    ).encode("utf-8-sig")
-
-                time_suffix = (
-                    f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-                    f"{end_time.strftime('%Y%m%d_%H%M%S')}"
-                )
-
-                # ---- Toplu ZIP indirme ----
-
-                zip_buffer = io.BytesIO()
-
-                with zipfile.ZipFile(
-                    zip_buffer,
-                    mode="w",
-                    compression=zipfile.ZIP_DEFLATED,
-                ) as zip_file:
-
-                    for flight, group_df in flight_groups.items():
-
-                        zip_file.writestr(
-                            f"ucus_{flight}_{time_suffix}.csv",
-                            _flight_csv_bytes(group_df),
-                        )
-
-                st.download_button(
-                    label=(
-                        f"📦 Tüm Uçuşları ZIP Olarak İndir "
-                        f"({len(flight_groups)} dosya)"
-                    ),
-                    data=zip_buffer.getvalue(),
-                    file_name=f"ucuslar_{time_suffix}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    key="download_all_flights_zip",
-                )
-
-                st.caption(
-                    "Her uçuş için ayrı bir CSV dosyası içerir. "
-                    "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
-                )
-
-                # ---- Tek tek indirme ----
-
-                with st.expander(
-                    "Uçuşları tek tek indir"
-                ):
-
-                    for flight, group_df in sorted(flight_groups.items()):
-
-                        col_a, col_b = st.columns(
-                            [3, 1]
-                        )
-
-                        with col_a:
-
-                            st.write(
-                                f"**{flight}** — {len(group_df):,} satır"
-                            )
-
-                        with col_b:
-
-                            st.download_button(
-                                label="CSV indir",
-                                data=_flight_csv_bytes(group_df),
-                                file_name=(
-                                    f"ucus_{flight}_{time_suffix}.csv"
-                                ),
-                                mime="text/csv",
-                                key=f"download_flight_{flight}",
-                            )
+        st.exception(exc)
 
 
 # ============================================================
@@ -2555,7 +2593,12 @@ def main():
         )
 
         st.caption(
-            f"Kaynak (parquet): "
+            f"ClickHouse tablosu: "
+            f"{get_clickhouse_database()}.{get_clickhouse_table()}"
+        )
+
+        st.caption(
+            f"Parquet yedeği: "
             f"{get_processed_files_glob()}"
         )
 
@@ -2608,12 +2651,53 @@ def main():
     # AUTO REFRESH
     # ========================================================
 
-    if refresh_seconds:
+    # "Veri Gözat / Dışa Aktar" akışında otomatik yenileme, gerçek
+    # ortamda doğrulanmış iki ayrı şekilde export'u bozuyordu:
+    #
+    #  1) Sadece interval değerini büyütmek (ör. 24 saate çekmek)
+    #     YETERLİ DEĞİL — streamlit_autorefresh bileşeninin JS tarafı
+    #     zaten çalışan bir zamanlayıcı varken yeni interval'i
+    #     güvenilir şekilde uygulamıyor. Bu yüzden bileşen, interval
+    #     değiştirilerek değil doğrudan HİÇ MONTE EDİLMEYEREK devre
+    #     dışı bırakılır (aşağıdaki st.empty() ile).
+    #
+    #  2) Bunu yalnızca "veri getirildikten sonra" (export_df set
+    #     edildikten sonra) yapmak da yetersizdi: otomatik yenileme
+    #     hâlâ aktifken "📥 Veriyi Getir ve Önizle" tıklaması, o anda
+    #     tetiklenen bir yenilemeyle yarışıp sunucuya hiç ulaşmamış
+    #     gibi kayboluyordu — export_df bir türlü set edilemiyor,
+    #     "3️⃣ İndir" sonsuza dek boş kalıyordu. Bu yüzden duraklatma,
+    #     satır sayısı hesaplandığı anda (export_row_count set
+    #     edilir edilmez) başlar; "Veriyi Getir ve Önizle" tıklandığı
+    #     an otomatik yenileme zaten devre dışıdır, yarış oluşmaz.
+    #     (~874k satırlık bir export ile: otomatik yenileme AÇIKKEN
+    #     asla tamamlanmadı, bu düzeltmeyle ~20-30 saniyede sorunsuz
+    #     tamamlandı.)
+    #
+    # st_autorefresh() çağrısını koşula bağlı olarak tamamen var/yok
+    # etmek (fonksiyonu hiç çağırmamak), st.tabs() öncesindeki eleman
+    # sırasını/sayısını değiştirip Streamlit'in dış sekmeleri (main()
+    # içindeki "Pipeline Metrikleri" vb.) yeniden takılmış gibi
+    # algılayıp seçili sekmeyi ilk sekmeye sıfırlamasına yol açıyordu.
+    # Bunu önlemek için sabit bir st.empty() placeholder HER ZAMAN aynı
+    # noktada oluşturulur — değişen şey, bu placeholder'ın İÇİNİN
+    # doldurulup doldurulmaması.
 
-        st_autorefresh(
-            interval=refresh_seconds * 1000,
-            key="dashboard_refresh",
-        )
+    export_in_progress = (
+        st.session_state.get("export_row_count") is not None
+        or st.session_state.get("export_df") is not None
+    )
+
+    autorefresh_slot = st.empty()
+
+    if refresh_seconds and not export_in_progress:
+
+        with autorefresh_slot:
+
+            st_autorefresh(
+                interval=refresh_seconds * 1000,
+                key="dashboard_refresh",
+            )
 
     # ========================================================
     # RUN VERİSİNİ BİR KEZ ÇEK
