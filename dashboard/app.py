@@ -103,9 +103,6 @@ REFRESH_OPTIONS = {
     "60 sn": 60,
 }
 
-MAX_EXPORT_ROWS = 2_000_000
-
-
 # ============================================================
 # AU-AIR KOLONLARI
 # ============================================================
@@ -1803,6 +1800,13 @@ def render_alerts(
 # VERİ GÖZAT / DIŞA AKTAR
 # ============================================================
 
+DOWNLOAD_FORMAT_LABELS = {
+    "all": "📄 Tüm Veri (Tek CSV)",
+    "zip": "📦 Uçuş Bazlı ZIP",
+    "each": "✈️ Uçuşları Tek Tek İndir",
+}
+
+
 def render_download_section(
     dataframe: pd.DataFrame,
     start_time: datetime,
@@ -1811,13 +1815,11 @@ def render_download_section(
     """
     "3️⃣ İndir" adımının içeriği.
 
-    İki bağımsız blok art arda gösterilir (birbirine bağlı bir sekme/
-    radio seçimi YOKTUR — böylece herhangi bir widget durumuna bağlı
-    kalmadan en azından "Tüm Veriyi İndir" butonu her zaman görünür):
-
-      1. Tüm veriyi tek bir CSV olarak indirme (her zaman gösterilir).
-      2. flight_id kolonu anlamlı veri içeriyorsa, uçuş bazlı ayrı
-         CSV'ler + toplu ZIP indirme (koşullu gösterilir).
+    Kullanıcı önce bir indirme formatı seçer; CSV/ZIP dönüşümü SADECE
+    seçilen format için yapılır. Önceden üç format da (tek CSV, uçuş
+    bazlı ZIP, uçuş bazlı tek tek CSV) her render'da aynı anda
+    hesaplanıyordu — büyük veri setlerinde bu gereksiz yere uzun
+    sürüyordu.
     """
 
     time_suffix = (
@@ -1825,41 +1827,34 @@ def render_download_section(
         f"{end_time.strftime('%Y%m%d_%H%M%S')}"
     )
 
-    # --------------------------------------------------------
-    # 1) TÜM VERİ — TEK CSV
-    # --------------------------------------------------------
+    has_flight_id = "flight_id" in dataframe.columns
 
-    all_data_csv = dataframe.to_csv(
-        index=False
-    ).encode(
-        "utf-8-sig"
+    format_keys = ["all"]
+
+    if has_flight_id:
+        format_keys += ["zip", "each"]
+
+    selected_format = st.radio(
+        "İndirme formatı seçin",
+        options=format_keys,
+        format_func=lambda key: DOWNLOAD_FORMAT_LABELS[key],
+        index=0,
+        horizontal=True,
+        key="download_format_choice",
     )
 
-    st.download_button(
-        label="📄 Tüm Veriyi CSV Olarak İndir",
-        data=all_data_csv,
-        file_name=f"au_air_telemetry_{time_suffix}.csv",
-        mime="text/csv",
-        type="primary",
-        key="download_all_data_csv",
-    )
+    st.divider()
 
-    st.caption(
-        f"CSV dosyası: {len(dataframe):,} satır, "
-        f"{len(dataframe.columns)} kolon"
-    )
+    if selected_format == "all":
 
-    # --------------------------------------------------------
-    # 2) UÇUŞ BAZLI AYRI DOSYALAR (varsa)
-    # --------------------------------------------------------
-    #
-    # Yukarıdaki filtrelere (zaman, class, değer bazlı filtreler) uyan
-    # veri, her uçuş için ayrı bir CSV dosyasına bölünür; ayrıca hepsi
-    # tek bir ZIP içinde de toplu indirilebilir.
+        _render_all_data_csv_download(
+            dataframe,
+            time_suffix,
+        )
 
-    if "flight_id" not in dataframe.columns:
         return
 
+    # "zip" ve "each" — ikisi de flight_id bazlı gruplamaya ihtiyaç duyar.
     # pandas.groupby varsayılan olarak NaN/None grup anahtarlarını zaten
     # otomatik eler; burada ek olarak sadece boş string ("") ve gerçekten
     # boş/whitespace-only değerler dışlanır (eski, flight_id kolonu
@@ -1872,9 +1867,13 @@ def render_download_section(
     }
 
     if not flight_groups:
-        return
 
-    st.divider()
+        st.info(
+            "Seçilen veride uçuş bazlı gruplama için kullanılabilir "
+            "flight_id bulunamadı."
+        )
+
+        return
 
     st.markdown(
         "**✈️ Uçuş Bazlı İndirme**"
@@ -1894,22 +1893,64 @@ def render_download_section(
         hide_index=True,
     )
 
-    # Her uçuşun CSV baytları burada bir kere hesaplanıp önbelleğe
-    # alınır; hem ZIP hem de tek tek indirme butonları aynı sonucu
-    # kullanır. Büyük veri setlerinde bu işlem biraz sürebileceği için
-    # spinner ile sarmalanır (geri bildirimsiz uzun bekleme, sayfanın
-    # "donmuş" gibi görünmesine yol açıyordu).
+    if selected_format == "zip":
+
+        _render_flight_zip_download(
+            flight_groups,
+            time_suffix,
+        )
+
+    else:
+
+        _render_flight_individual_downloads(
+            flight_groups,
+            time_suffix,
+        )
+
+
+def _render_all_data_csv_download(
+    dataframe: pd.DataFrame,
+    time_suffix: str,
+) -> None:
+
+    # Büyük veri setlerinde bu dönüşüm birkaç saniye sürebiliyor; spinner
+    # olmadan sekme "donmuş" gibi görünüyor ve kullanıcı bir hata
+    # olduğunu düşünebiliyordu.
 
     with st.spinner(
-        f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
+        "Veriniz indirmeye hazırlanıyor, veri miktarına bağlı olarak "
+        "bu işlem biraz sürebilir..."
     ):
 
-        flight_csv_bytes = {
-            flight: group_df.to_csv(
-                index=False
-            ).encode("utf-8-sig")
-            for flight, group_df in flight_groups.items()
-        }
+        all_data_csv = dataframe.to_csv(
+            index=False
+        ).encode(
+            "utf-8-sig"
+        )
+
+    st.download_button(
+        label="📄 Tüm Veriyi CSV Olarak İndir",
+        data=all_data_csv,
+        file_name=f"au_air_telemetry_{time_suffix}.csv",
+        mime="text/csv",
+        type="primary",
+        key="download_all_data_csv",
+    )
+
+    st.caption(
+        f"CSV dosyası: {len(dataframe):,} satır, "
+        f"{len(dataframe.columns)} kolon"
+    )
+
+
+def _render_flight_zip_download(
+    flight_groups: dict,
+    time_suffix: str,
+) -> None:
+
+    with st.spinner(
+        f"{len(flight_groups)} uçuş için ZIP hazırlanıyor..."
+    ):
 
         zip_buffer = io.BytesIO()
 
@@ -1919,7 +1960,11 @@ def render_download_section(
             compression=zipfile.ZIP_DEFLATED,
         ) as zip_file:
 
-            for flight, csv_bytes in flight_csv_bytes.items():
+            for flight, group_df in flight_groups.items():
+
+                csv_bytes = group_df.to_csv(
+                    index=False
+                ).encode("utf-8-sig")
 
                 zip_file.writestr(
                     f"ucus_{flight}_{time_suffix}.csv",
@@ -1939,35 +1984,47 @@ def render_download_section(
     )
 
     st.caption(
-        "Her uçuş için ayrı bir CSV dosyası içerir. "
-        "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
+        "Her uçuş için ayrı bir CSV dosyası içerir."
     )
 
-    with st.expander(
-        "Uçuşları tek tek indir"
+
+def _render_flight_individual_downloads(
+    flight_groups: dict,
+    time_suffix: str,
+) -> None:
+
+    with st.spinner(
+        f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
     ):
 
-        for flight, group_df in sorted(flight_groups.items()):
+        flight_csv_bytes = {
+            flight: group_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
+            for flight, group_df in flight_groups.items()
+        }
 
-            col_a, col_b = st.columns(
-                [3, 1]
+    for flight, group_df in sorted(flight_groups.items()):
+
+        col_a, col_b = st.columns(
+            [3, 1]
+        )
+
+        with col_a:
+
+            st.write(
+                f"**{flight}** — {len(group_df):,} satır"
             )
 
-            with col_a:
+        with col_b:
 
-                st.write(
-                    f"**{flight}** — {len(group_df):,} satır"
-                )
-
-            with col_b:
-
-                st.download_button(
-                    label="CSV indir",
-                    data=flight_csv_bytes[flight],
-                    file_name=f"ucus_{flight}_{time_suffix}.csv",
-                    mime="text/csv",
-                    key=f"download_flight_{flight}",
-                )
+            st.download_button(
+                label="CSV indir",
+                data=flight_csv_bytes[flight],
+                file_name=f"ucus_{flight}_{time_suffix}.csv",
+                mime="text/csv",
+                key=f"download_flight_{flight}",
+            )
 
 
 def render_data_export():
@@ -2391,8 +2448,7 @@ def render_data_export():
     )
 
     st.caption(
-        f"Önce satır sayısını hesaplayın (limit: {MAX_EXPORT_ROWS:,} satır), "
-        "ardından veriyi getirip önizleyin."
+        "Önce satır sayısını hesaplayın, ardından veriyi getirip önizleyin."
     )
 
     if st.button(
@@ -2446,20 +2502,6 @@ def render_data_export():
 
         st.warning(
             "Seçilen filtrelerle eşleşen veri yok."
-        )
-
-        return
-
-    if row_count > MAX_EXPORT_ROWS:
-
-        st.warning(
-            f"{row_count:,} satır çok fazla. "
-            f"Mevcut export limiti: "
-            f"{MAX_EXPORT_ROWS:,} satır."
-        )
-
-        st.info(
-            "Lütfen zaman aralığını veya class filtresini daraltın."
         )
 
         return

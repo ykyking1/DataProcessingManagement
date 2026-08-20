@@ -46,5 +46,29 @@
     "error": "[Errno 2] No such file or directory: 'D:\\\\Haluk Yıldız\\\\DataProcessingManagement\\\\dagster\\\\.tmp_dagster_home_lsxr0x_8\\\\storage\\\\processed_telemetry\\\\2026-08-16'",
     "status": "RESOLVED",
     "resolved_at": "2026-08-18T14:05:22.505934+00:00"
+  },
+  {
+    "timestamp": "2026-08-20T05:13:00.108531+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "Code: 210. Hedef makine etkin olarak reddettiğinden bağlantı kurulamadı (localhost:9000)",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-20T05:24:18.042035+00:00"
+  },
+  {
+    "timestamp": "2026-08-20T06:07:11.676719+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "Code: 210. Hedef makine etkin olarak reddettiğinden bağlantı kurulamadı (localhost:9000)",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-20T06:07:54.393067+00:00"
+  },
+  {
+    "timestamp": "2026-08-20T06:07:13.767941+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "Code: 210. Hedef makine etkin olarak reddettiğinden bağlantı kurulamadı (localhost:9000)",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-20T06:07:54.393079+00:00"
   }
 ]
