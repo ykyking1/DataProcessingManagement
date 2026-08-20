@@ -2245,6 +2245,12 @@ def render_download_section(
     bazlı ZIP, uçuş bazlı tek tek CSV) her render'da aynı anda
     hesaplanıyordu — büyük veri setlerinde bu gereksiz yere uzun
     sürüyordu.
+
+    ÖNEMLİ: Format seçildiğinde (hatta "Tüm Veri" varsayılan seçili
+    geldiğinde, kullanıcı hiçbir şeye tıklamadan) dönüşümün OTOMATİK
+    başlamaması için, her format kendi alt fonksiyonunda ayrıca bir
+    "Oluştur" butonuna basılmasını bekler (bkz. _render_all_data_csv_download
+    vb.) -- dönüşüm yalnızca o butona basılınca çalışır.
     """
 
     time_suffix = (
@@ -2318,11 +2324,18 @@ def render_download_section(
         hide_index=True,
     )
 
+    # flight_groups her render'da groupby ile yeniden oluşturulduğu için
+    # kendi id()'si her seferinde değişir; cache anahtarı bunun yerine
+    # session_state'ten gelen (dolayısıyla rerun'lar arasında sabit
+    # kalan) dataframe'in id()'sine dayanır.
+    dataframe_id = id(dataframe)
+
     if selected_format == "zip":
 
         _render_flight_zip_download(
             flight_groups,
             time_suffix,
+            dataframe_id,
         )
 
     else:
@@ -2330,6 +2343,7 @@ def render_download_section(
         _render_flight_individual_downloads(
             flight_groups,
             time_suffix,
+            dataframe_id,
         )
 
 
@@ -2338,96 +2352,179 @@ def _render_all_data_csv_download(
     time_suffix: str,
 ) -> None:
 
-    # Büyük veri setlerinde bu dönüşüm birkaç saniye sürebiliyor; spinner
-    # olmadan sekme "donmuş" gibi görünüyor ve kullanıcı bir hata
-    # olduğunu düşünebiliyordu.
-
-    with st.spinner(
-        "Veriniz indirmeye hazırlanıyor, veri miktarına bağlı olarak "
-        "bu işlem biraz sürebilir..."
-    ):
-
-        all_data_csv = dataframe.to_csv(
-            index=False
-        ).encode(
-            "utf-8-sig"
-        )
-
-    st.download_button(
-        label="📄 Tüm Veriyi CSV Olarak İndir",
-        data=all_data_csv,
-        file_name=f"au_air_telemetry_{time_suffix}.csv",
-        mime="text/csv",
-        type="primary",
-        key="download_all_data_csv",
-    )
-
     st.caption(
         f"CSV dosyası: {len(dataframe):,} satır, "
         f"{len(dataframe.columns)} kolon"
     )
 
+    # Dönüşüm yalnızca kullanıcı açıkça bu butona basınca çalışır --
+    # aksi halde "Tüm Veri" formatı varsayılan seçili geldiği için sekme
+    # açılır açılmaz (kullanıcı hiçbir şey yapmadan) büyük veri setinde
+    # saniyeler süren bir CSV dönüşümü otomatik başlıyordu.
+
+    cache_key = ("all", id(dataframe))
+
+    if st.button(
+        "📄 CSV Oluştur",
+        type="primary",
+        key="prepare_all_data_csv",
+    ):
+
+        # Büyük veri setlerinde bu dönüşüm birkaç saniye sürebiliyor;
+        # spinner olmadan sekme "donmuş" gibi görünüyor ve kullanıcı bir
+        # hata olduğunu düşünebiliyordu.
+
+        with st.spinner(
+            "Veriniz indirmeye hazırlanıyor, veri miktarına bağlı olarak "
+            "bu işlem biraz sürebilir..."
+        ):
+
+            csv_bytes = dataframe.to_csv(
+                index=False
+            ).encode(
+                "utf-8-sig"
+            )
+
+        st.session_state["download_all_data_cache"] = {
+            "key": cache_key,
+            "bytes": csv_bytes,
+        }
+
+    cache = st.session_state.get("download_all_data_cache")
+
+    if cache and cache["key"] == cache_key:
+
+        st.download_button(
+            label="⬇️ Tüm Veriyi CSV Olarak İndir",
+            data=cache["bytes"],
+            file_name=f"au_air_telemetry_{time_suffix}.csv",
+            mime="text/csv",
+            type="primary",
+            key="download_all_data_csv",
+        )
+
+    else:
+
+        st.caption(
+            "İndirme dosyasını oluşturmak için yukarıdaki butona basın."
+        )
+
 
 def _render_flight_zip_download(
     flight_groups: dict,
     time_suffix: str,
+    dataframe_id: int,
 ) -> None:
 
-    with st.spinner(
-        f"{len(flight_groups)} uçuş için ZIP hazırlanıyor..."
+    st.caption(
+        f"{len(flight_groups)} uçuş, toplam "
+        f"{sum(len(g) for g in flight_groups.values()):,} satır."
+    )
+
+    cache_key = ("zip", dataframe_id)
+
+    if st.button(
+        "📦 ZIP Oluştur",
+        type="primary",
+        key="prepare_flight_zip",
     ):
 
-        zip_buffer = io.BytesIO()
+        with st.spinner(
+            f"{len(flight_groups)} uçuş için ZIP hazırlanıyor..."
+        ):
 
-        with zipfile.ZipFile(
-            zip_buffer,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-        ) as zip_file:
+            zip_buffer = io.BytesIO()
 
-            for flight, group_df in flight_groups.items():
+            with zipfile.ZipFile(
+                zip_buffer,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as zip_file:
 
-                csv_bytes = group_df.to_csv(
-                    index=False
-                ).encode("utf-8-sig")
+                for flight, group_df in flight_groups.items():
 
-                zip_file.writestr(
-                    f"ucus_{flight}_{time_suffix}.csv",
-                    csv_bytes,
-                )
+                    csv_bytes = group_df.to_csv(
+                        index=False
+                    ).encode("utf-8-sig")
 
-    st.download_button(
-        label=(
-            f"📦 Tüm Uçuşları ZIP Olarak İndir "
-            f"({len(flight_groups)} dosya)"
-        ),
-        data=zip_buffer.getvalue(),
-        file_name=f"ucuslar_{time_suffix}.zip",
-        mime="application/zip",
-        type="primary",
-        key="download_all_flights_zip",
-    )
+                    zip_file.writestr(
+                        f"ucus_{flight}_{time_suffix}.csv",
+                        csv_bytes,
+                    )
 
-    st.caption(
-        "Her uçuş için ayrı bir CSV dosyası içerir."
-    )
+        st.session_state["download_flight_zip_cache"] = {
+            "key": cache_key,
+            "bytes": zip_buffer.getvalue(),
+        }
+
+    cache = st.session_state.get("download_flight_zip_cache")
+
+    if cache and cache["key"] == cache_key:
+
+        st.download_button(
+            label=(
+                f"⬇️ Tüm Uçuşları ZIP Olarak İndir "
+                f"({len(flight_groups)} dosya)"
+            ),
+            data=cache["bytes"],
+            file_name=f"ucuslar_{time_suffix}.zip",
+            mime="application/zip",
+            type="primary",
+            key="download_all_flights_zip",
+        )
+
+        st.caption(
+            "Her uçuş için ayrı bir CSV dosyası içerir."
+        )
+
+    else:
+
+        st.caption(
+            "İndirme dosyasını oluşturmak için yukarıdaki butona basın."
+        )
 
 
 def _render_flight_individual_downloads(
     flight_groups: dict,
     time_suffix: str,
+    dataframe_id: int,
 ) -> None:
 
-    with st.spinner(
-        f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
+    cache_key = ("each", dataframe_id)
+
+    if st.button(
+        "✈️ CSV'leri Oluştur",
+        type="primary",
+        key="prepare_flight_individual_csvs",
     ):
 
-        flight_csv_bytes = {
-            flight: group_df.to_csv(
-                index=False
-            ).encode("utf-8-sig")
-            for flight, group_df in flight_groups.items()
+        with st.spinner(
+            f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
+        ):
+
+            flight_csv_bytes = {
+                flight: group_df.to_csv(
+                    index=False
+                ).encode("utf-8-sig")
+                for flight, group_df in flight_groups.items()
+            }
+
+        st.session_state["download_flight_individual_cache"] = {
+            "key": cache_key,
+            "bytes": flight_csv_bytes,
         }
+
+    cache = st.session_state.get("download_flight_individual_cache")
+
+    if not (cache and cache["key"] == cache_key):
+
+        st.caption(
+            "İndirme dosyalarını oluşturmak için yukarıdaki butona basın."
+        )
+
+        return
+
+    flight_csv_bytes = cache["bytes"]
 
     for flight, group_df in sorted(flight_groups.items()):
 
