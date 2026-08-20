@@ -1,0 +1,14 @@
+# Pipeline Changelog
+
+Dagster orchestration, processing, validation, reproducibility, and runtime dependency changes are recorded here.
+
+<!-- version list -->
+
+## pipeline-v0.1.0 (2026-08-20)
+
+
+### Features
+
+- **pipeline**: Add independent semantic release stream ([`21754b0`](https://github.com/ykyking1/DataProcessingManagement/commit/21754b0ac8eea4913222c895a789ed8fe3df55f2))
+
+- **pipeline**: Integrate Dagster outputs with DVC ([`955a29e`](https://github.com/ykyking1/DataProcessingManagement/commit/955a29e99214b641b542bb9b3bbb6d2a95105469))

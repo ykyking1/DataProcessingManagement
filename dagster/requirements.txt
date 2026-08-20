@@ -1,5 +1,6 @@
 dagster
 dagster-webserver
+dvc==3.67.1
 clickhouse-driver
 psycopg2-binary
 pandas

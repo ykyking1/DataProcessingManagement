@@ -8,4 +8,7 @@ __pycache__/
 /tmp/
 reports
 /data/raw/
+/dagster/data/raw/
+/dagster/tmp/
+/dagster/.tmp_dagster_home_*/
 .venv
