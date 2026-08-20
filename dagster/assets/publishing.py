@@ -11,6 +11,17 @@ from partitions import daily_partitions
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLISH_SCRIPT = PROJECT_ROOT / "scripts" / "publish_validated_data.py"
 PROCESSED_DATA_DIR = PROJECT_ROOT / "dagster" / "data" / "processed"
+PIPELINE_GIT_PATHS = [
+    "dagster",
+    "scripts",
+    "dvc.yaml",
+    "params.yaml",
+    "requirements*.txt",
+    "pyproject.toml",
+    "uv.lock",
+    "poetry.lock",
+    ":(exclude)dagster/data",
+]
 
 
 def get_pipeline_git_sha() -> str:
@@ -36,24 +47,59 @@ def get_pipeline_version(pipeline_git_sha: str) -> str:
     result = subprocess.run(
         [
             "git",
-            "tag",
-            "--sort=-v:refname",
-            "--points-at",
-            "HEAD",
-            "--list",
+            "describe",
+            "--tags",
+            "--match",
             "pipeline-v*",
+            "--abbrev=0",
+            "HEAD",
+        ],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        return f"unreleased-{pipeline_git_sha}"
+
+    pipeline_tag = result.stdout.strip()
+    committed_changes = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--quiet",
+            f"{pipeline_tag}..HEAD",
+            "--",
+            *PIPELINE_GIT_PATHS,
+        ],
+        cwd=PROJECT_ROOT,
+        check=False,
+    )
+    working_tree_changes = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            *PIPELINE_GIT_PATHS,
         ],
         cwd=PROJECT_ROOT,
         check=True,
         capture_output=True,
         text=True,
     )
-    pipeline_tags = result.stdout.splitlines()
 
-    if pipeline_tags:
-        return pipeline_tags[0]
+    if committed_changes.returncode not in (0, 1):
+        raise RuntimeError(
+            f"Could not compare pipeline code with {pipeline_tag}."
+        )
 
-    return f"untagged-{pipeline_git_sha}"
+    if committed_changes.returncode == 1 or working_tree_changes.stdout.strip():
+        return f"unreleased-{pipeline_git_sha}"
+
+    return pipeline_tag
 
 
 @asset(
