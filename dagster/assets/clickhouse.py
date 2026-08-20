@@ -6,6 +6,7 @@ from clickhouse_driver import Client
 from dagster import asset, MaterializeResult, MetadataValue
 
 from partitions import daily_partitions
+from metadata_store import record_asset_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +246,53 @@ def clickhouse_telemetry(context, processed_telemetry):
         row[0]: row[1]
         for row in schema_rows
     }
+
+    # -----------------------------------------------------------------------
+    # Metadata geçmişi (Postgres) -- uçuş bazlı filtreleme yapılabilmesi için
+    # her uçuş kendi satır sayısıyla ayrı kaydedilir.
+    # -----------------------------------------------------------------------
+
+    if flight_ids_in_batch:
+
+        counts_by_flight = (
+            df["flight_id"].value_counts().to_dict()
+        )
+
+        for flight_id in flight_ids_in_batch:
+
+            record_asset_metadata(
+                context,
+                group_name="storage",
+                flight_id=flight_id,
+                row_count=counts_by_flight.get(flight_id, 0),
+                metadata={
+                    "partition": partition_date,
+                    "flight_id": flight_id,
+                    "table": table_fqn,
+                    "row_count": counts_by_flight.get(flight_id, 0),
+                    "column_count": len(columns),
+                    "database": database,
+                    "schema": schema,
+                },
+            )
+
+    else:
+
+        record_asset_metadata(
+            context,
+            group_name="storage",
+            flight_id=None,
+            row_count=len(rows),
+            metadata={
+                "partition": partition_date,
+                "flight_id": None,
+                "table": table_fqn,
+                "row_count": len(rows),
+                "column_count": len(columns),
+                "database": database,
+                "schema": schema,
+            },
+        )
 
     return MaterializeResult(
         metadata={

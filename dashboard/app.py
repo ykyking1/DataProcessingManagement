@@ -37,6 +37,9 @@ Dashboard bölümleri:
        - Dagster asset'leri
        - Son materialization
        - Metadata
+       - Metadata Geçmişi (Postgres, asset_metadata_history):
+         asset / uçuş / tarih bazlı filtrelenebilir materialization
+         geçmişi — bkz. docs/postgres_asset_metadata_schema.sql
 
     3. Alertler
        - Başarısız Dagster run'ları
@@ -62,6 +65,7 @@ from pathlib import Path
 
 import clickhouse_connect
 import pandas as pd
+import psycopg2
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -958,6 +962,427 @@ def flatten_metadata(entries):
         flat[label] = value
 
     return flat
+
+
+# ============================================================
+# POSTGRES (ASSET METADATA GEÇMİŞİ)
+# ============================================================
+#
+# dagster/metadata_store.py her asset materialize olduğunda
+# asset_metadata_history tablosuna bir satır ekler (bkz.
+# docs/postgres_asset_metadata_schema.sql). Dashboard bu tabloyu sadece
+# OKUR -- yazma işlemi tamamen Dagster tarafında olur. Bu, yukarıdaki
+# ASSET_CATALOG_QUERY'nin (Dagster GraphQL, sadece SON materialization)
+# aksine, asset / uçuş / tarih bazlı filtrelenebilir bir GEÇMİŞ sağlar.
+
+def get_postgres_conn_params() -> dict:
+    return dict(
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        user=os.environ.get("POSTGRES_USER", "postgres"),
+        password=os.environ.get("POSTGRES_PASSWORD", ""),
+        dbname=os.environ.get("POSTGRES_DATABASE", "postgres"),
+    )
+
+
+def get_postgres_conn():
+    return psycopg2.connect(**get_postgres_conn_params())
+
+
+@st.cache_data(ttl=30)
+def get_metadata_history_filters() -> dict:
+    """
+    Filtre widget'ları (Asset / Uçuş multiselect) için mevcut değerleri
+    döner. Tablo henüz yoksa (pipeline hiç çalışmadıysa ya da Postgres'e
+    erişilemiyorsa) boş listeler döner; katalog sekmesi bu durumda
+    "henüz veri yok" mesajı gösterir, hata fırlatmaz.
+    """
+
+    try:
+        conn = get_postgres_conn()
+    except Exception:
+        return {"assets": [], "flights": []}
+
+    try:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                "SELECT to_regclass('public.asset_metadata_history')"
+            )
+
+            if cur.fetchone()[0] is None:
+                return {"assets": [], "flights": []}
+
+            cur.execute(
+                "SELECT DISTINCT asset_key FROM asset_metadata_history "
+                "ORDER BY asset_key"
+            )
+            assets = [row[0] for row in cur.fetchall()]
+
+            cur.execute(
+                "SELECT DISTINCT flight_id FROM asset_metadata_history "
+                "WHERE flight_id IS NOT NULL ORDER BY flight_id"
+            )
+            flights = [row[0] for row in cur.fetchall()]
+
+        return {"assets": assets, "flights": flights}
+
+    except Exception:
+        return {"assets": [], "flights": []}
+
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=15)
+def fetch_metadata_history(
+    assets: tuple = (),
+    flights: tuple = (),
+    start_date=None,
+    end_date=None,
+    limit: int = 500,
+) -> pd.DataFrame:
+    """
+    asset_metadata_history tablosundan, verilen filtrelere uyan
+    kayıtları en yeni materialization'dan başlayarak döner (en fazla
+    `limit` satır).
+    """
+
+    conn = get_postgres_conn()
+
+    try:
+
+        clauses = []
+        params = []
+
+        if assets:
+            clauses.append("asset_key = ANY(%s)")
+            params.append(list(assets))
+
+        if flights:
+            clauses.append("flight_id = ANY(%s)")
+            params.append(list(flights))
+
+        if start_date:
+            clauses.append("partition_date >= %s")
+            params.append(start_date)
+
+        if end_date:
+            clauses.append("partition_date <= %s")
+            params.append(end_date)
+
+        where_sql = (
+            "WHERE " + " AND ".join(clauses)
+            if clauses
+            else ""
+        )
+
+        query = f"""
+            SELECT
+                asset_key, group_name, partition_date, flight_id,
+                run_id, row_count, metadata, materialized_at
+            FROM asset_metadata_history
+            {where_sql}
+            ORDER BY materialized_at DESC
+            LIMIT %s
+        """
+
+        params.append(limit)
+
+        return pd.read_sql(query, conn, params=params)
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# METADATA GEÇMİŞİ (RENDER)
+# ============================================================
+#
+# NOT: Filtreler değiştirildiğinde eski sonucun ekranda kafa karıştırıcı
+# şekilde kalmaya devam etmesini önlemek için, "Veri Gözat / Dışa Aktar"
+# sekmesindeki (render_data_export) aynı desen kullanılıyor: sonuç ve o
+# sonucu üreten filtre "imzası" session_state'te birlikte tutulur; imza
+# güncel filtrelerle uyuşmuyorsa eski sonuç hemen temizlenir ve kullanıcı
+# yeniden sorgulamaya yönlendirilir. Sorgu, her widget değişiminde değil,
+# yalnızca "🔍 Sorgula" butonuna basıldığında (veya ilk açılışta,
+# filtresiz varsayılan olarak) çalışır.
+
+def _parse_metadata_date_range(date_range):
+
+    start_date = None
+    end_date = None
+
+    if isinstance(date_range, (tuple, list)):
+        if len(date_range) == 2:
+            start_date, end_date = date_range
+        elif len(date_range) == 1:
+            start_date = date_range[0]
+    elif date_range:
+        start_date = date_range
+
+    return start_date, end_date
+
+
+def render_metadata_history() -> None:
+
+    st.subheader(
+        "🗄️ Metadata Geçmişi"
+    )
+
+    st.caption(
+        "Yukarıdaki tablo her asset'in yalnızca SON materialization'ını "
+        "gösterir. Burada, her materialization'da Postgres'e kaydedilen "
+        "geçmiş; asset / uçuş / tarih bazlı filtrelenebilir "
+        "(asset_metadata_history, bkz. docs/postgres_asset_metadata_schema.sql)."
+    )
+
+    try:
+        filters = get_metadata_history_filters()
+    except Exception as exc:
+        st.warning(
+            f"Postgres'e bağlanılamadı: {exc}"
+        )
+        return
+
+    if not filters["assets"]:
+        st.info(
+            "Henüz metadata geçmişi yok. Pipeline en az bir kez "
+            "çalıştığında (ve POSTGRES_* ortam değişkenleri doğru "
+            "ayarlandığında) bu bölüm dolacaktır."
+        )
+        return
+
+    # --------------------------------------------------------------
+    # Filtreler
+    # --------------------------------------------------------------
+    #
+    # st.form içindeki widget'lar, dışarıdaki gibi HER değişiklikte
+    # (ya da otomatik yenileme sekmesindeki periyodik rerun'larda) anlık
+    # olarak sorguyu tetiklemez -- yalnızca "Sorgula" ile submit edilince
+    # okunur. Önceki tasarımda filtre widget'ları formun dışındaydı ve
+    # her rerun'da (örn. otomatik yenileme, ya da listedeki asset/uçuş
+    # seçenekleri arka planda değiştiğinde) o anki widget değerleri son
+    # sorgulanan değerlerle karşılaştırılıyordu; bu karşılaştırma
+    # otomatik yenilemeyle çakışıp "Filtreler değişti" mesajının
+    # durduk yere görünüp kaybolmasına (flicker) yol açıyordu. Form,
+    # bu karşılaştırmayı tamamen gereksiz kılar.
+
+    with st.form("metadata_history_filter_form", border=True):
+
+        filter_col1, filter_col2, filter_col3 = st.columns(
+            [1, 1, 1.4]
+        )
+
+        with filter_col1:
+
+            selected_assets = st.multiselect(
+                "Asset",
+                options=filters["assets"],
+                key="metadata_history_assets",
+            )
+
+        with filter_col2:
+
+            selected_flights = st.multiselect(
+                "Uçuş",
+                options=filters["flights"],
+                key="metadata_history_flights",
+            )
+
+        with filter_col3:
+
+            date_range = st.date_input(
+                "Tarih aralığı (partition)",
+                value=(),
+                key="metadata_history_date_range",
+                help=(
+                    "Boş bırakılırsa tüm tarihler dahil edilir. Aralık "
+                    "seçmek için takvimde iki tarihe art arda tıklayın."
+                ),
+            )
+
+        submitted = st.form_submit_button(
+            "🔍 Sorgula",
+            type="primary",
+        )
+
+    if st.button(
+        "🧹 Filtreleri temizle",
+        key="metadata_history_clear_btn",
+    ):
+
+        for widget_key in (
+            "metadata_history_assets",
+            "metadata_history_flights",
+            "metadata_history_date_range",
+        ):
+            st.session_state.pop(widget_key, None)
+
+        st.session_state.pop("metadata_history_result", None)
+
+        st.rerun()
+
+    # --------------------------------------------------------------
+    # Sorgu -- yalnızca "Sorgula" submit edildiğinde (ya da ilk
+    # açılışta, filtresiz varsayılan olarak) Postgres'e gidilir.
+    # --------------------------------------------------------------
+
+    if submitted:
+
+        start_date, end_date = _parse_metadata_date_range(
+            date_range
+        )
+
+        try:
+
+            # Cache'i temizle -- aksi halde aynı filtre kombinasyonuyla
+            # tekrar "Sorgula"ya basıldığında (örn. yeni bir materialization
+            # sonrası) ttl dolana kadar eski sonuç dönebilir.
+            fetch_metadata_history.clear()
+
+            with st.spinner("Sorgulanıyor..."):
+
+                history_df = fetch_metadata_history(
+                    assets=tuple(selected_assets),
+                    flights=tuple(selected_flights),
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
+        except Exception as exc:
+
+            st.error(
+                f"Metadata geçmişi okunamadı: {exc}"
+            )
+            return
+
+        st.session_state["metadata_history_result"] = history_df
+
+    elif "metadata_history_result" not in st.session_state:
+
+        # İlk açılış: henüz hiç sorgu yapılmadıysa filtresiz (tüm
+        # kayıtlar, en yeni önce) varsayılan sonuç otomatik gösterilir.
+        try:
+
+            history_df = fetch_metadata_history()
+
+        except Exception as exc:
+
+            st.error(
+                f"Metadata geçmişi okunamadı: {exc}"
+            )
+            return
+
+        st.session_state["metadata_history_result"] = history_df
+
+    history_df = st.session_state.get("metadata_history_result")
+
+    if history_df is None or history_df.empty:
+        st.info(
+            "Filtrelere uyan kayıt bulunamadı."
+        )
+        return
+
+    # --------------------------------------------------------------
+    # Özet + sonuç tablosu
+    # --------------------------------------------------------------
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+    metric_col1.metric("Kayıt", len(history_df))
+    metric_col2.metric("Asset", history_df["asset_key"].nunique())
+    metric_col3.metric(
+        "Uçuş",
+        history_df["flight_id"].dropna().nunique(),
+    )
+
+    st.caption(
+        "En fazla 500 kayıt gösterilir, en yeni materialization önce."
+    )
+
+    display_df = history_df[
+        [
+            "asset_key",
+            "group_name",
+            "partition_date",
+            "flight_id",
+            "row_count",
+            "materialized_at",
+            "run_id",
+        ]
+    ].rename(
+        columns={
+            "asset_key": "Asset",
+            "group_name": "Grup",
+            "partition_date": "Tarih",
+            "flight_id": "Uçuş",
+            "row_count": "Satır Sayısı",
+            "materialized_at": "Materialize Zamanı",
+            "run_id": "Run ID",
+        }
+    )
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "Detay için bir satırı aşağıdan genişletin:"
+    )
+
+    for _, row in history_df.iterrows():
+
+        # Uçuş bilgisi (ve diğer temel alanlar) her zaman görünür olsun
+        # diye, ham JSON metadata'nın önüne eklenir -- eski kayıtlarda
+        # JSON içine "flight_id" yazılmamış olsa bile burada gösterilir.
+        display_metadata = {
+            "flight_id": row["flight_id"] or "-",
+            "asset_key": row["asset_key"],
+            "partition_date": row["partition_date"],
+            "materialized_at": row["materialized_at"],
+        }
+
+        for key, value in (row["metadata"] or {}).items():
+            if key not in display_metadata:
+                display_metadata[key] = value
+
+        with st.expander(
+            f"✈️ {row['flight_id'] or '-'} — {row['asset_key']} — "
+            f"{row['partition_date']} — {row['materialized_at']}"
+        ):
+
+            metadata_rows = []
+
+            for key, value in display_metadata.items():
+
+                if isinstance(
+                    value,
+                    (dict, list),
+                ):
+
+                    value = json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                metadata_rows.append(
+                    {
+                        "alan": key,
+                        "değer": value,
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    metadata_rows
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # ============================================================
@@ -2851,7 +3276,11 @@ def main():
             render_catalog(
                 catalog_df
             )
-            
+
+        st.divider()
+
+        render_metadata_history()
+
     # ========================================================
     # ALERTS
     # ========================================================

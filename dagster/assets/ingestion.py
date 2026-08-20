@@ -4,6 +4,7 @@ from pathlib import Path
 from dagster import asset, Config, MaterializeResult, MetadataValue
 
 from partitions import daily_partitions
+from metadata_store import record_asset_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,21 @@ def raw_uav_telemetry(context, config: RawTelemetryConfig):
         column: str(dtype)
         for column, dtype in df.dtypes.items()
     }
+
+    record_asset_metadata(
+        context,
+        group_name="raw_layer",
+        flight_id=flight_id,
+        row_count=len(df),
+        metadata={
+            "partition": partition_date,
+            "flight_id": flight_id,
+            "source_file": str(path),
+            "row_count": len(df),
+            "column_count": len(df.columns),
+            "schema": schema,
+        },
+    )
 
     return MaterializeResult(
         value=df,

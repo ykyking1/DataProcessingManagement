@@ -1,6 +1,7 @@
 dagster
 dagster-webserver
 clickhouse-driver
+psycopg2-binary
 pandas
 pyarrow
 requests
