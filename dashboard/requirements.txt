@@ -4,4 +4,5 @@ requests==2.32.3
 streamlit-autorefresh==1.0.1
 pyarrow==17.0.0
 clickhouse-connect==1.7.1
+psycopg2-binary==2.9.9
 python-dotenv==1.0.1

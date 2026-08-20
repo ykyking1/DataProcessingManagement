@@ -5,6 +5,7 @@ import pandas as pd
 from dagster import asset, MaterializeResult, MetadataValue
 
 from partitions import daily_partitions
+from metadata_store import record_asset_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,24 @@ def processed_telemetry(context, raw_uav_telemetry):
             group_df.to_parquet(file_path, index=False)
 
             processed_files.append(str(file_path))
+
+            # Her uçuş için ayrı bir metadata geçmişi satırı -- dashboard'daki
+            # Katalog sekmesinde uçuş bazlı filtreleme bunun üzerinden yapılır.
+            record_asset_metadata(
+                context,
+                group_name="processing",
+                flight_id=flight_id,
+                row_count=len(group_df),
+                metadata={
+                    "partition": partition_date,
+                    "flight_id": flight_id,
+                    "row_count": len(group_df),
+                    "column_count": len(group_df.columns),
+                    "columns": list(group_df.columns),
+                    "schema": schema,
+                    "processed_file": str(file_path),
+                },
+            )
 
         context.log.info(
             f"İşlenmiş veri diske kaydedildi (partition={partition_date}): "

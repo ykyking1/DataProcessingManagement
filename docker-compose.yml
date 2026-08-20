@@ -1,0 +1,20 @@
+services:
+  # Asset metadata geçmişi (bkz. dagster/metadata_store.py,
+  # docs/postgres_asset_metadata_schema.sql). Bağlantı bilgileri
+  # dagster/.env ve dashboard/.env içindeki POSTGRES_* değerleriyle
+  # eşleşmelidir.
+  postgres:
+    image: postgres:16
+    container_name: dpm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: HalukPG123!
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - dpm_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  dpm_postgres_data:

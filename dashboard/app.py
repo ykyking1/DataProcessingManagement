@@ -37,6 +37,9 @@ Dashboard bölümleri:
        - Dagster asset'leri
        - Son materialization
        - Metadata
+       - Metadata Geçmişi (Postgres, asset_metadata_history):
+         asset / uçuş / tarih bazlı filtrelenebilir materialization
+         geçmişi — bkz. docs/postgres_asset_metadata_schema.sql
 
     3. Alertler
        - Başarısız Dagster run'ları
@@ -62,6 +65,7 @@ from pathlib import Path
 
 import clickhouse_connect
 import pandas as pd
+import psycopg2
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -102,9 +106,6 @@ REFRESH_OPTIONS = {
     "30 sn": 30,
     "60 sn": 60,
 }
-
-MAX_EXPORT_ROWS = 2_000_000
-
 
 # ============================================================
 # AU-AIR KOLONLARI
@@ -280,15 +281,24 @@ def get_clickhouse_database() -> str:
     )
 
 
+def get_clickhouse_table() -> str:
+    # dagster/assets/clickhouse.py bu isimde bir tabloya (aynı ortam
+    # değişkeniyle, CLICKHOUSE_TABLE) INSERT yapar; burada aynı isim
+    # kullanılarak iki taraf senkron kalır.
+    return os.environ.get(
+        "CLICKHOUSE_TABLE",
+        "telemetry",
+    )
+
+
 def get_processed_files_glob() -> str:
     """
-    ClickHouse container'ına bağlı user_files_path altında, işlenmiş
-    parquet dosyalarını bulmak için kullanılan glob deseni.
-
-    dagster/assets/processing.py, işlenmiş veriyi
-    dagster/data/processed/ klasörüne yazar; bu klasör ClickHouse
-    container'ında /var/lib/clickhouse/user_files/processed olarak
-    bind mount edilmiştir (bkz. docker run --volume ayarı).
+    dagster/assets/processing.py, ClickHouse'a INSERT etmeye ek olarak
+    işlenmiş veriyi yedek/denetim amacıyla dagster/data/processed/
+    klasörüne parquet olarak da yazar. Bu fonksiyon sadece o yedek
+    klasörü UI'da bilgi amaçlı göstermek için kullanılır; sorgular
+    artık bu dosyaları değil, doğrudan ClickHouse tablosunu okur
+    (bkz. get_clickhouse_source()).
     """
     return os.environ.get(
         "CLICKHOUSE_PROCESSED_GLOB",
@@ -298,17 +308,15 @@ def get_processed_files_glob() -> str:
 
 def get_clickhouse_source() -> str:
     """
-    Sorgulanacak veri kaynağını, ClickHouse'un `file()` tablo
-    fonksiyonu ifadesi olarak döner.
-
-    ÖNEMLİ: Veri artık ClickHouse'un kendi depolama motoruna (MergeTree
-    tablosuna) INSERT edilmiyor. Her sorgu, dagster'ın ürettiği parquet
-    dosyalarını doğrudan (sorgu anında) okur. Bu fonksiyonun döndürdüğü
+    Sorgulanacak veri kaynağını ClickHouse tablosunun tam adı
+    (database.table) olarak döner. dagster/assets/clickhouse.py,
+    processed_telemetry çıktısını bu tabloya INSERT eder; dashboard
+    ise aynı tabloyu sorgu zamanında okur. Bu fonksiyonun döndürdüğü
     ifade, aşağıdaki tüm SELECT/DESCRIBE sorgularında `FROM` yerine
     geçer.
     """
     return (
-        f"file('{get_processed_files_glob()}', 'Parquet')"
+        f"`{get_clickhouse_database()}`.`{get_clickhouse_table()}`"
     )
 
 
@@ -362,13 +370,18 @@ def get_clickhouse_schema() -> pd.DataFrame:
 
     except Exception as exc:
 
-        # Henüz hiç işlenmiş parquet dosyası yoksa (örn. pipeline hiç
-        # çalışmadıysa) ClickHouse'un file() fonksiyonu
-        # CANNOT_EXTRACT_TABLE_STRUCTURE hatası fırlatır. Bu, gerçek bir
-        # bağlantı/yetki hatasından ayırt edilip boş şema olarak
-        # ele alınır; render_data_export bu durumda zaten kullanıcı
-        # dostu bir uyarı gösteriyor (bkz. "schema.empty" kontrolü).
-        if "CANNOT_EXTRACT_TABLE_STRUCTURE" in str(exc):
+        # Pipeline henüz hiç çalışmadıysa (clickhouse_telemetry asset'i
+        # tabloyu henüz oluşturmadıysa) ClickHouse "UNKNOWN_TABLE" /
+        # "doesn't exist" hatası fırlatır. Bu, gerçek bir bağlantı/yetki
+        # hatasından ayırt edilip boş şema olarak ele alınır;
+        # render_data_export bu durumda zaten kullanıcı dostu bir uyarı
+        # gösteriyor (bkz. "schema.empty" kontrolü).
+        exc_text = str(exc)
+
+        if (
+            "UNKNOWN_TABLE" in exc_text
+            or "doesn't exist" in exc_text
+        ):
             return pd.DataFrame()
 
         raise
@@ -949,6 +962,427 @@ def flatten_metadata(entries):
         flat[label] = value
 
     return flat
+
+
+# ============================================================
+# POSTGRES (ASSET METADATA GEÇMİŞİ)
+# ============================================================
+#
+# dagster/metadata_store.py her asset materialize olduğunda
+# asset_metadata_history tablosuna bir satır ekler (bkz.
+# docs/postgres_asset_metadata_schema.sql). Dashboard bu tabloyu sadece
+# OKUR -- yazma işlemi tamamen Dagster tarafında olur. Bu, yukarıdaki
+# ASSET_CATALOG_QUERY'nin (Dagster GraphQL, sadece SON materialization)
+# aksine, asset / uçuş / tarih bazlı filtrelenebilir bir GEÇMİŞ sağlar.
+
+def get_postgres_conn_params() -> dict:
+    return dict(
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        user=os.environ.get("POSTGRES_USER", "postgres"),
+        password=os.environ.get("POSTGRES_PASSWORD", ""),
+        dbname=os.environ.get("POSTGRES_DATABASE", "postgres"),
+    )
+
+
+def get_postgres_conn():
+    return psycopg2.connect(**get_postgres_conn_params())
+
+
+@st.cache_data(ttl=30)
+def get_metadata_history_filters() -> dict:
+    """
+    Filtre widget'ları (Asset / Uçuş multiselect) için mevcut değerleri
+    döner. Tablo henüz yoksa (pipeline hiç çalışmadıysa ya da Postgres'e
+    erişilemiyorsa) boş listeler döner; katalog sekmesi bu durumda
+    "henüz veri yok" mesajı gösterir, hata fırlatmaz.
+    """
+
+    try:
+        conn = get_postgres_conn()
+    except Exception:
+        return {"assets": [], "flights": []}
+
+    try:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                "SELECT to_regclass('public.asset_metadata_history')"
+            )
+
+            if cur.fetchone()[0] is None:
+                return {"assets": [], "flights": []}
+
+            cur.execute(
+                "SELECT DISTINCT asset_key FROM asset_metadata_history "
+                "ORDER BY asset_key"
+            )
+            assets = [row[0] for row in cur.fetchall()]
+
+            cur.execute(
+                "SELECT DISTINCT flight_id FROM asset_metadata_history "
+                "WHERE flight_id IS NOT NULL ORDER BY flight_id"
+            )
+            flights = [row[0] for row in cur.fetchall()]
+
+        return {"assets": assets, "flights": flights}
+
+    except Exception:
+        return {"assets": [], "flights": []}
+
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=15)
+def fetch_metadata_history(
+    assets: tuple = (),
+    flights: tuple = (),
+    start_date=None,
+    end_date=None,
+    limit: int = 500,
+) -> pd.DataFrame:
+    """
+    asset_metadata_history tablosundan, verilen filtrelere uyan
+    kayıtları en yeni materialization'dan başlayarak döner (en fazla
+    `limit` satır).
+    """
+
+    conn = get_postgres_conn()
+
+    try:
+
+        clauses = []
+        params = []
+
+        if assets:
+            clauses.append("asset_key = ANY(%s)")
+            params.append(list(assets))
+
+        if flights:
+            clauses.append("flight_id = ANY(%s)")
+            params.append(list(flights))
+
+        if start_date:
+            clauses.append("partition_date >= %s")
+            params.append(start_date)
+
+        if end_date:
+            clauses.append("partition_date <= %s")
+            params.append(end_date)
+
+        where_sql = (
+            "WHERE " + " AND ".join(clauses)
+            if clauses
+            else ""
+        )
+
+        query = f"""
+            SELECT
+                asset_key, group_name, partition_date, flight_id,
+                run_id, row_count, metadata, materialized_at
+            FROM asset_metadata_history
+            {where_sql}
+            ORDER BY materialized_at DESC
+            LIMIT %s
+        """
+
+        params.append(limit)
+
+        return pd.read_sql(query, conn, params=params)
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# METADATA GEÇMİŞİ (RENDER)
+# ============================================================
+#
+# NOT: Filtreler değiştirildiğinde eski sonucun ekranda kafa karıştırıcı
+# şekilde kalmaya devam etmesini önlemek için, "Veri Gözat / Dışa Aktar"
+# sekmesindeki (render_data_export) aynı desen kullanılıyor: sonuç ve o
+# sonucu üreten filtre "imzası" session_state'te birlikte tutulur; imza
+# güncel filtrelerle uyuşmuyorsa eski sonuç hemen temizlenir ve kullanıcı
+# yeniden sorgulamaya yönlendirilir. Sorgu, her widget değişiminde değil,
+# yalnızca "🔍 Sorgula" butonuna basıldığında (veya ilk açılışta,
+# filtresiz varsayılan olarak) çalışır.
+
+def _parse_metadata_date_range(date_range):
+
+    start_date = None
+    end_date = None
+
+    if isinstance(date_range, (tuple, list)):
+        if len(date_range) == 2:
+            start_date, end_date = date_range
+        elif len(date_range) == 1:
+            start_date = date_range[0]
+    elif date_range:
+        start_date = date_range
+
+    return start_date, end_date
+
+
+def render_metadata_history() -> None:
+
+    st.subheader(
+        "🗄️ Metadata Geçmişi"
+    )
+
+    st.caption(
+        "Yukarıdaki tablo her asset'in yalnızca SON materialization'ını "
+        "gösterir. Burada, her materialization'da Postgres'e kaydedilen "
+        "geçmiş; asset / uçuş / tarih bazlı filtrelenebilir "
+        "(asset_metadata_history, bkz. docs/postgres_asset_metadata_schema.sql)."
+    )
+
+    try:
+        filters = get_metadata_history_filters()
+    except Exception as exc:
+        st.warning(
+            f"Postgres'e bağlanılamadı: {exc}"
+        )
+        return
+
+    if not filters["assets"]:
+        st.info(
+            "Henüz metadata geçmişi yok. Pipeline en az bir kez "
+            "çalıştığında (ve POSTGRES_* ortam değişkenleri doğru "
+            "ayarlandığında) bu bölüm dolacaktır."
+        )
+        return
+
+    # --------------------------------------------------------------
+    # Filtreler
+    # --------------------------------------------------------------
+    #
+    # st.form içindeki widget'lar, dışarıdaki gibi HER değişiklikte
+    # (ya da otomatik yenileme sekmesindeki periyodik rerun'larda) anlık
+    # olarak sorguyu tetiklemez -- yalnızca "Sorgula" ile submit edilince
+    # okunur. Önceki tasarımda filtre widget'ları formun dışındaydı ve
+    # her rerun'da (örn. otomatik yenileme, ya da listedeki asset/uçuş
+    # seçenekleri arka planda değiştiğinde) o anki widget değerleri son
+    # sorgulanan değerlerle karşılaştırılıyordu; bu karşılaştırma
+    # otomatik yenilemeyle çakışıp "Filtreler değişti" mesajının
+    # durduk yere görünüp kaybolmasına (flicker) yol açıyordu. Form,
+    # bu karşılaştırmayı tamamen gereksiz kılar.
+
+    with st.form("metadata_history_filter_form", border=True):
+
+        filter_col1, filter_col2, filter_col3 = st.columns(
+            [1, 1, 1.4]
+        )
+
+        with filter_col1:
+
+            selected_assets = st.multiselect(
+                "Asset",
+                options=filters["assets"],
+                key="metadata_history_assets",
+            )
+
+        with filter_col2:
+
+            selected_flights = st.multiselect(
+                "Uçuş",
+                options=filters["flights"],
+                key="metadata_history_flights",
+            )
+
+        with filter_col3:
+
+            date_range = st.date_input(
+                "Tarih aralığı (partition)",
+                value=(),
+                key="metadata_history_date_range",
+                help=(
+                    "Boş bırakılırsa tüm tarihler dahil edilir. Aralık "
+                    "seçmek için takvimde iki tarihe art arda tıklayın."
+                ),
+            )
+
+        submitted = st.form_submit_button(
+            "🔍 Sorgula",
+            type="primary",
+        )
+
+    if st.button(
+        "🧹 Filtreleri temizle",
+        key="metadata_history_clear_btn",
+    ):
+
+        for widget_key in (
+            "metadata_history_assets",
+            "metadata_history_flights",
+            "metadata_history_date_range",
+        ):
+            st.session_state.pop(widget_key, None)
+
+        st.session_state.pop("metadata_history_result", None)
+
+        st.rerun()
+
+    # --------------------------------------------------------------
+    # Sorgu -- yalnızca "Sorgula" submit edildiğinde (ya da ilk
+    # açılışta, filtresiz varsayılan olarak) Postgres'e gidilir.
+    # --------------------------------------------------------------
+
+    if submitted:
+
+        start_date, end_date = _parse_metadata_date_range(
+            date_range
+        )
+
+        try:
+
+            # Cache'i temizle -- aksi halde aynı filtre kombinasyonuyla
+            # tekrar "Sorgula"ya basıldığında (örn. yeni bir materialization
+            # sonrası) ttl dolana kadar eski sonuç dönebilir.
+            fetch_metadata_history.clear()
+
+            with st.spinner("Sorgulanıyor..."):
+
+                history_df = fetch_metadata_history(
+                    assets=tuple(selected_assets),
+                    flights=tuple(selected_flights),
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
+        except Exception as exc:
+
+            st.error(
+                f"Metadata geçmişi okunamadı: {exc}"
+            )
+            return
+
+        st.session_state["metadata_history_result"] = history_df
+
+    elif "metadata_history_result" not in st.session_state:
+
+        # İlk açılış: henüz hiç sorgu yapılmadıysa filtresiz (tüm
+        # kayıtlar, en yeni önce) varsayılan sonuç otomatik gösterilir.
+        try:
+
+            history_df = fetch_metadata_history()
+
+        except Exception as exc:
+
+            st.error(
+                f"Metadata geçmişi okunamadı: {exc}"
+            )
+            return
+
+        st.session_state["metadata_history_result"] = history_df
+
+    history_df = st.session_state.get("metadata_history_result")
+
+    if history_df is None or history_df.empty:
+        st.info(
+            "Filtrelere uyan kayıt bulunamadı."
+        )
+        return
+
+    # --------------------------------------------------------------
+    # Özet + sonuç tablosu
+    # --------------------------------------------------------------
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+    metric_col1.metric("Kayıt", len(history_df))
+    metric_col2.metric("Asset", history_df["asset_key"].nunique())
+    metric_col3.metric(
+        "Uçuş",
+        history_df["flight_id"].dropna().nunique(),
+    )
+
+    st.caption(
+        "En fazla 500 kayıt gösterilir, en yeni materialization önce."
+    )
+
+    display_df = history_df[
+        [
+            "asset_key",
+            "group_name",
+            "partition_date",
+            "flight_id",
+            "row_count",
+            "materialized_at",
+            "run_id",
+        ]
+    ].rename(
+        columns={
+            "asset_key": "Asset",
+            "group_name": "Grup",
+            "partition_date": "Tarih",
+            "flight_id": "Uçuş",
+            "row_count": "Satır Sayısı",
+            "materialized_at": "Materialize Zamanı",
+            "run_id": "Run ID",
+        }
+    )
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "Detay için bir satırı aşağıdan genişletin:"
+    )
+
+    for _, row in history_df.iterrows():
+
+        # Uçuş bilgisi (ve diğer temel alanlar) her zaman görünür olsun
+        # diye, ham JSON metadata'nın önüne eklenir -- eski kayıtlarda
+        # JSON içine "flight_id" yazılmamış olsa bile burada gösterilir.
+        display_metadata = {
+            "flight_id": row["flight_id"] or "-",
+            "asset_key": row["asset_key"],
+            "partition_date": row["partition_date"],
+            "materialized_at": row["materialized_at"],
+        }
+
+        for key, value in (row["metadata"] or {}).items():
+            if key not in display_metadata:
+                display_metadata[key] = value
+
+        with st.expander(
+            f"✈️ {row['flight_id'] or '-'} — {row['asset_key']} — "
+            f"{row['partition_date']} — {row['materialized_at']}"
+        ):
+
+            metadata_rows = []
+
+            for key, value in display_metadata.items():
+
+                if isinstance(
+                    value,
+                    (dict, list),
+                ):
+
+                    value = json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                metadata_rows.append(
+                    {
+                        "alan": key,
+                        "değer": value,
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    metadata_rows
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # ============================================================
@@ -1791,6 +2225,233 @@ def render_alerts(
 # VERİ GÖZAT / DIŞA AKTAR
 # ============================================================
 
+DOWNLOAD_FORMAT_LABELS = {
+    "all": "📄 Tüm Veri (Tek CSV)",
+    "zip": "📦 Uçuş Bazlı ZIP",
+    "each": "✈️ Uçuşları Tek Tek İndir",
+}
+
+
+def render_download_section(
+    dataframe: pd.DataFrame,
+    start_time: datetime,
+    end_time: datetime,
+) -> None:
+    """
+    "3️⃣ İndir" adımının içeriği.
+
+    Kullanıcı önce bir indirme formatı seçer; CSV/ZIP dönüşümü SADECE
+    seçilen format için yapılır. Önceden üç format da (tek CSV, uçuş
+    bazlı ZIP, uçuş bazlı tek tek CSV) her render'da aynı anda
+    hesaplanıyordu — büyük veri setlerinde bu gereksiz yere uzun
+    sürüyordu.
+    """
+
+    time_suffix = (
+        f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
+        f"{end_time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    has_flight_id = "flight_id" in dataframe.columns
+
+    format_keys = ["all"]
+
+    if has_flight_id:
+        format_keys += ["zip", "each"]
+
+    selected_format = st.radio(
+        "İndirme formatı seçin",
+        options=format_keys,
+        format_func=lambda key: DOWNLOAD_FORMAT_LABELS[key],
+        index=0,
+        horizontal=True,
+        key="download_format_choice",
+    )
+
+    st.divider()
+
+    if selected_format == "all":
+
+        _render_all_data_csv_download(
+            dataframe,
+            time_suffix,
+        )
+
+        return
+
+    # "zip" ve "each" — ikisi de flight_id bazlı gruplamaya ihtiyaç duyar.
+    # pandas.groupby varsayılan olarak NaN/None grup anahtarlarını zaten
+    # otomatik eler; burada ek olarak sadece boş string ("") ve gerçekten
+    # boş/whitespace-only değerler dışlanır (eski, flight_id kolonu
+    # eklenmeden önce yazılmış satırlar boş string içerebilir).
+
+    flight_groups = {
+        str(flight): group_df
+        for flight, group_df in dataframe.groupby("flight_id")
+        if str(flight).strip()
+    }
+
+    if not flight_groups:
+
+        st.info(
+            "Seçilen veride uçuş bazlı gruplama için kullanılabilir "
+            "flight_id bulunamadı."
+        )
+
+        return
+
+    st.markdown(
+        "**✈️ Uçuş Bazlı İndirme**"
+    )
+
+    summary_rows = [
+        {
+            "uçuş": flight,
+            "satır_sayısı": len(group_df),
+        }
+        for flight, group_df in sorted(flight_groups.items())
+    ]
+
+    st.dataframe(
+        pd.DataFrame(summary_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if selected_format == "zip":
+
+        _render_flight_zip_download(
+            flight_groups,
+            time_suffix,
+        )
+
+    else:
+
+        _render_flight_individual_downloads(
+            flight_groups,
+            time_suffix,
+        )
+
+
+def _render_all_data_csv_download(
+    dataframe: pd.DataFrame,
+    time_suffix: str,
+) -> None:
+
+    # Büyük veri setlerinde bu dönüşüm birkaç saniye sürebiliyor; spinner
+    # olmadan sekme "donmuş" gibi görünüyor ve kullanıcı bir hata
+    # olduğunu düşünebiliyordu.
+
+    with st.spinner(
+        "Veriniz indirmeye hazırlanıyor, veri miktarına bağlı olarak "
+        "bu işlem biraz sürebilir..."
+    ):
+
+        all_data_csv = dataframe.to_csv(
+            index=False
+        ).encode(
+            "utf-8-sig"
+        )
+
+    st.download_button(
+        label="📄 Tüm Veriyi CSV Olarak İndir",
+        data=all_data_csv,
+        file_name=f"au_air_telemetry_{time_suffix}.csv",
+        mime="text/csv",
+        type="primary",
+        key="download_all_data_csv",
+    )
+
+    st.caption(
+        f"CSV dosyası: {len(dataframe):,} satır, "
+        f"{len(dataframe.columns)} kolon"
+    )
+
+
+def _render_flight_zip_download(
+    flight_groups: dict,
+    time_suffix: str,
+) -> None:
+
+    with st.spinner(
+        f"{len(flight_groups)} uçuş için ZIP hazırlanıyor..."
+    ):
+
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(
+            zip_buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
+
+            for flight, group_df in flight_groups.items():
+
+                csv_bytes = group_df.to_csv(
+                    index=False
+                ).encode("utf-8-sig")
+
+                zip_file.writestr(
+                    f"ucus_{flight}_{time_suffix}.csv",
+                    csv_bytes,
+                )
+
+    st.download_button(
+        label=(
+            f"📦 Tüm Uçuşları ZIP Olarak İndir "
+            f"({len(flight_groups)} dosya)"
+        ),
+        data=zip_buffer.getvalue(),
+        file_name=f"ucuslar_{time_suffix}.zip",
+        mime="application/zip",
+        type="primary",
+        key="download_all_flights_zip",
+    )
+
+    st.caption(
+        "Her uçuş için ayrı bir CSV dosyası içerir."
+    )
+
+
+def _render_flight_individual_downloads(
+    flight_groups: dict,
+    time_suffix: str,
+) -> None:
+
+    with st.spinner(
+        f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
+    ):
+
+        flight_csv_bytes = {
+            flight: group_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
+            for flight, group_df in flight_groups.items()
+        }
+
+    for flight, group_df in sorted(flight_groups.items()):
+
+        col_a, col_b = st.columns(
+            [3, 1]
+        )
+
+        with col_a:
+
+            st.write(
+                f"**{flight}** — {len(group_df):,} satır"
+            )
+
+        with col_b:
+
+            st.download_button(
+                label="CSV indir",
+                data=flight_csv_bytes[flight],
+                file_name=f"ucus_{flight}_{time_suffix}.csv",
+                mime="text/csv",
+                key=f"download_flight_{flight}",
+            )
+
+
 def render_data_export():
 
     st.subheader(
@@ -1798,8 +2459,8 @@ def render_data_export():
     )
 
     st.caption(
-        f"Backend: **ClickHouse** (file() ile sorgu zamanında okuma) | "
-        f"Kaynak: `{get_processed_files_glob()}`"
+        f"Backend: **ClickHouse** | "
+        f"Tablo: `{get_clickhouse_database()}.{get_clickhouse_table()}`"
     )
 
     # --------------------------------------------------------
@@ -1837,9 +2498,9 @@ def render_data_export():
     if schema.empty:
 
         st.warning(
-            f"`{get_processed_files_glob()}` altında henüz işlenmiş "
-            "parquet dosyası bulunamadı. Dagster pipeline'ı en az bir "
-            "kez çalışıp `processed_telemetry` asset'ini materialize "
+            f"`{get_clickhouse_database()}.{get_clickhouse_table()}` "
+            "tablosu henüz oluşturulmamış. Dagster pipeline'ı en az bir "
+            "kez çalışıp `clickhouse_telemetry` asset'ini materialize "
             "ettikten sonra burada veri görünecektir."
         )
 
@@ -2212,8 +2873,7 @@ def render_data_export():
     )
 
     st.caption(
-        f"Önce satır sayısını hesaplayın (limit: {MAX_EXPORT_ROWS:,} satır), "
-        "ardından veriyi getirip önizleyin."
+        "Önce satır sayısını hesaplayın, ardından veriyi getirip önizleyin."
     )
 
     if st.button(
@@ -2267,20 +2927,6 @@ def render_data_export():
 
         st.warning(
             "Seçilen filtrelerle eşleşen veri yok."
-        )
-
-        return
-
-    if row_count > MAX_EXPORT_ROWS:
-
-        st.warning(
-            f"{row_count:,} satır çok fazla. "
-            f"Mevcut export limiti: "
-            f"{MAX_EXPORT_ROWS:,} satır."
-        )
-
-        st.info(
-            "Lütfen zaman aralığını veya class filtresini daraltın."
         )
 
         return
@@ -2349,173 +2995,32 @@ def render_data_export():
     # ==========================================================
     # ADIM 3 — İNDİR
     # ==========================================================
-    #
-    # İndirme seçenekleri sekmeler hâlinde ayrılır: tüm veri tek bir
-    # CSV olarak, ya da (flight_id mevcutsa) uçuş bazlı ayrı dosyalar
-    # hâlinde indirilebilir. Böylece her yöntem kendi sekmesinde
-    # kalır ve aynı anda ekranda üst üste görünmez.
 
     st.subheader(
         "3️⃣ İndir"
     )
 
-    has_flight_breakdown = (
-        "flight_id" in dataframe.columns
-        and dataframe["flight_id"].notna().any()
-    )
+    try:
 
-    if has_flight_breakdown:
-        tab_all, tab_flights = st.tabs(
-            ["📄 Tüm Veri", "✈️ Uçuş Bazlı"]
-        )
-    else:
-        tab_all, = st.tabs(
-            ["📄 Tüm Veri"]
+        render_download_section(
+            dataframe,
+            start_time,
+            end_time,
         )
 
-    with tab_all:
+    except Exception as exc:
 
-        csv_data = dataframe.to_csv(
-            index=False
-        ).encode(
-            "utf-8-sig"
+        # Bu bölüm daha önce (belirli filtre kombinasyonlarında) hiçbir
+        # hata göstermeden sessizce boş kalıyordu. Nedeni tam olarak
+        # tekrar üretilemedi; bu yüzden burada olası bir istisna artık
+        # yutulmuyor, doğrudan ekranda gösteriliyor ki bir daha "hiçbir
+        # şey görünmüyor, hata da yok" durumuna düşülmesin.
+
+        st.error(
+            "İndirme seçenekleri hazırlanırken beklenmeyen bir hata oluştu."
         )
 
-        filename = (
-            f"au_air_telemetry_"
-            f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-            f"{end_time.strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-
-        st.download_button(
-            label="CSV olarak indir",
-            data=csv_data,
-            file_name=filename,
-            mime="text/csv",
-            type="primary",
-        )
-
-        st.caption(
-            f"CSV dosyası: {len(dataframe):,} satır, "
-            f"{len(dataframe.columns)} kolon"
-        )
-
-    # --------------------------------------------------------
-    # UÇUŞ BAZLI AYRI DOSYALAR
-    # --------------------------------------------------------
-    #
-    # Yukarıdaki filtrelere (zaman, class, değer bazlı filtreler) uyan
-    # veri, seçilen her uçuş için ayrı bir CSV dosyasına bölünür.
-    # Örn: "altitude > 30" filtresiyle uçuş 1, 2 ve 3'ün her biri için
-    # ayrı ayrı CSV indirilebilir; ayrıca hepsi tek bir ZIP içinde de
-    # toplu indirilebilir.
-
-    if has_flight_breakdown:
-
-        with tab_flights:
-
-            flight_groups = {
-                flight: group_df
-                for flight, group_df in dataframe.groupby("flight_id")
-                if flight not in (None, "")
-            }
-
-            if not flight_groups:
-
-                st.info(
-                    "Getirilen veride ayırt edilebilir bir uçuş bulunamadı."
-                )
-
-            else:
-
-                summary_rows = [
-                    {
-                        "uçuş": flight,
-                        "satır_sayısı": len(group_df),
-                    }
-                    for flight, group_df in sorted(flight_groups.items())
-                ]
-
-                st.dataframe(
-                    pd.DataFrame(summary_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                def _flight_csv_bytes(flight_df: pd.DataFrame) -> bytes:
-
-                    return flight_df.to_csv(
-                        index=False
-                    ).encode("utf-8-sig")
-
-                time_suffix = (
-                    f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-                    f"{end_time.strftime('%Y%m%d_%H%M%S')}"
-                )
-
-                # ---- Toplu ZIP indirme ----
-
-                zip_buffer = io.BytesIO()
-
-                with zipfile.ZipFile(
-                    zip_buffer,
-                    mode="w",
-                    compression=zipfile.ZIP_DEFLATED,
-                ) as zip_file:
-
-                    for flight, group_df in flight_groups.items():
-
-                        zip_file.writestr(
-                            f"ucus_{flight}_{time_suffix}.csv",
-                            _flight_csv_bytes(group_df),
-                        )
-
-                st.download_button(
-                    label=(
-                        f"📦 Tüm Uçuşları ZIP Olarak İndir "
-                        f"({len(flight_groups)} dosya)"
-                    ),
-                    data=zip_buffer.getvalue(),
-                    file_name=f"ucuslar_{time_suffix}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    key="download_all_flights_zip",
-                )
-
-                st.caption(
-                    "Her uçuş için ayrı bir CSV dosyası içerir. "
-                    "Tek tek indirmek isterseniz aşağıdaki listeyi kullanın."
-                )
-
-                # ---- Tek tek indirme ----
-
-                with st.expander(
-                    "Uçuşları tek tek indir"
-                ):
-
-                    for flight, group_df in sorted(flight_groups.items()):
-
-                        col_a, col_b = st.columns(
-                            [3, 1]
-                        )
-
-                        with col_a:
-
-                            st.write(
-                                f"**{flight}** — {len(group_df):,} satır"
-                            )
-
-                        with col_b:
-
-                            st.download_button(
-                                label="CSV indir",
-                                data=_flight_csv_bytes(group_df),
-                                file_name=(
-                                    f"ucus_{flight}_{time_suffix}.csv"
-                                ),
-                                mime="text/csv",
-                                key=f"download_flight_{flight}",
-                            )
+        st.exception(exc)
 
 
 # ============================================================
@@ -2555,7 +3060,12 @@ def main():
         )
 
         st.caption(
-            f"Kaynak (parquet): "
+            f"ClickHouse tablosu: "
+            f"{get_clickhouse_database()}.{get_clickhouse_table()}"
+        )
+
+        st.caption(
+            f"Parquet yedeği: "
             f"{get_processed_files_glob()}"
         )
 
@@ -2608,12 +3118,53 @@ def main():
     # AUTO REFRESH
     # ========================================================
 
-    if refresh_seconds:
+    # "Veri Gözat / Dışa Aktar" akışında otomatik yenileme, gerçek
+    # ortamda doğrulanmış iki ayrı şekilde export'u bozuyordu:
+    #
+    #  1) Sadece interval değerini büyütmek (ör. 24 saate çekmek)
+    #     YETERLİ DEĞİL — streamlit_autorefresh bileşeninin JS tarafı
+    #     zaten çalışan bir zamanlayıcı varken yeni interval'i
+    #     güvenilir şekilde uygulamıyor. Bu yüzden bileşen, interval
+    #     değiştirilerek değil doğrudan HİÇ MONTE EDİLMEYEREK devre
+    #     dışı bırakılır (aşağıdaki st.empty() ile).
+    #
+    #  2) Bunu yalnızca "veri getirildikten sonra" (export_df set
+    #     edildikten sonra) yapmak da yetersizdi: otomatik yenileme
+    #     hâlâ aktifken "📥 Veriyi Getir ve Önizle" tıklaması, o anda
+    #     tetiklenen bir yenilemeyle yarışıp sunucuya hiç ulaşmamış
+    #     gibi kayboluyordu — export_df bir türlü set edilemiyor,
+    #     "3️⃣ İndir" sonsuza dek boş kalıyordu. Bu yüzden duraklatma,
+    #     satır sayısı hesaplandığı anda (export_row_count set
+    #     edilir edilmez) başlar; "Veriyi Getir ve Önizle" tıklandığı
+    #     an otomatik yenileme zaten devre dışıdır, yarış oluşmaz.
+    #     (~874k satırlık bir export ile: otomatik yenileme AÇIKKEN
+    #     asla tamamlanmadı, bu düzeltmeyle ~20-30 saniyede sorunsuz
+    #     tamamlandı.)
+    #
+    # st_autorefresh() çağrısını koşula bağlı olarak tamamen var/yok
+    # etmek (fonksiyonu hiç çağırmamak), st.tabs() öncesindeki eleman
+    # sırasını/sayısını değiştirip Streamlit'in dış sekmeleri (main()
+    # içindeki "Pipeline Metrikleri" vb.) yeniden takılmış gibi
+    # algılayıp seçili sekmeyi ilk sekmeye sıfırlamasına yol açıyordu.
+    # Bunu önlemek için sabit bir st.empty() placeholder HER ZAMAN aynı
+    # noktada oluşturulur — değişen şey, bu placeholder'ın İÇİNİN
+    # doldurulup doldurulmaması.
 
-        st_autorefresh(
-            interval=refresh_seconds * 1000,
-            key="dashboard_refresh",
-        )
+    export_in_progress = (
+        st.session_state.get("export_row_count") is not None
+        or st.session_state.get("export_df") is not None
+    )
+
+    autorefresh_slot = st.empty()
+
+    if refresh_seconds and not export_in_progress:
+
+        with autorefresh_slot:
+
+            st_autorefresh(
+                interval=refresh_seconds * 1000,
+                key="dashboard_refresh",
+            )
 
     # ========================================================
     # RUN VERİSİNİ BİR KEZ ÇEK
@@ -2725,7 +3276,11 @@ def main():
             render_catalog(
                 catalog_df
             )
-            
+
+        st.divider()
+
+        render_metadata_history()
+
     # ========================================================
     # ALERTS
     # ========================================================
