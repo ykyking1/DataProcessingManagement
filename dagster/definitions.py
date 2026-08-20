@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from dagster import (
+    AssetSelection,
     Definitions,
     define_asset_job,
     load_assets_from_modules,
@@ -19,6 +20,7 @@ load_dotenv(
 
 from assets import ingestion
 from assets import processing
+from assets import publishing
 
 from schedules.telemetry_sensor import telemetry_sensor
 
@@ -34,6 +36,7 @@ all_assets = load_assets_from_modules(
     [
         ingestion,
         processing,
+        publishing,
     ]
 )
 
@@ -44,7 +47,7 @@ all_assets = load_assets_from_modules(
 
 uav_data_pipeline_job = define_asset_job(
     name="uav_data_pipeline_job",
-    selection="*",
+    selection=AssetSelection.all(),
     hooks={
         alert_on_failure,
         clear_alert_on_success, # YENİ EKLENEN KISIM
