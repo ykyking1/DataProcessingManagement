@@ -21,6 +21,7 @@ load_dotenv(
 from assets import ingestion
 from assets import processing
 from assets import clickhouse
+from assets import publishing
 
 from schedules.telemetry_sensor import telemetry_sensor
 
@@ -37,6 +38,7 @@ all_assets = load_assets_from_modules(
         ingestion,
         processing,
         clickhouse,
+        publishing,
     ]
 )
 
