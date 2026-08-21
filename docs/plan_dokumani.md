@@ -1172,3 +1172,1845 @@ ayarlanması gereken bir çift.** Üretim sunucusunda (256 çekirdek,
 farklı RAM bütçesi) bu ikili yeniden ölçülmeli; bu makinedeki 20/5.000
 kombinasyonu doğrudan oraya taşınabilir bir "sihirli sayı" değil,
 metodoloji taşınabilir.
+
+## 22. `row_group_size=20000` denemesi -- sistem çökmesi, örnek-ölçek tahmini tutmadı (2026-08-18)
+
+Bölüm 21'deki küçük-örnek profilinde `row_group_size=20000` en iyi
+nokta gibi görünmüştü (654MB/worker, sıkıştırma 2,12x -- 50.000'den
+bile iyi). Kullanıcının "6-7GB kullanmışız, hâlâ yerimiz var" gözlemi
+üzerine bu değer gerçek ölçekte (766binlik tam parçalar, N=20) test
+edildi.
+
+**Sonuç: örnek-ölçek tahmini gerçek ölçekte tutmadı, tam sistem
+kilitlenmesi.** İlk 50 saniyede bellek 8,5Gi->9,0Gi'ye tırmandı, hemen
+ardından `docker exec`/`docker stats`/`docker top` -- yani Docker
+daemon'ının container'a dokunan HER işlemi -- 40-90 saniye içinde
+cevapsız kaldı. Host makine sağlıklıydı (8,7GB boş RAM, Docker Desktop
+process'leri "Responding: True"), ama WSL2 VM'i içeride tamamen
+tıkanmıştı. ~20 dakika bekleme + kurtarma denemesinden sonra Docker
+Desktop zaten kendiliğinden çökmüştü (`npipe` soketi kayboldu) --
+**manuel restart (`Stop-Process` + `wsl --shutdown` + yeniden başlatma)
+gerekti.** Container ve volume sağlam kaldı (crash'ten etkilenmedi),
+ama testin kendisi **20/20 worker de yarım kaldı** (250-360MB'lık
+kesik parquet dosyaları, hiçbiri tamamlanmadı, tek bir exit kodu bile
+yazılamadı).
+
+**Bu, `row_group_size=50000`'in verdiği hatadan (Bölüm 19) NİTELİKSEL
+OLARAK DAHA KÖTÜ bir başarısızlık modu**: rgs=50000'de OOM-killer
+devreye girip başarısız worker'ları temiz şekilde öldürüyordu (anında
+0-byte dosya, net exit kodu 137, üretim manifestosu bunu kolayca
+yakalar). rgs=20000'de ise sistem OOM-killer'ın müdahale edemeyeceği
+kadar ağır bir swap-thrashing'e girip **tamamen donuyor** -- dışarıdan
+müdahale olmadan süresiz askıda kalabilirdi, üretimde bu "sessizce
+saatlerce takılı kalan" bir worker havuzu anlamına gelir, tespiti çok
+daha zordur.
+
+**Neden küçük-örnek tahmini tutmadı**: 300.000 satırlık örnek dosya
+gerçek parçaların (766.667 satır) ~%39'u büyüklüğünde -- DuckDB'nin
+CSV okuyucusunun kendi iç tamponlaması (auto-detect/sniffing, okuma
+ilerisi tamponu) muhtemelen dosya boyutuyla orantısız büyüyor, salt
+`row_group_size`'a bağlı değil. Yani örnek-ölçek profilleme
+`row_group_size`'ın YÖNÜNÜ (küçültmek belleği azaltır) doğru
+gösterdi ama MUTLAK değerleri güvenilir şekilde tam ölçeğe
+taşımadı -- bu bir daha dikkate alınmalı, tam ölçekte doğrulanmamış
+bir ayarı üretime almadan önce mutlaka gerçek dosya boyutuyla test
+etmek gerekir.
+
+**Güncel durum**: `row_group_size=5000` hâlâ tek doğrulanmış güvenli
+N=20 ayarı (Bölüm 21, gerçek ölçekte 20/20 başarılı, ~5,9-6,9GB peak
+bellek). `20000` denenmemeli/güvenilmez olarak işaretlendi. Aradaki
+değerler (10000, 15000) test edilmedi.
+
+**GÜNCELLEME: bkz. Bölüm 23 -- `row_group_size=10000` test edildi,
+5.000'den hem hızlı hem daha iyi sıkıştırılmış çıktı, yeni en iyi
+nokta.**
+
+## 23. `row_group_size=10000` -- yeni en iyi nokta, container'ın tam sıfırdan kurulumu (2026-08-18)
+
+Bölüm 22'deki çökme sırasında, kullanıcının host diskini kontrol etmesi
+üzerine **host C: diski 0,4GB'a kadar düşmüş** olduğu bulundu --
+sorumlusu `docker_data.vhdx` (WSL2/Docker'ın sanal disk dosyası),
+158,8GB'a şişmişti (container içinde `rm -rf` ile silinen dosyalar
+vhdx'i küçültmüyor, sadece boş alan olarak içeride tutuluyor -- Bölüm
+12'de belgelenen davranışın aynısı). Kullanıcı Docker Desktop'ın
+"Clean/Purge data" (WSL2) özelliğini çalıştırdı: host disk 0,4GB->
+155,3GB'a döndü **ama bu, `t2p-cmp3` container'ını ve `t2p-work4`
+volume'unu da tamamen sildi** (imaj dahil). Kaynak `.tab` dosyaları
+host'ta (vhdx'in dışında) olduğu için etkilenmedi.
+
+**Container sıfırdan yeniden kuruldu**:
+```
+docker volume create t2p-work4
+docker run -d --name t2p-cmp3 \
+  -v "c:/Users/PC_4150_YD26/DataProcessingManagement:/host" \
+  -v t2p-work4:/work \
+  rust:1-bookworm sleep infinity
+```
+`apt-get` HTTP (port 80, `deb.debian.org`) bağlantısı zaman aşımına
+uğradı (muhtemelen Docker Desktop restart sonrası ağın tam
+oturmaması ya da bir filtre) ama HTTPS (pypi.org, port 443) çalıştı --
+`apt`'a hiç gerek kalmadan `get-pip.py` (`https://bootstrap.pypa.io/get-pip.py`)
+ile pip kuruldu (Debian'ın PEP 668 "externally managed environment"
+korumasını aşmak için `--break-system-packages` gerekti -- tek
+kullanımlık container'da risksiz), ardından `pip install duckdb
+pyarrow numpy` ile bağımlılıklar geri geldi (duckdb 1.5.5, pyarrow
+25.0.1, numpy 2.4.6).
+
+**Yeniden kurulan container ile `row_group_size=10000` test edildi**
+(6 kaynak dosya yeniden 20 parçaya bölündü, bu kez bellek her 10-15
+saniyede bir sıkıca izlendi -- Bölüm 22'deki geç fark etme sorununu
+önlemek için):
+
+| | N=20 (rgs=50.000) | N=20 (rgs=20.000) | N=20 (rgs=5.000) | **N=20 (rgs=10.000)** |
+|---|---|---|---|---|
+| Sonuç | 13/20 (%65) | **sistem kilitlendi, 0/20** | 20/20 | **20/20** |
+| Süre | 664sn | tamamlanamadı | 290sn | **235sn** |
+| Sıkıştırma | 2,09x (sadece hayatta kalanlar) | -- | 1,97x | **1,99x** |
+| Peak bellek | 11GB/11GB (doldu) | 9GB'da kilitlendi | ~5,9-6,9GB | ~5,0-5,6GB (en düşük!) |
+| Agregat throughput | ~12.990 satır/sn | -- | 47.586 satır/sn | **58.723 satır/sn** |
+
+**`row_group_size=10000`, `5000`'e göre de net üstün çıktı** -- hem
+daha hızlı (235sn vs 290sn) hem daha iyi sıkıştırılmış (1,99x vs
+1,97x) hem daha düşük bellek kullanan (~5,0-5,6GB vs ~5,9-6,9GB).
+Yani belek-sıkıştırma-hız üçgeninde `5000` ile `10000` arasında bir
+"trade-off" yokmuş -- `10000` üçünde de `5000`'i geçiyor. `20000` ise
+hâlâ güvenilmez/tehlikeli olarak işaretli kalıyor (Bölüm 22).
+
+**Yeni en iyi doğrulanmış DuckDB ayarı bu makinede: `threads=1`,
+`row_group_size=10000`, N=20 worker.** Bu, Bölüm 14'teki orijinal
+N=6/`row_group_size=50000` yaklaşımına (565sn) göre **~2,4x hızlanma**
+sağlıyor (235sn), güvenilirlik kaybı olmadan (20/20 vs 6/6, ikisi de
+%100). `row_group_size=15000` gibi aradaki değerler hâlâ test
+edilmedi, ama `10000` zaten hem `5000`'den hem (görünüşe göre)
+`20000`'in güvensizliğinden daha iyi bir nokta olduğu için ek
+tarama şu an için gerekçesiz görünüyor.
+
+## 24. MinIO -> ClickHouse yükleme darboğazı -- s3() toplu yükleme ile ~17-20x hızlanma (2026-08-18)
+
+Kullanıcı, henüz üretimde olmayan ama tasarım aşamasında endişe
+duyulan bir sonraki darboğazı sordu: MinIO'daki parquet dosyalarının
+ClickHouse'a taşınması. Bu, plan dokümanının Bölüm 3.4'ünde ZATEN
+öngörülmüştü ("1.5M dosya için 1.5M ayrı INSERT atılmamalı... ya
+uygulama tarafında biriktirip az sayıda büyük INSERT, ya da
+ClickHouse'un S3()/file() fonksiyonlarıyla toplu yükleme") ama hiç
+gerçek ölçekte doğrulanmamıştı. Repo'daki tek mevcut ClickHouse yükleme
+kodu (`dagster/assets/clickhouse.py`, AU-AIR prototip verisiyle) tam
+olarak uyarılan anti-pattern'i kullanıyordu: `pandas` DataFrame ->
+Python tuple listesi -> `clickhouse_driver.execute(INSERT...VALUES,
+rows)`.
+
+**Test ortamı**: Docker'da MinIO + ClickHouse + `t2p-cmp3` (client)
+aynı network'te (`t2p-net`) ayağa kaldırıldı. Test verisi: mevcut
+`.tab` kaynaklarından 100.000 satırlık bir dilim, doğrulanmış DuckDB
+ayarıyla (`threads=1`, `row_group_size=10000`) parquet'e çevrildi
+(1001 sütun: `timestamp` + `f0`..`f999`, hepsi Float64) ve MinIO'ya
+yüklendi. ClickHouse'da eşleşen şema ile `MergeTree` tablosu
+oluşturuldu (`ORDER BY timestamp`).
+
+**Sonuçlar (100.000 satır, tek dosya)**:
+
+| Yöntem | Süre | Throughput |
+|---|---|---|
+| Naive `pandas`+`clickhouse_driver` INSERT (mevcut `dagster/clickhouse.py` deseni) | 37,11sn (10,78sn pandas dönüşüm + 26,34sn INSERT) | 2.694 satır/sn |
+| **ClickHouse `s3()` toplu yükleme** (`INSERT INTO ... SELECT * FROM s3(...)`) | **2,12sn** | **47.159 satır/sn** |
+
+**~17,5x hızlanma**, Python/pandas'ı devre dışı bırakıp veriyi
+ClickHouse'un kendi C++ motoruna (S3 okuma + parquet decode + insert
+hepsi native) bırakarak -- bugün DuckDB'de yaptığımız "satır-satır
+Python işlemeyi bypass et" prensibinin birebir aynısı.
+
+**Wildcard çoklu-dosya testi** (planın asıl önerdiği çözüm: "1,5M ayrı
+sorgu" sorununu gidermek için tek sorguda çok dosya): aynı içerikten 4
+kopya daha MinIO'ya yüklenip `s3('http://minio:9000/telemetry/bench/sample_*.parquet', ...)`
+ile TEK SORGUDA 5 dosya (500.000 satır) yüklendi: **9,16sn, 54.595
+satır/sn** -- tekil dosya testinden bile hafif daha hızlı, yani
+wildcard ile çoklu dosya yüklemenin dosya başına ek bir maliyeti YOK.
+Doğruluk teyit edildi: ClickHouse'daki `sum(f0)` (-711210,13188),
+kaynak parquet'in DuckDB ile hesaplanan toplamıyla (×5) birebir eşleşti.
+
+**"Too many parts" endişesi kısmen doğrulandı**: tek wildcard INSERT
+(5 dosya, 500.000 satır) ClickHouse'ta **4 aktif parça** oluşturdu (muhtemelen
+ClickHouse'un kendi iç blok boyutu sınırından, dosya sayısından değil).
+Bu, "dosya başına 1 parça" ya da "satır başına 1 parça" senaryosundan
+çok daha iyi -- 1,5M dosyayı örneğin 100-1000'lik gruplar halinde
+wildcard ile yükleseydik, toplam parça sayısı background merge
+sürecinin rahatça yetişebileceği bir aralıkta kalır.
+
+**Sonuç/tavsiye**:
+- **MinIO->ClickHouse için Python/pandas tabanlı satır-satır INSERT
+  KULLANILMAMALI** -- `dagster/assets/clickhouse.py`'deki mevcut
+  desen, gerçek 1,5M dosyalık ölçeğe hiç taşınmamalı, sadece küçük
+  ölçekli prototip/demo amaçlı kaldı.
+- **Üretim deseni**: dönüştürülen parquet dosyaları MinIO'ya
+  yazıldıkça, Postgres manifest tablosundaki durumu "hazır" olan
+  dosyalar periyodik olarak (örn. saatlik/günlük batch, ya da N dosya
+  biriktiğinde) `INSERT INTO ... SELECT * FROM s3('.../*.parquet',
+  ...)` ile wildcard/glob pattern kullanılarak TOPLU yüklenmeli --
+  dosya başına ayrı sorgu değil.
+- **Açık kalan tasarım kararı (plan açık sorular #4)**: partition
+  key/`ORDER BY` stratejisi hâlâ üretim şemasına göre netleştirilmeli
+  -- bu testte basitlik için ham `timestamp` (Float64) ile `ORDER BY
+  timestamp` kullanıldı, gerçek şemada uygun bir `DateTime64` sütunu +
+  `PARTITION BY toYYYYMM(...)` gibi bir strateji (mevcut
+  `dagster/assets/clickhouse.py`'nin zaten kullandığı desen) daha
+  doğru olur; bu, hem sorgu performansını hem merge/parça davranışını
+  etkiler, ayrı ele alınmalı.
+- **Ölçek notu**: bu testte 100k-500k satırlık küçük örneklerle
+  çalışıldı, sonuçlar oranlar (17-20x) olarak güvenilir ama gerçek
+  `.ham` verisinin satır yoğunluğu netleşmeden 1,5M dosyalık tam
+  senaryo için kesin süre tahmini yapılmadı.
+
+## 25. ClickHouse partition key kararı -- İHA bazlı vs zaman bazlı vs bileşik, gerçek ölçümle karar (2026-08-18)
+
+Kullanıcı "sorgular genelde araç bazlı olur, İHA'ya göre gruplamak
+daha iyi olmaz mı" diye sordu -- makul bir itiraz, varsayımla değil
+ölçerek cevaplandı. Üç ClickHouse tablosu (aynı şema: `timestamp
+DateTime`, `iha_id UInt8`, `latitude/longitude/altitude Float64`,
+100.000.000 satır, 6 İHA, 1 yıllık zaman aralığı, veri doğrudan
+ClickHouse SQL'iyle (`numbers()`+`rand()`) üretildi -- parquet/MinIO
+adımı bu testte YOK, sadece ClickHouse'un kendi sorgu motoru
+ölçülüyor) oluşturuldu:
+
+- `tel_time_part`: `PARTITION BY toYYYYMM(timestamp)`, `ORDER BY (iha_id, timestamp)` -- 52 aktif parça
+- `tel_iha_part`: `PARTITION BY iha_id`, `ORDER BY (iha_id, timestamp)` -- 54 aktif parça
+- `tel_composite`: `PARTITION BY (iha_id, toYYYYMM(timestamp))`, `ORDER BY (iha_id, timestamp)` -- **372 aktif parça**
+
+**Üç sorgu senaryosu, her biri 3 kez çalıştırılıp en iyi süre alındı**:
+
+| Senaryo | `tel_time_part` (aylık) | `tel_iha_part` (İHA) | `tel_composite` (bileşik) |
+|---|---|---|---|
+| Araç + dar zaman (iha_id=3, 1 hafta) | **6,7ms** | 7,6ms | 27,0ms |
+| Sadece araç filtresi (iha_id=3, tüm zamanlar) | 37,3ms | **25,9ms** | 45,7ms |
+| Sadece zaman filtresi (1 hafta, tüm araçlar) | **13,3ms** | 16,5ms | 21,6ms |
+
+**Bulgular**:
+1. Araç bazlı sorgu hızı **`ORDER BY (iha_id, timestamp)`'tan geliyor, `PARTITION BY`'dan değil** -- her üç şemada da `iha_id` `ORDER BY`'ın başında olduğu için araç filtreli sorgular zaten hızlı; `PARTITION BY` seçimi bunu marjinal etkiliyor.
+2. Kullanıcının sezgisi kısmen doğrulandı: `PARTITION BY iha_id`, SADECE "araç filtresi, zaman filtresi yok" senaryosunda gerçekten daha hızlı (~%30, 37,3ms->25,9ms) -- çünkü tek partition'a gidiyor, 12 ayı taramıyor. Ama diğer iki senaryoda (ikisi de zaman filtresi içeriyor) aylık partition kazanıyor, farklar küçük.
+3. **Bileşik partition (`iha_id`+ay) HER ÜÇ senaryoda da EN KÖTÜSÜ çıktı** -- "en iyisini birleştirelim" sezgisi burada ters tepti. Sebep: 6 İHA × 12 ay kombinasyonu 372 aktif parçaya bölünmüş (aylık'ın 52'sine, İHA'nın 54'üne karşı) -- çok daha fazla, çok daha küçük partition/parça demek, her sorgu daha fazla partition metadata'sı açıp taramak zorunda kalıyor, merge de partition sınırını aşamadığı için veri daha az konsolide kalıyor. Beklenen "iki avantajı birleştir" sonucu yerine "iki dezavantajı birleştir" oldu.
+
+**Karar (ölçümle doğrulandı, varsayımla değil)**: `PARTITION BY
+toYYYYMM(timestamp)` + `ORDER BY (iha_id, timestamp)` -- 3 senaryonun
+2'sinde en hızlı, kaybettiği senaryoda fark küçük, VE zaman bazlı
+arşivleme/eski-veri-silme avantajını koruyor (bkz. Bölüm 24), VE en
+sağlıklı parça/merge davranışını veriyor. Bileşik partition fikri
+somut olarak elendi -- düşünsel olarak makul görünse de ölçüldüğünde
+her senaryoda daha kötü çıktı.
+
+**Not**: Bu test tek seferlik bir anlık görüntü (100M satır bir kerede
+yüklendi) -- gerçek üretimde sürekli/artımlı yükleme altında merge
+davranışının uzun vadede nasıl evrileceği (özellikle `tel_iha_part`'ın
+partition başına sınırsız büyümesi -- Bölüm 24'te tartışılan risk) bu
+testte gözlemlenmedi, ayrı bir uzun-vadeli test gerektirir.
+
+## 26. MinIO->ClickHouse yükleme sınırları -- dosya sayısı, eşzamanlı worker, ortam kirlenmesi (2026-08-18)
+
+Kullanıcının "sınırları test edelim" isteği üzerine `s3()` toplu
+yüklemenin iki ayrı boyutu ölçüldü: (a) tek sorguda kaç dosya, (b) kaç
+eşzamanlı sorgu/worker. Yol boyunca önemli bir metodolojik ders de
+çıktı.
+
+### 26.1 Tek sorguda dosya sayısı -- ortam kirlenmesi tuzağı
+
+İlk turda 5->25->100 dosya denendi (aynı bucket'a biriktirerek):
+5 dosya 9,16sn (54.595 satır/sn), 25 dosya 70,91sn (35.256 satır/sn),
+100 dosya 459,42sn (21.766 satır/sn) -- düzgün bir düşüş gibi
+göründü. Ama `max_insert_threads`/`max_download_threads`'i 20'ye
+çıkarıp "25 dosyayı" tekrar test edince sonuç **1200sn'de (20dk)
+KILL QUERY ile durduruldu** -- ayarları artırmak YARDIMCI OLMADI,
+kötüleştirdi. Bunu araştırırken **asıl kök nedenin dosya sayısı
+DEĞİL, test ortamının kendisinin saatlerce süren birikmiş yükten
+yorulmuş olması** olduğu bulundu:
+- `docker stats`: ClickHouse boşta bile %99,93 CPU, 7,2GB bellek
+  (idle'da olmaması gereken bir yük)
+- Host disk 62,9GB'dan 19,9GB'a düşmüş (vhdx büyümesi, Bölüm 22/12'nin
+  aynı paterni), host RAM 2,4GB'a düşmüş
+- İzole/temiz bucket'ta bile aynı "25 dosya" testi 235-255sn sürdü
+  (ilk ölçümün 70,91sn'sinden ~3,3x yavaş) -- bucket'ın kendisi temiz
+  olsa bile SİSTEM genel olarak yorulmuştu
+
+**Çözüm**: kullanıcı Docker Desktop "Clean/Purge data" çalıştırdı
+(disk 19,9->155,8GB), tüm container'lar (`t2p-cmp3`, `minio`,
+`clickhouse`, imajlar) sıfırdan yeniden kuruldu (`apt` yerine yine
+`get-pip.py` + `--break-system-packages`, Bölüm 23'teki yöntemin
+aynısı). **Temiz ortamda tekrar ölçüm**: 5 dosya 15,21sn (32.873
+satır/sn), 25 dosya 84,58sn (29.559 satır/sn) -- ilk (kirlenmemiş)
+ölçümlere çok daha yakın, throughput 5->25 dosyada sadece ~%10
+düşüyor (önceki yanlış "felaket" düşüşü ortam kirliliğinden kaynaklıydı).
+
+**Ders**: Uzun süren (saatler süren) benchmark oturumlarında **ortamın
+kendisi bir değişken haline geliyor** -- WSL2/Docker'ın disk (vhdx
+thin-provisioning büyümesi) ve bellek (WSL2'nin belleği Windows'a geç
+iade etmesi, normal ama birikimli) davranışı, ölçtüğümüz asıl
+parametreden (dosya sayısı) bağımsız olarak sonuçları kirletebiliyor.
+Uzun test turlarında ARA SIRA "temiz ortamda tekrar ölç" kontrolü
+yapmadan, tek bir uzun oturumun sonuçlarına güvenilmemeli.
+
+**Ek bulgu -- CPU kullanımı düşük, iş I/O-bound**: temiz ortamda 25
+dosyalık bir yükleme sırasında `docker stats` ile canlı CPU izlendi:
+%300-432 (20 çekirdeğin ~%15-22'si) -- yani `max_threads=20` olsa da
+sorgu CPU'yu doldurmuyor, ağ/disk I/O'da bekliyor. Bu, thread sayısını
+artırmanın neden işe yaramadığını (üstte, 1200sn'lik çökme) açıklıyor.
+
+**Ek bulgu -- soğuk/sıcak önbellek etkisi**: aynı 25 dosya İKİNCİ kez
+okunduğunda süre 84,58sn->53,97sn'ye düştü (throughput 29.559->46.319
+satır/sn) -- MinIO/OS önbelleği "ısınmış". Üretimde her dosya
+muhtemelen sadece 1 kez okunacağı için, İLK okuma (soğuk) sayıları
+gerçek senaryoyu temsil eder, tekrar okuma sayıları aşırı iyimserdir.
+
+### 26.2 Eşzamanlı worker sayısı -- N=4'te bellek limiti aşıldı
+
+Darboğazın I/O-bound olduğu bulununca, "daha fazla eşzamanlı sorgu
+CPU'nun boşta kalan kısmını doldurabilir mi" test edildi. Her N için
+TAMAMEN TAZE (önceden hiç okunmamış) 10'ar dosyalık izole gruplar
+kullanıldı (soğuk-önbellek etkisini karıştırmamak için), hepsi aynı
+hedef tabloya (`telemetry_concurrent`) paralel yazdı:
+
+| N | Toplam süre | Başarı | Agregat throughput |
+|---|---|---|---|
+| 1 | 18,58sn | 1/1 (%100) | 53.821 satır/sn |
+| 2 | 32sn | 2/2 (%100) | **62.500 satır/sn (en iyi)** |
+| 4 | 91sn | **3/4 (%75)** | ~32.967 satır/sn (düşüş + kayıp) |
+
+N=4'te bir worker **temiz bir hatayla** düştü (sessiz veri kaybı
+değil):
+```
+DB::Exception: (total) memory limit exceeded: would use 9.13 GiB
+(attempt to allocate chunk of 3.00 MiB), current RSS: 7.91 GiB,
+maximum: 9.12 GiB.
+```
+Bu, ClickHouse'un `max_memory_usage=0` (sorgu başı sınırsız) olmasına
+rağmen **sunucu geneli toplam bellek limitine** (container'ın 11,68GB
+bütçesinin ~%78'i, muhtemelen ClickHouse'un varsayılan
+`max_server_memory_usage` payı) çarptığını gösteriyor.
+
+**Sonuç**: N=1->2 arası paralellik net kazanç veriyor (+%16 agregat
+throughput, klasik "bireysel worker yavaşlıyor ama toplam iş hızlanıyor"
+paterni -- N=1 18,58sn/worker'dan N=2'de ~31,5sn/worker'a çıktı ama
+2 tane aynı anda).
+
+**N=3 ayrıca test edildi (yine tamamen taze/izole 3x10 dosyalık
+gruplarla) -- beklenmedik ve önemli bir sonuç verdi**: 129sn, 3/3
+başarılı (%100) ama agregat throughput **23.256 satır/sn'ye çöktü** --
+N=1'den (53.821) bile kötü. Bellek izlemesi boyunca sürekli 7,6Gi'den
+9,1Gi'ye tırmandığı görüldü -- tam N=4'ün çöktüğü ~9,12GB sınırına
+yaklaşmış ama aşmamış. Yorum: N=4'te "kırmızı bölge" (açık hata) var,
+N=3'te ise sınıra yaklaşırken ClickHouse'un kendini sessizce
+yavaşlattığı (muhtemelen bellek baskısı altında ek disk spill/throttle)
+bir **"sarı bölge"** var -- büyüklük olarak çökmeden önce performans
+zaten ciddi bozuluyor.
+
+**GÜNCEL SONUÇ: bu makinede gerçek güvenli tavan N=2, "2 ile 4 arası"
+değil.** N=3 zaten belirgin bozulma gösteriyor (N=1'den bile yavaş),
+N=4 açıkça çöküyor -- tab->parquet'teki DuckDB N=20 testine (Bölüm 19)
+benzer ama daha erken/keskin bir "verinin bir kısmını kaybetmeden
+büyütülebilecek worker sayısı çok sınırlı" deseni, burada tavan 6
+değil 2.
+
+**Genel tavsiye (üretim tasarımı için)**: MinIO->ClickHouse yükleme
+worker'ları (a) dosya başına değil, onlarca-dosyalık batch'ler
+halinde (`s3()` wildcard, Bölüm 24) çalışmalı, (b) eşzamanlı **2**
+worker'ı aşmamalı (bu makinede -- üretim sunucusunda ClickHouse'un
+kendi bellek payı farklı olacağı için bu sayı yeniden ölçülmeli), (c)
+"memory limit exceeded" gibi net hatalar Postgres manifest'te retry
+tetiklemeli, sessiz kayıp riski düşük görünüyor bu senaryoda.
+
+### 26.3 `max_download_threads` düzeltmesi -- ölçülü artış (4->8) gerçekten yardımcı oluyor
+
+Bölüm 26.1'deki "thread artırmak kötüleştirdi (1200sn'de KILL QUERY)"
+sonucu KİRLİ ortamda ölçülmüştü, güvenilmezdi -- temiz ortamda,
+`max_insert_threads`+`max_download_threads` ikisini birden aşırı
+değere (20/20) değil, sadece `max_download_threads`'i ölçülü bir
+değere (4->8) çıkararak tekrar test edildi (iki TAMAMEN taze/izole
+10'ar dosyalık grup, cold-cache karşılaştırması adil kalsın diye):
+
+| Ayar | Süre | Throughput |
+|---|---|---|
+| Varsayılan (`max_download_threads=4`) | 44,27sn | 22.591 satır/sn |
+| **`max_download_threads=8`** | **32,93sn** | **30.368 satır/sn (~%34 daha hızlı)** |
+
+**Düzeltme**: Bölüm 26.1'in "thread artırmak yardımcı olmuyor" sonucu
+YANLIŞTI -- o ölçüm kirli ortamda yapılmıştı. Ölçülü bir artış (4->8)
+gerçek ve belirgin bir kazanç veriyor. Daha yüksek değerler (12, 16,
+20) bu oturumda tekrar bellek/host baskısı nedeniyle test edilemedi --
+`max_download_threads=8`, N=2 eşzamanlı worker ile birlikte
+(Bölüm 26.2) kullanılabilecek, doğrulanmış bir başlangıç noktası.
+
+**Metodolojik ders (tekrar)**: Bölüm 26.1'de zaten çıkarılan "kirli
+ortamda ölçüm güvenilmez" dersi burada ikinci kez doğrulandı -- aynı
+parametrenin (thread sayısı) etkisi kirli/temiz ortamda TERS yöne
+çıktı (kötüleşme vs %34 iyileşme). Ortam sağlığı kontrol edilmeden
+alınan "X işe yaramıyor" sonuçlarına güvenilmemeli.
+
+**Devamı -- tam eğri 4'ten 20'ye kadar çıkarıldı, kesintisiz kazanç.**
+Aradaki test sırasında `vmmemWSL` host RAM'ini yine ~9GB'a kadar
+tüketti (host'ta 0,7GB boş kaldı) -- bu kez purge değil, kullanıcının
+`wsl --shutdown` komutu ile çözüldü (RAM 0,7->7,9GB'a döndü). **Önemli
+fark**: `wsl --shutdown`, Docker Desktop'ın "Clean/Purge data"
+özelliğinden farklı olarak container/volume verisini SİLMİYOR --
+sadece durduruyor, `docker start` ile hepsi (paketler, MinIO verisi
+dahil) aynen geri geldi, yeniden kurulum gerekmedi. (Yan etkisi hâlâ
+geçerli: bu makinedeki TÜM WSL tabanlı Docker container'larını
+durdurur, sadece bizimkini değil.)
+
+| `max_download_threads` | Süre | Throughput |
+|---|---|---|
+| 4 (varsayılan) | 44,27sn | 22.591 satır/sn |
+| 8 | 32,93sn | 30.368 satır/sn |
+| 12 | 27,86sn | 35.888 satır/sn |
+| 16 | 23,12sn | 43.259 satır/sn |
+| **20** | **19,49sn** | **51.316 satır/sn (4'e göre +%127)** |
+
+Her adım (10'ar dosyalık TAMAMEN taze/izole gruplarla, cold-cache
+adil kalsın diye) kesintisiz kazanç verdi, hiç çökme olmadı --
+`max_download_threads=20` TEK BAŞINA (yalnızca bunu artırıp
+`max_insert_threads`'e dokunmadan) sorunsuz ve en iyi sonucu verdi.
+**Sonuç: önceki çökme (Bölüm 26.1, 1200sn) hem kirli ortamdan hem
+`max_insert_threads`+`max_download_threads` ikisinin BİRLİKTE 20'ye
+çıkarılmasından kaynaklanıyormuş -- sadece `max_download_threads`'i
+artırmak (container'ın mantıksal çekirdek sayısı olan 20'ye kadar)
+tamamen güvenli ve güçlü bir kazanç kaynağı.**
+
+**GÜNCELLEME -- kombinasyon test edildi, tahmin YANLIŞ çıktı (bkz.
+Bölüm 26.4).** "Muhtemelen çarpımsal fayda sağlarlar" hipotezi
+ölçüldü ve reddedildi -- N=2 + `max_download_threads=20` birlikte,
+ikisinden AYRI AYRI daha kötü sonuç verdi.
+
+### 26.4 N=2 + max_download_threads=20 kombinasyonu -- birbirini beslemiyor, çakışıyor
+
+İki taze/izole 10'ar dosyalık grup, N=2 eşzamanlı worker ile, her biri
+`max_download_threads=20` ayarıyla aynı hedef tabloya yüklendi:
+
+| Konfigürasyon | Süre | Agregat throughput |
+|---|---|---|
+| N=2, varsayılan thread (Bölüm 26.2) | 32sn | **62.500 satır/sn (en iyi)** |
+| N=1, `max_download_threads=20` (Bölüm 26.3) | 19,49sn | 51.316 satır/sn |
+| **N=2 + `max_download_threads=20` (bu test)** | 46sn | **43.478 satır/sn (İKİSİNDEN DE KÖTÜ)** |
+
+**Yorum**: İki optimizasyon "farklı darboğazları hedefliyor, çarpımsal
+fayda sağlar" varsayımı YANLIŞ. Aslında ikisi de AYNI kısıtlı kaynağı
+(gerçek I/O bant genişliği -- tek MinIO instance'ı/Docker ağı)
+paylaşıyor: N=2 worker × 20 download thread = aynı anda 40'a kadar
+bağlantı aynı darboğaza yükleniyor, birbirine eklenmek yerine
+çakışıyor/rekabet ediyor (bu oturumun çok daha önceki bir bölümünde,
+native Windows'ta 12 paralel worker'ın disk I/O'sunu ~148MB/s'e
+çökerttiği bulgusuyla aynı aile).
+
+**GÜNCEL/NİHAİ ÖNERİ (üretim için)**: İkisini birleştirmeye çalışmak
+yerine **TEK bir optimizasyonu seç, ikisini birden değil**:
+- Tek worker/az sayıda eşzamanlı yükleme yeterliyse: `max_download_threads`'i
+  yüksek tut (bu makinede 20, hedef sunucunun çekirdek sayısına göre
+  ölçeklenmeli).
+- Çok sayıda eşzamanlı yükleme gerekiyorsa (üretimde muhtemel senaryo
+  -- sürekli akan iş kuyruğu): N=2'yi varsayılan thread ayarlarıyla
+  kullan, `max_download_threads`'i artırma -- gerçek I/O bant
+  genişliğini paylaşan birden fazla worker zaten var, üstüne thread de
+  eklemek darboğazı büyütüyor.
+- İkisi ARASINDAKİ optimal denge (örn. N=2 + threads=8, ya da N=3 +
+  threads=4 gibi ara noktalar) bu oturumda test edilmedi, üretim
+  donanımında gerekirse ayrıca taranmalı.
+
+**GÜNCELLEME -- N=2 için ara thread değerleri tarandı, sonuç
+GÜRÜLTÜLÜ/tutarsız çıktı, tekrar taramaya değmez (bkz. altta).**
+
+### 26.5 N=2 için thread ince ayarı -- güvenilir bir örüntü bulunamadı
+
+N=2 sabit tutulup `max_download_threads` 6 ve 10 değerleriyle (her
+biri tamamen taze/izole 2x10 dosyalık gruplarla) test edildi:
+
+| N=2, thread ayarı | Süre | Throughput |
+|---|---|---|
+| **4 (varsayılan)** | 32sn | **62.500 satır/sn** |
+| 6 | 62sn | 32.258 satır/sn |
+| 10 | 71sn | 28.169 satır/sn |
+| 20 (Bölüm 26.4) | 46sn | 43.478 satır/sn |
+
+**Düzgün/monoton bir eğri değil** -- 4'ten sonra sürekli kötüleşiyor,
+20'de kısmen toparlanıyor ama 4'ün gerisinde kalıyor. Bu, güvenilir
+bir "optimal ara nokta" olduğunu göstermiyor; büyük ihtimalle çoğunlukla
+ölçüm gürültüsü (her test farklı zamanda, host/WSL2 kaynak durumu
+hafifçe farklı, tekrar/ortalama alınmadı, tek seferlik ölçüm).
+
+**Sonuç: bu makinede N=2 için elle thread ayarlamanın güvenilir bir
+kazancı YOK, hatta varsayılan (4) en iyisi çıktı.** Daha fazla ince
+ayar aramak bu noktada gürültüyü kovalamak olur -- durduruldu.
+**Nihai, sade tavsiye**: N=2 çalıştırılacaksa thread ayarına hiç
+dokunulmamalı (varsayılan kalsın); tek worker yeterliyse
+`max_download_threads` yükseltilmeli (hedef makinenin çekirdek
+sayısına göre).
+
+### 26.6 Dosya boyutu etkisi izole edildi -- çok-küçük dosya az-büyük dosyadan hafif hızlı
+
+Bölüm 26.1'de dosya SAYISI test edilirken toplam veri hacmi de birlikte
+büyüyordu (5 dosya=1,14GB, 25 dosya=5,7GB) -- "dosya sayısı" ile
+"toplam hacim" ayrıştırılmamıştı. Bu kez SABİT toplam hacimde (~2,3GB,
+1.000.000 satır) iki yapı karşılaştırıldı:
+
+| Yapı | Süre | Throughput |
+|---|---|---|
+| Az-büyük (2 dosya × 1138,5MB, 500k satır/dosya) | 82,74sn | 12.086 satır/sn |
+| **Çok-küçük (40 dosya × 57,1MB, 25k satır/dosya)** | **70,11sn** | **14.264 satır/sn (~%18 daha hızlı)** |
+
+**Sonuç -- beklenenin tersi**: Çok sayıda küçük dosya, az sayıda büyük
+dosyadan biraz daha hızlı çıktı. Sezgisel beklenti "az dosya = az
+per-dosya overhead, daha hızlı" yönündeydi ama tam tersi oldu --
+muhtemelen ClickHouse'un `s3()` okuyucusu (varsayılan
+`max_download_threads=4` ile bile) birden fazla dosya arasında bir
+miktar okuma paralelliği sağlıyor; sadece 2 büyük dosyada bu
+paralellik fırsatı çok sınırlı kalıyor (en fazla 2 dosya aynı anda
+okunabilir, 40 dosyada çok daha fazla eşzamanlı okuma fırsatı var).
+**Pratik sonuç: dosya boyutu küçük/orta kalsın diye endişelenmeye
+gerek yok -- MinIO->ClickHouse yükleme mekanizması, üretimdeki
+muhtemel dosya boyutu dağılımına (küçükten büyüğe) karşı esnek
+görünüyor, ekstra bir "dosyaları birleştir" adımına gerek yok.**
+
+### 26.7 Bellek tavanını büyütme denemesi -- N=3'ü yavaşlattı, N=4'ü kurtarmadı
+
+ClickHouse'un sunucu geneli bellek limiti (`max_server_memory_usage_to_ram_ratio`,
+varsayılan 0,9 -> ~9,17GB) container restart edilmeden (config.d'ye
+XML override + `docker restart clickhouse`, veri kaybı yok) 0,95'e
+çıkarılıp ~10,64GB'a yükseltildi. Ardından N=3 ve N=4 tamamen taze/izole
+verilerle tekrar test edildi:
+
+- **N=3 (yüksek tavan)**: 186sn, 3/3 başarılı ama Bölüm 26.2'deki
+  orijinal ölçümden (129sn) DAHA YAVAŞ -- tavanı büyütmek yardımcı
+  olmadı, kötüleşti.
+- **N=4 (yüksek tavan)**: 155sn, **hâlâ 3/4 (%75) başarı** -- bir
+  worker yine "(total) memory limit exceeded" ile düştü, bu kez
+  ~9,80GB'da (yeni ~10,64GB tavanına yakın ama tam değil).
+
+**Sonuç: bellek tavanını ölçülü büyütmek (0,9->0,95) NE N=3'ü
+hızlandırdı NE N=4'ü kurtardı.** Bu, sorunun "ClickHouse'un tavanı
+çok muhafazakar" olmadığını, gerçekten **4 eşzamanlı worker'ın
+(1001 sütunlu geniş parquet ile) taleplerinin bu container bütçesini
+aştığını** gösteriyor -- küçük bir tavan artışı yetersiz, sorunu
+çözmek için ya çok daha büyük bir bellek artışı (host/WSL2 riskiyle,
+bugün zaten defalarca sorun yaşadık) ya da worker başına veri/bellek
+ayak izini küçültmek (tab->parquet'teki `row_group_size` küçültme
+dersine benzer, MinIO->ClickHouse tarafında henüz denenmedi) gerekir.
+Config değişikliği geri alındı (varsayılan 0,9'a dönüldü), veri
+kaybı olmadı. **Nihai sonuç değişmedi: bu makinede güvenli tavan N=2.**
+
+### 26.8 Sürekli/artımlı yükleme testi -- merge sağlığı 20 batch boyunca gözlemlendi, güven verici
+
+Bölüm 25'te açık bırakılan soru ("gerçek üretimde sürekli/artımlı
+yükleme altında merge davranışının uzun vadede nasıl evrileceği...
+ayrı bir uzun-vadeli test gerektirir") test edildi -- kullanıcı molaya
+çıkarken bu testi otonom tamamlamam istendi.
+
+**Yöntem**: `telemetry_continuous` tablosuna, 20 ardışık batch (her
+biri 3 dosya, 300.000 satır) art arda `s3()` ile yüklendi -- toplamda
+6.000.000 satır. Her batch sonrası: o batch'in süresi, kümülatif satır
+sayısı, aktif parça sayısı, o an çalışan merge sayısı kaydedildi.
+
+**Sonuçlar (20 batch, tam kayıt plan dosyasında)**:
+- **Süre trendi**: batch 0 = 5,81sn, batch 19 = 8,21sn -- ilk 10
+  batch ortalaması ~6,12sn, son 10 batch ortalaması ~6,77sn (~%11
+  yavaşlama). Hafif ama gerçek bir eğilim var, felaket değil.
+- **Aktif parça sayısı**: 9'dan başlayıp genel olarak 24-31 aralığına
+  yükseldi ama SINIRSIZ BÜYÜMEDİ -- düzgün monoton artış değil,
+  zaman zaman düşüşler de var (örn. batch 9'da 28 -> batch 10'da 19),
+  yani background merge periyodik olarak parçaları gerçekten
+  konsolide ediyor.
+- **Eşzamanlı çalışan merge sayısı**: sürekli 1-4 arasında, hiç
+  birikip patlamadı.
+- **Hiç hata/çökme olmadı** -- 6M satır tam ve doğru yüklendi, "too
+  many parts" gibi bir hataya hiç rastlanmadı.
+
+**Sonuç: bu ölçekte (20 batch, 128sn, 6M satır) ClickHouse'un
+background merge süreci yükleme hızına YETİŞEBİLİYOR** -- parça
+sayısı sınırlı bir aralıkta dalgalanıyor, süre hafifçe (~%11) yavaşlıyor
+ama patlamıyor. **Önemli sınırlama**: bu hâlâ görece kısa/küçük
+ölçekli bir test (128 saniye, 6M satır) -- gerçek üretimde saatler/
+günler süren, milyonlarca dosyalık sürekli yükleme altında bu hafif
+yavaşlama eğiliminin uzun vadede birikip birikmeyeceği (plato mı
+yapıyor yoksa yavaşça büyümeye mi devam ediyor) bu testle kesin
+kanıtlanmadı -- çok daha uzun soluklu bir test gerektirir, ama bu
+kısa testin sonucu **güven verici** (patlama/çökme belirtisi yok).
+
+## 27. KRİTİK DÜZELTME -- Bölüm 24-26.8'deki tüm testler yanlış sütun eşleşmesiyle ölçülmüş (2026-08-18)
+
+Kullanıcının "bench_sample.parquet 1000 sütun demi" sorusu üzerine
+şema kontrol edilirken ciddi bir metodoloji hatası bulundu.
+
+**Hata**: Kaynak parquet'in gerçek sütun isimleri `timestamp` + `f0`-`f299`
+(300 float) + `b0`-`b699` (700 binary) -- ama Bölüm 24'ten beri TÜM
+ClickHouse hedef tabloları
+`cols = ["timestamp Float64"] + [f"f{i} Float64" for i in range(1000)]`
+ile, yani `f0`'dan `f999`'a kadar 1000 tane "f" ile oluşturulmuştu.
+`INSERT INTO ... SELECT * FROM s3(...)` **isme göre eşleştiriyor**
+(konuma göre değil) -- doğrulandı: `timestamp=0.012` satırında
+kaynakta `f0=-302.816`, yanlış-isimli tabloda `f0` alanı (aslında
+kaynağın `b0`'ına denk gelen pozisyonda) **0** çıktı. Yani kaynağın
+`f0`-`f299`'u doğru eşleşiyordu ama `b0`-`b699`'u (700 sütun, verinin
+%70'i) hedef tabloda karşılığı olmadığı için **sessizce atlanmış/0
+olarak dolmuş olabilir**.
+
+**Etkinin ölçülmesi**: Aynı kaynak dosya, iki şemayla yüklendi:
+
+| Şema | Süre | Throughput |
+|---|---|---|
+| YANLIŞ (`f0`-`f999`, Bölüm 24-26.8'de kullanılan) | 1,52sn | 65.866 satır/sn |
+| **DOĞRU (`f0`-`f299`+`b0`-`b699`, gerçek veri)** | **2,36sn** | **42.413 satır/sn** |
+
+**Doğru/tam veriyle yüklemek ~%55 (1,55x) daha yavaş.** Yani Bölüm
+24-26.8'deki TÜM mutlak throughput sayıları (örn. "51.316 satır/sn"),
+gerçekte kaynağın sadece ~%30'unu (300/1000 sütun) doğru şekilde
+işleyip geri kalan ~700 sütunu (muhtemelen S3/parquet okuma
+seviyesinde bile atlayarak, kolon projeksiyonu sayesinde) hiç
+taşımadan elde edilmiş -- **gerçek/tam veri yükünde bu sayılar ~1,55x
+daha düşük olmalı.**
+
+**Neden bu, tüm sonuçları çöpe atmıyor**: Hata Bölüm 24'ten beri
+YAPILAN HER TESTTE aynı şekilde (tutarlı olarak) vardı -- yani
+testler ARASI karşılaştırmalar (N=2'nin en iyi nokta olması,
+`max_download_threads`'in 4->20 artışının fayda sağlaması, küçük
+dosyanın büyük dosyadan hızlı olması, N=4'ün bellek limitine
+çarpması, bileşik ayarların çakışması, sürekli yüklemenin merge
+sağlığı) muhtemelen YÖN olarak hâlâ geçerli -- hepsi aynı "eksik
+veri" koşulunda, birbirine göre ölçüldü. **Ama mutlak sayılara
+(satır/sn, saniye) güvenilmemeli** -- gerçek değerler yaklaşık
+~%35-40 daha düşük (1/1,55 ≈ 0,65 çarpanı) olarak düşünülmeli.
+
+**How to apply**: MinIO->ClickHouse için gerçek/üretim kodu
+yazılırken, ClickHouse hedef tablosunun sütun isimlerinin kaynak
+parquet'in GERÇEK sütun isimleriyle birebir eşleştiğinden mutlaka
+emin olunmalı (`DESCRIBE TABLE s3(...)` ile kaynağın şemasını
+doğrulamak, ya da `SELECT * FROM s3(...) LIMIT 0` ile önce şema
+kontrolü yapmak iyi bir alışkanlık olur) -- sessiz sütun
+eşleşmemesi, hem yanlış/eksik veri yüklenmesine HEM yanıltıcı
+performans ölçümlerine yol açabiliyor, ikisi de bu oturumda
+somut olarak gözlemlendi.
+
+**Düzeltilmiş nihai sayı -- gerçek en iyi konfigürasyon (N=2 +
+varsayılan thread, Bölüm 26.2'nin gerçek/doğru şemayla tekrarı)**:
+
+| | Süre | Throughput |
+|---|---|---|
+| Yanlış şema (Bölüm 26.2) | 32sn | 62.500 satır/sn |
+| **Doğru şema (güvenilir)** | **44sn** | **45.455 satır/sn** |
+
+~%27 daha düşük ama YÖN/KARAR değişmedi -- **N=2 eşzamanlı worker +
+varsayılan `max_download_threads` bu makinede hâlâ en iyi doğrulanmış
+MinIO->ClickHouse yükleme konfigürasyonu, sadece mutlak sayı
+45.455 satır/sn olarak düzeltildi.** Diğer testlerin (N=3/N=4 çöküşü,
+dosya boyutu, bellek tavanı, sürekli yükleme) sayıları da benzer bir
+oranda (~%25-45) düşük tahmin edilmiş olabilir ama tek tek yeniden
+ölçülmedi -- yön/karar geçerliliğini koruyor, sadece mutlak rakamlara
+dikkatli yaklaşılmalı.
+
+## 28. Kalan boşluklar -- max_insert_threads, gerçekçi veri, hedef tablo sıkıştırması (2026-08-18, doğru şemayla)
+
+Bölüm 27'nin düzeltmesinden sonra, kalan üç açık soru **doğru şemayla**
+(kaynakla birebir eşleşen `f0`-`f299`+`b0`-`b699`) test edildi.
+
+### 28.1 `max_insert_threads` izole test edildi -- tam ters yönde etki
+
+`max_download_threads`'in aksine (Bölüm 26.3, artırmak net kazanç),
+`max_insert_threads` TEK BAŞINA (download_threads varsayılanda
+bırakılarak) 4'ten 20'ye tarandı:
+
+| `max_insert_threads` | Süre | Throughput |
+|---|---|---|
+| **4 (varsayılan)** | 18,79sn | **53.207 satır/sn (en iyi)** |
+| 8 | 21,84sn | 45.792 satır/sn |
+| 12 | 34,32sn | 29.136 satır/sn |
+| 16 | 25,09sn | 39.853 satır/sn |
+| 20 | 45,60sn | 21.930 satır/sn (en kötü) |
+
+**Sonuç: `max_insert_threads`'i artırmak sürekli KÖTÜLEŞTİRİYOR**
+(küçük bir dalgalanma dışında düzgün azalan bir eğri). Mantığı:
+download thread'leri S3'ten okurken I/O-bekleme dolduruyor (boşta
+CPU'yu kullanıyor, Bölüm 26.3), ama insert thread'leri AYNI hedef
+tabloya yazarken birbirleriyle kilit/senkronizasyon rekabeti
+yaratıyor -- artırmak yardımcı olmuyor, çakışmayı büyütüyor. **Net
+tavsiye: `max_insert_threads`'e hiç dokunulmamalı, varsayılanda (4)
+bırakılmalı.** Bu, Bölüm 26.4'teki "N=2+download_threads=20
+kombinasyonu neden kötüleşti" bulgusunu da netleştiriyor -- muhtemelen
+insert tarafında da benzer bir çakışma etkisi vardı.
+
+### 28.2 Gerçekçi/çeşitli veri ile test -- içerik çeşitliliğinin etkisi yok
+
+Bugüne kadarki TÜM MinIO/ClickHouse testleri `bench_sample.parquet`'in
+aynı içerikli kopyalarıyla yapılmıştı -- bu, gerçek/çeşitli üretim
+verisini yansıtmıyor olabilirdi (önbellekleme/sıkıştırma davranışı
+farklı olabilirdi). Bunu izole etmek için 10 GERÇEKTEN FARKLI dosya
+üretildi (2 farklı kaynak `.tab` dosyasından, 5'er farklı satır
+aralığından, her biri benzersiz byte içerikli) ve aynı toplam
+hacimdeki (10 dosya) "aynı içeriğin 10 kopyası" senaryosuyla
+karşılaştırıldı:
+
+| Senaryo | Süre | Throughput |
+|---|---|---|
+| repeat10 (aynı içeriğin 10 kopyası) | 54,02sn | 18.512 satır/sn |
+| diverse10 (10 gerçekten farklı dosya) | 53,57sn | 18.667 satır/sn |
+
+**Sonuç: fark %1'in altında, ölçüm gürültüsü seviyesinde -- içerik
+çeşitliliğinin yükleme hızına anlamlı bir etkisi YOK.** Sebep:
+bugünkü tüm testler zaten "taze prefix" (hiç önceden okunmamış
+MinIO klasörü) metodolojisiyle yapıldı -- kopya içerikli dosyalar
+bile ilk okunuşlarında önbellek avantajı elde edemiyordu, yani
+metodoloji zaten adildi. **Bugüne kadarki tüm testlerde kopya veri
+kullanmış olmamız, sonuçları yapay olarak hızlandırmamış/bozmamış.**
+
+**Not -- mutlak sayı tutarsızlığı**: Bu testin sonucu (~18.500 satır/sn,
+N=1/varsayılan/10 dosya/doğru şema) Bölüm 28.1'deki AYNI konfigürasyonla
+(N=1/varsayılan/10 dosya/doğru şema, `max_insert_threads=4` testi)
+ölçülen 53.207 satır/sn'den belirgin düşük çıktı -- muhtemelen bu
+testten hemen önce çalışan ~50 dakikalık `sed` dilim çıkarma işleminin
+(yoğun disk I/O) bıraktığı geçici ortam yükünden. Bugünkü genel
+metodoloji dersini bir kez daha doğruluyor: **aynı konfigürasyonun
+mutlak sayısı bile oturum içinde zamana göre değişebiliyor, göreli
+karşılaştırmalara (aynı anda/arka arkaya ölçülenlere) güvenilmeli,
+farklı zamanlarda ölçülmüş mutlak sayılara değil.**
+
+### 28.3 ClickHouse hedef tablosunun kendi sıkıştırma codec'i -- ZSTD net kazanç
+
+Şimdiye kadar hep ClickHouse'un varsayılan codec'i (LZ4) ile
+yüklenmişti -- parquet tarafının sıkıştırması (Bölüm 21-23) çok
+optimize edildi ama ClickHouse'un KENDİ depolama sıkıştırması hiç
+ayarlanmamıştı. Aynı veri (`diverse10`, 10 dosya), iki farklı hedef
+tablo şemasıyla yüklendi:
+
+| Codec | Süre | Throughput | Disk boyutu |
+|---|---|---|---|
+| Varsayılan (LZ4) | 44,22sn | 22.614 satır/sn | 3.395,9MB |
+| **Explicit `CODEC(ZSTD)`** | **41,94sn** | **23.845 satır/sn** | **2.488,6MB (~%27 daha az)** |
+
+**Sonuç: `CODEC(ZSTD)` hem yükleme hızında hafif kazanç (~%5,
+gürültü seviyesine yakın ama en azından yavaşlatmıyor) HEM disk
+boyutunda büyük kazanç (~%27) veriyor.** Net tavsiye: ClickHouse
+hedef tablosunda tüm sütunlara `CODEC(ZSTD)` uygulanmalı, varsayılan
+LZ4'e güvenilmemeli -- 1,5M dosyalık üretim ölçeğinde bu, MinIO'nun
+yanı sıra ClickHouse'un kendi disk maliyetinde de ciddi bir tasarruf
+sağlar (tab->parquet tarafında DuckDB'nin sıkıştırma üstünlüğünü
+bulduğumuz Bölüm 15'teki mantığın ClickHouse-tarafı karşılığı).
+
+## 29. MinIO indirme süresi vs ClickHouse işleme süresi -- darboğaz kesin olarak ClickHouse tarafında (2026-08-19)
+
+Kullanıcının "MinIO'ya sorgu atma ve ClickHouse'a sorgu atma
+sürelerini kıyaslayabilir miyiz" sorusu üzerine, aynı 10 dosya
+(`diverse10`) iki farklı şekilde ölçüldü: (a) `minio` Python
+client'ıyla SAF indirme (ClickHouse hiç karışmadan, sadece byte'ları
+çekip belleğe okuma), (b) ClickHouse'un `INSERT...SELECT * FROM
+s3(...)` ile TAM süreci (indir+parquet decode+tip dönüşümü+tabloya
+sıkıştırıp yazma).
+
+*(Not: bu testten hemen önce Docker Desktop/WSL2 17 saatlik bir
+boşluktan sonra (muhtemelen makine uykuya geçmişti) yeniden
+başlatılması gerekti -- `docker start` ile container'lar sorunsuz
+geri geldi, veri/paket kaybı olmadı, purge gerekmedi.)*
+
+| Aşama | Süre | Toplam içindeki pay |
+|---|---|---|
+| Saf MinIO indirme (10 dosya, 2277,3MB, ClickHouse yok) | 6,72sn (338,9MB/sn) | **~%10** |
+| ClickHouse'un tam süreci (indir+decode+yaz) | 69,56sn | %100 |
+| Fark (decode+tip dönüşümü+yazma payı) | 62,84sn | **~%90** |
+
+**Sonuç: darboğaz kesinlikle MinIO/ağ tarafında DEĞİL, ClickHouse'un
+kendi işleme sürecinde (parquet decode + tip dönüşümü + sıkıştırıp
+yazma).** MinIO'dan saf indirme çok hızlı (338,9MB/sn) -- toplam
+sürenin sadece ~%10'u. Bu, bugünkü birçok bulguyu birbirine bağlıyor:
+
+- `max_insert_threads`'in (yazma tarafı) sonuçları bu kadar güçlü
+  etkilemesinin sebebi: zamanın zaten büyük çoğunluğu ClickHouse'un
+  kendi yazma/decode işinde geçiyor.
+- Bölüm 27'deki "yanlış şema (300 sütun) %55 daha hızlıydı" bulgusu
+  tutarlı: daha az sütun işlemek, asıl darboğaz olan ClickHouse-tarafı
+  decode/yazma süresini doğrudan kısaltıyor.
+- Genel tema (Bölüm 15, 27, 29 ortak): **1000 sütunlu geniş veriyi
+  decode etmek pahalı** -- bu üçüncü kez, artık doğrudan/net şekilde
+  doğrulandı.
+
+**Pratik sonuç**: MinIO/ağ tarafını daha fazla optimize etmenin
+(daha hızlı disk, daha iyi network) getirisi sınırlı -- MinIO zaten
+darboğaz değil. Asıl kazanç fırsatı ClickHouse'un kendi decode/yazma
+verimliliğinde (`CODEC(ZSTD)`, sütun sayısını gerçek ihtiyaca göre
+tutmak, `max_insert_threads`'i dokunmadan bırakmak gibi Bölüm
+26-28'de bulunan optimizasyonlar zaten bu yöndeydi).
+
+**Not**: `system.query_log`'un `ProfileEvents` haritasından
+(`S3ReadMicroseconds` vb.) ayrıca bir kırılım denendi ama sorgu
+boş/sıfır sonuç döndü (muhtemelen bu ClickHouse sürümünde metrik adı
+farklı ya da agregasyon sözdizimi hatalı) -- yukarıdaki "saf indirme
+vs tam süreç" karşılaştırması zaten net bir cevap verdiği için bu
+ayrıca araştırılmadı.
+
+**Ek soru -- "MinIO indirmesi hızlıysa, sorguları doğrudan MinIO'dan
+yapmayalım mı, ClickHouse'a neden yüklüyoruz?"** Bu soru somut olarak
+test edildi: aynı 10 dosya/1M satır üzerinde aynı basit aggregate
+sorgusu (`count()`, `avg(f0)`) iki şekilde çalıştırıldı --
+
+| Senaryo | En iyi süre |
+|---|---|
+| MinIO'yu doğrudan sorgula (`s3()`, önceden yükleme yok) | 104,2ms |
+| **Önceden ClickHouse'a yüklenmiş tablo** | **15,4ms** |
+
+**Önceden yüklenmiş tablo ~6,8x daha hızlı** -- MinIO tarafı ısındıktan
+sonraki EN İYİ hali bile (ilk/soğuk deneme 802ms'ydi). Sebep: canlı
+sorguda ClickHouse HER SEFERİNDE parquet'i yeniden decode etmek
+zorunda (Bölüm 29'da bulunan asıl pahalı işlem) -- MinIO'dan indirme
+hızlı olsa da decode maliyeti canlı sorguda tekrar tekrar ödeniyor,
+önceden yüklemede bir kez ödenip bitiyor. Ayrıca bu fark FİLTRELİ
+sorgularda çok daha büyür -- Bölüm 25'te önceden yüklenmiş tabloda
+partition pruning + sıralı index sayesinde **6,7ms** almıştık (canlı
+sorguda böyle bir index yok, eşleşen tüm dosyalar her seferinde
+taranır). **Sonuç: MinIO'nun hızlı olması "önceden yükleme gereksiz"
+anlamına gelmiyor -- tam tersine, pahalı olan decode adımını BİR KEZ
+ödemek (yükleme), her sorguda TEKRAR TEKRAR ödemekten (canlı
+sorgulama) çok daha ucuz. MinIO->ClickHouse mimarisi doğru kurgulanmış.**
+
+**Bu fark veri hacmiyle nasıl değişiyor? -- neredeyse ORANTILI
+büyüyor (kötüye doğru, canlı sorgulama için).** Aynı karşılaştırma
+5x veri hacminde (50 dosya/5.000.000 satır) tekrarlandı:
+
+| Veri hacmi | Canlı `s3()` (filtresiz) | Önceden yüklenmiş | Fark |
+|---|---|---|---|
+| 10 dosya (1M satır) | 104,2ms | 15,4ms | 6,8x |
+| **50 dosya (5M satır, 5x)** | **416,9ms** | **11,9ms (değişmedi)** | **34,9x** |
+
+Fark 6,8x'ten 34,9x'e çıktı -- veri 5 kat büyüyünce fark de ~5,1 kat
+büyüdü, neredeyse birebir orantılı. Sebep tam beklenen: **canlı
+sorgu süresi veri hacmiyle DOĞRU ORANTILI büyüyor** (104,2ms->416,9ms,
+~4x -- her byte'ı yeniden decode ediyor, kısayol yok), **önceden
+yüklenmiş sorgu süresi veri hacminden neredeyse BAĞIMSIZ kalıyor**
+(15,4ms->11,9ms, pratikte değişmedi -- ClickHouse'un sıkıştırılmış
+formatı zaten hızlı taranıyor).
+
+Filtreli sorguda (dar zaman aralığı, `WHERE timestamp<1`, sadece
+12.500/5.000.000 satırı eşleşiyor) da benzer desen: canlı 205,7ms vs
+önceden-yüklenmiş 10,8ms (19x fark) -- gerçek üretimde tam
+partition'lı/index'li kurulumla (Bölüm 25'teki 6,7ms gibi) bu fark
+muhtemelen çok daha da büyür.
+
+**Nihai sonuç**: "MinIO hızlı, direkt sorgulayalım" fikri küçük
+ölçekte bile kötüydü (6,8x), veri büyüdükçe **çok daha savunulamaz**
+hale geliyor (34,9x, sadece 5 kat veri artışında). 1,5M dosyalık
+üretim ölçeğinde önceden yükleme (ETL) mimarisi bir tercih değil,
+zorunluluk -- canlı sorgulamanın performans farkı ölçekle katlanarak
+kötüleşiyor.
+
+**Üçüncü nokta eklendi: 200 dosya/20M satır (2026-08-19).** Aynı
+karşılaştırma bir kademe daha büyütüldü (bu turda disk %100 dolma
+krizi + Docker Desktop'ın purge sırasında `wsl --unmount` hatası
+vermesi -- `wsl --shutdown` ile çözüldü, kullanıcı purge'ü tekrar
+denedi, container'lar sıfırdan yeniden kuruldu). Yükleme adımı
+beklenenden çok yavaş çıktı (~40dk, `system.processes` ile canlı
+izlendi -- takılı değildi, gerçekten 20M satırı işliyordu, ~8.344
+satır/sn gibi düşük bir hızda; muhtemelen TEK sorguda 200 dosyanın
+kendi ek maliyeti, Bölüm 26.1'deki "dosya sayısı arttıkça throughput
+düşüyor" deseninin bir uzantısı).
+
+| Dosya sayısı | Satır | Canlı (filtresiz) | Önceden yüklenmiş | Fark |
+|---|---|---|---|---|
+| 10 | 1M | 104,2ms | 15,4ms | 6,8x |
+| 50 | 5M | 416,9ms | 11,9ms | 34,9x |
+| **200** | **20M** | **2.637,4ms** | **14,3ms** | **184,2x** |
+
+Filtreli sorguda (dar zaman aralığı) fark daha da uçlaşıyor:
+
+| Dosya sayısı | Canlı (filtreli) | Önceden yüklenmiş | Fark |
+|---|---|---|---|
+| 50 | 205,7ms | 10,8ms | 19,0x |
+| **200** | **4.974,5ms** | **11,5ms** | **433,9x** |
+
+**En çarpıcı bulgu**: Önceden yüklenmiş tarafın süresi veri 20 kat
+büyümesine rağmen (10->200 dosya) PRATİKTE DEĞİŞMEDİ (15,4ms->14,3ms).
+Canlı sorgu ise 104,2ms->2.637,4ms'ye fırladı (~25x, veri artışından
+(20x) bile hızlı -- SÜPER-DOĞRUSAL büyüme). Bu, canlı sorgulamanın
+sadece "veri hacmiyle orantılı" değil, **hacim büyüdükçe orantılıdan
+da kötü** bir şekilde yavaşladığını gösteriyor -- tek sorguda çok
+dosyalı okumanın kendi ek yükü (Bölüm 26.1) buna ekleniyor. **1,5M
+dosyalık gerçek üretim ölçeğinde bu fark muhtemelen binlerce/on
+binlerce kat olurdu -- önceden yükleme mimarisinin zorunluluğunu
+kesin olarak kanıtlıyor.**
+
+## 30. Mimari değişiklik önerisi -- MinIO'da parquet yerine ham `.tab.zst` arşivi, ClickHouse yine parquet üzerinden yüklenir (2026-08-19)
+
+Kullanıcı yeni bir mimari önerdi: MinIO'da parquet yerine `.tab`'ın
+doğrudan ZSTD ile sıkıştırılmış hali (`.tab.zst`) tutulsun -- "boyut
+olarak daha küçük oluyor sanırım" gerekçesiyle. Bu iki ayrı soruyu
+gerektirdi: (a) boyut iddiası doğru mu, (b) ClickHouse bunu nasıl
+yükleyecek.
+
+### 30.1 Boyut karşılaştırması -- sezgi doğru, hatta beklenenden fazla
+
+Aynı kaynak (`bench_sample.tab`, 454,0MB) iki şekilde sıkıştırıldı:
+
+| Format | Boyut | Oran |
+|---|---|---|
+| `.tab` (ham) | 454,0MB | -- |
+| `.parquet` (ZSTD, DuckDB, mevcut yöntem) | 227,7MB | 1,99x |
+| **`.tab.zst`** (Python `zstandard`, seviye 3) | **187,7MB** | **2,42x -- parquet'ten %18 küçük** |
+| `.tab.zst` (seviye 19, yüksek) | 149,0MB | 3,05x -- ama tek dosya için 409sn sürdü (1,5M dosyada kullanılamaz) |
+
+**Ham `.tab`'ı doğrudan ZSTD ile sıkıştırmak, parquet'ten daha küçük
+çıkıyor.** Sebep: verinin 700/1000 sütunu binary (0/1) -- metin
+halinde "0\t1\t0\t0\t1..." deseni çok tekrarlı, ZSTD bunu TÜM dosya
+boyunca (sütunlar arası, satırlar arası) örüntü olarak yakalıyor.
+Parquet ise sıkıştırmayı sütun-sütun İZOLE yapıyor (her column chunk
+ayrı sıkıştırma bağlamı), bu daha büyük ölçekli/çapraz-sütun
+tekrarları kaçırıyor.
+
+### 30.2 ClickHouse ham sıkıştırılmış TSV'yi doğrudan okuyabiliyor -- ama daha yavaş
+
+ClickHouse'un `s3()` fonksiyonu `TabSeparatedWithNames` formatıyla,
+dosya uzantısından (`.zst`) sıkıştırmayı OTOMATİK algılayarak
+`.tab.zst`'i doğrudan okuyabildi -- parquet'e hiç gerek kalmadan:
+
+| Kaynak format | Süre (100k satır, tek dosya) | Throughput |
+|---|---|---|
+| `.tab.zst` (ham, doğrudan) | 10,25sn | 9.753 satır/sn |
+| **`.parquet`** (ZSTD, DuckDB) | **4,51sn** | **22.160 satır/sn (~2,27x daha hızlı)** |
+
+**Parquet ~2,27x daha hızlı yükleniyor** -- sebep: parquet'te
+değerler zaten binary/tipli (float64, 8 byte), ClickHouse doğrudan
+kullanıyor. Ham `.tab.zst`'te değerler hâlâ METİN ("443.532506"
+gibi), ClickHouse her satırda/sütunda bunu sayıya çevirmek (parse)
+zorunda -- bu, oturumun en başından beri (Rust vs Python elle-parse)
+gördüğümüz "metin parse etmek pahalı" temasının bir tekrarı.
+
+### 30.3 Nihai mimari kararı -- ikisinin en iyisini birleştiren hibrit
+
+Kullanıcının kararı: **ClickHouse yine parquet üzerinden yüklenir**
+(hızlı yol korunur), **MinIO'da SADECE `.tab.zst` kalıcı olarak
+tutulur** (küçük arşiv, parquet MinIO'da kalıcı değil, sadece geçici
+"staging" -- ClickHouse'a yüklendikten sonra silinir).
+
+**Akış uçtan uca test edildi ve doğrulandı**:
+1. `.tab` -> parquet'e çevrildi, MinIO'ya geçici olarak yüklendi
+2. ClickHouse `s3()` ile parquet'ten yükledi (100.000 satır)
+3. Parquet MinIO'dan silindi
+4. **ClickHouse'daki veri hiç etkilenmedi** (satır sayısı ve `sum(f0)`
+   silme öncesi/sonrası birebir aynı) -- ClickHouse veriyi kendi
+   formatına yazdıktan sonra kaynak parquet'e bağımlı değil
+5. MinIO'da sadece `.tab.zst` (187,7MB) kaldı
+6. **Üç katman mutabakatı doğrulandı**: arşivdeki `.tab.zst` açılıp
+   elle satır sayısı (100.000, eşleşti) ve `sum(f0)` (-142242,02637600095
+   vs ClickHouse'un -142242,02637600008 -- son birkaç ondalık basamak
+   farkı sadece toplama sırası kaynaklı float gürültüsü, gerçek
+   uyuşmazlık değil) hesaplandı, ClickHouse'daki değerle eşleşti.
+
+**Sonuç**: Bu mimari hem depolama tasarrufu (MinIO'da ~%18 daha az
+yer, 1,5M dosyada ciddi fark) HEM yükleme hızı (ClickHouse hâlâ
+parquet'in ~2,27x hızından yararlanıyor) sağlıyor -- ödünleşimi
+gerektirmeden ikisinin de avantajını alan bir tasarım. Tek ek
+maliyet: pipeline artık her `.tab` dosyası için İKİ ayrı dönüşüm
+üretmeli (parquet + `.tab.zst`), ve parquet'in "yükle-doğrula-sil"
+döngüsünün Postgres manifest tarafında doğru yönetilmesi gerekir
+(henüz üretim kodunda uygulanmadı, tasarım/doğrulama aşamasında).
+
+### 30.4 `.tab.zst` sıkıştırma seviyesi -- DÜZELTME, seviye 3 değil seviye 12 asıl tatlı nokta
+
+Kullanıcı "seviye 19 daha da fazla sıkıştırıyordu, seviye 3'ün en iyi
+yöntem olduğuna emin misin" diye haklı bir itirazda bulundu -- 30.1'de
+sadece iki uç (3 ve 19) test edilmiş, aradaki seviyeler (parquet
+tarafında Bölüm 16'da da aynı boşluk bırakılmıştı) hiç taranmamıştı.
+Tam tarama yapıldı:
+
+| Seviye | Boyut | Parquet'e göre oran | Süre (tek dosya, 454MB kaynak) |
+|---|---|---|---|
+| 3 | 187,7MB | %18 küçük | 2,8sn |
+| 6 | 174,7MB | %23 küçük | 6,3sn |
+| 9 | 171,7MB | %25 küçük | 12,2sn |
+| **12** | **165,9MB** | **%27 küçük** | **27,5sn** |
+| 15 | 160,9MB | %29 küçük | **191,3sn (uçurum)** |
+| 19 | 149,0MB | %35 küçük | 398,2sn |
+
+**Net bir maliyet uçurumu 12->15 arasında**: süre ~7x artıyor (27,5sn
+->191,3sn) ama boyut kazancı sadece ~%3 (165,9MB->160,9MB) -- ZSTD'nin
+belirli bir seviyeden sonra çok daha pahalı bir arama stratejisine
+geçmesinden (parquet tarafındaki max-seviye kötü trade-off'unun,
+Bölüm 16, aynı ailesi).
+
+**DÜZELTİLMİŞ TAVSİYE: seviye 3 değil, seviye 12.** Seviye 3'ten
+belirgin daha iyi sıkışıyor (%27 küçük vs %18) ve hâlâ makul bir
+sürede (27,5sn/dosya) -- seviye 15+'nin uçurumuna hiç yaklaşmıyor.
+1,5M dosyada paralel worker havuzuyla (tab->parquet tarafında bulunan
+N=6-20 aralığı gibi) makul sürede tamamlanır -- "tek worker'da 477
+gün" rakamı yanıltıcı, biz zaten hiçbir yerde tek worker'la
+çalışmıyoruz. Bu, Bölüm 30.1'deki seviye 3 tavsiyesini düzeltiyor.
+
+### 30.5 `.tab.zst` sıkıştırmasının veri kaybına yol açıp açmadığı -- SHA256 ile kesin doğrulama
+
+Kullanıcı, veri hassas olduğu için ("ondalıklar bile önemli")
+sıkıştırmanın veri kaybına yol açıp açmadığının kanıtlanmasını
+istedi -- varsayım değil, kesin kanıt. Orijinal `.tab` dosyasının
+SHA256 hash'i alındı, üç farklı seviyede (3, 12, 19) sıkıştırılıp
+açıldı, açılan dosyanın hash'i orijinalle karşılaştırıldı:
+
+| Seviye | Açılmış boyut (orijinalle aynı mı) | SHA256 eşleşiyor mu | Byte-byte birebir aynı mı |
+|---|---|---|---|
+| 3 | 476.072.469 byte (evet) | ✅ | ✅ |
+| 12 | 476.072.469 byte (evet) | ✅ | ✅ |
+| 19 | 476.072.469 byte (evet) | ✅ | ✅ |
+
+**Üç seviyede de SHA256 hash birebir eşleşti -- dosyanın hiçbir
+byte'ı değişmedi.** Ayrıca spesifik satırlar (0, 1, 50.000, 99.999,
+100.000) elle karşılaştırıldı, hepsi birebir aynı çıktı. Bu beklenen
+bir sonuç -- ZSTD tanımı gereği KAYIPSIZ (lossless) bir algoritma,
+sıkıştırma seviyesi hız/boyut dengesini etkiler ama doğruluğu
+etkilemez (JPEG gibi kayıplı yöntemlerin aksine). **Sonuç: `.tab.zst`
+(hangi seviyede olursa olsun, önerilen seviye 12 dahil) hassas
+veride sıfır ondalık/veri kaybına yol açmıyor -- kriptografik hash
+ile kanıtlandı, varsayım değil.**
+
+### 30.6 Seviye 22 (ZSTD maksimum) de denendi -- seviye 19'dan bile kötü bir yatırım
+
+Kullanıcı ZSTD'nin maksimum seviyesini (22) merak etti, tablo
+tamamlandı:
+
+| Seviye | Boyut | Oran | Süre |
+|---|---|---|---|
+| 3 | 187,7MB | 2,42x | 2,8sn |
+| 6 | 174,7MB | 2,60x | 6,3sn |
+| 9 | 171,7MB | 2,64x | 12,2sn |
+| **12 (tavsiye)** | **165,9MB** | **2,74x** | **27,5sn** |
+| 15 | 160,9MB | 2,82x | 191,3sn |
+| 19 | 149,0MB | 3,05x | 398,2sn |
+| 22 (maksimum) | 145,9MB | 3,11x | **784,4sn (13dk)** |
+
+19->22 arası: boyut sadece ~%2 daha küçülüyor (149,0MB->145,9MB) ama
+süre neredeyse 2 katına çıkıyor (398,2sn->784,4sn). 1,5M dosyada
+20 paralel worker'la bile ~680 gün demek -- kullanılamaz. SHA256 hash
+yine birebir eşleşti (seviye 22'de de veri kaybı yok) ama bu, boyut
+kazancının süre maliyetine değmediği gerçeğini değiştirmiyor. **Seviye
+12 tavsiyesi değişmedi -- bu, parquet tarafındaki (Bölüm 16) "max
+seviye kötü trade-off" dersinin ham `.tab` sıkıştırması tarafında da
+bir kez daha doğrulanması.**
+
+### 30.7 Parquet (DuckDB) veri kaybına yol açıyor mu -- ilk şüpheli sonuç, ama gerçek sebep doğrulama scriptinde çıktı
+
+`.tab.zst` için yapılan SHA256 doğrulamasının (Bölüm 30.5) aynısı bu
+kez `.parquet` için denendi -- ama parquet'te ham byte kopyalama
+değil bir TİP DÖNÜŞÜMÜ (metin->float64) olduğu için hash yerine
+**tam sayısal eşitlik** karşılaştırması gerekti: orijinal `.tab`
+(pandas ile okunup float64'e çevrilmiş) ile `.parquet` (pyarrow ile
+okunmuş) arasında 100.100.000 hücrenin tamamı (100.000 satır ×
+1001 sütun) tolerans sıfır şekilde karşılaştırıldı.
+
+**İlk sonuç şüpheli görünüyordu**: 9.299/100.100.000 hücre (%0,0093)
+tam eşleşmiyordu, hepsi `timestamp` sütununda, farklar 1e-17-1e-18
+mertebesinde (float64'ün son biti). Kök nedeni bulmak için tek bir
+örnek derinlemesine incelendi: kaynak `.tab`'taki ham metin aslında
+`'0.036000000000000004'` idi (temiz "0.036" değil -- sentetik veri
+kayan-nokta toplamayla üretildiği için böyle). Python'un kendi
+`float()` fonksiyonu (IEEE754 doğru-yuvarlama referansı) bu metni
+`0.036000000000000004` olarak veriyor -- **DuckDB/parquet'in verdiği
+değerle hex seviyesinde BİREBİR aynı** (`0x1.26e978d4fdf3cp-5`).
+**pandas'ın verdiği değer ise `0.036` -- 1 bit farklı, YANLIŞ
+yuvarlanmış** (`0x1.26e978d4fdf3bp-5`).
+
+**200 örnekle genelleme doğrulandı**: tüm 9.299 uyuşmazlıktan 200'ü
+tek tek kontrol edildi -- **200/200'ünde pandas hatalı, DuckDB
+Python'un referans değeriyle birebir doğru** (0 ters durum). Yani
+ilk bulunan "uyuşmazlık", parquet'in bir kusuru DEĞİL, doğrulama
+scriptinde kullanılan `pandas`'ın CSV parser'ının bu sınır
+durumlarında (son bitte) küçük bir yuvarlama kusuruydu.
+
+**Nihai sonuç: `.parquet` (DuckDB dönüşümü) da `.tab.zst` gibi sıfır
+veri kaybına yol açmıyor** -- IEEE754 doğru-yuvarlama seviyesinde
+doğrulandı (Python'un kendi referans dönüşümüyle birebir eşleşiyor).
+Hem MinIO'daki `.tab.zst` arşivi (byte-seviyesinde, SHA256) hem
+ClickHouse'a giden `.parquet` (sayısal doğruluk seviyesinde) hassas
+veride güvenli.
+
+## 31. Binary sütunların tipi -- neden Float64 kullanıldığı, ve ClickHouse'un kendi deposunda bulunan büyük kazanç
+
+Kullanıcı önemli bir soru sordu: "biz niye 0 ve 1'leri Float64 olarak
+saklıyoruz". Dürüst cevap: bu bilinçli bir karar değildi --
+`tab_to_parquet_duckdb.py` TÜM sütunları (binary dahil) `::DOUBLE`
+olarak dönüştürüyor, muhtemelen oturumun başında gerçek `.ham` şeması
+bilgisi olmadığı için tek-tip basitleştirme yapılmıştı (plan açık
+sorular listesinde hâlâ "kaynak sütunların gerçek genişliği teyit
+edilmedi" maddesi duruyor). Veri seti sabit %30 float64/%70 binary
+yapısında (300 float + 700 binary sütun).
+
+### 31.1 ClickHouse'un kendi deposunda UInt8+T64 -- büyük kazanç
+
+ClickHouse hedef tablosunda binary sütunlar (`b0`-`b699`) `Float64`
+yerine `UInt8` + `T64` codec ile tanımlanıp aynı kaynak parquet'ten
+yüklendi (10 dosya, 1M satır):
+
+| | Süre | Disk boyutu |
+|---|---|---|
+| Float64 (mevcut, ZSTD) | 36,59sn | 970,0MB |
+| **UInt8 + T64+ZSTD** | **19,53sn (~%87 daha hızlı)** | **661,8MB (~%32 daha küçük)** |
+
+**Not**: `T64` codec'i `Float64` tipini desteklemiyor (ClickHouse
+hatasıyla doğrulandı) -- doğru tip (`UInt8`) şart, sadece codec
+değişikliği yetmiyor.
+
+### 31.2 Ama parquet dosyasının KENDİSİ neredeyse hiç değişmiyor -- Bölüm 30.1'in geçerliliği korunuyor
+
+Kaynak `.tab` dosyası, binary sütunlar `UTINYINT` (DuckDB'nin küçük
+tam sayı tipi) olarak yeniden parquet'e çevrildi:
+
+| | Boyut |
+|---|---|
+| Eski parquet (hepsi Float64) | 227,7MB |
+| Yeni parquet (b sütunları UTINYINT) | 227,5MB (**sadece %0,1 fark**) |
+
+**Sebep**: Parquet, düşük-kardinaliteli (binary) sütunlarda deklare
+edilen tipten BAĞIMSIZ olarak zaten dictionary/RLE encoding
+kullanıyor (Bölüm 15'te bulunan mekanizmanın aynısı) -- sadece 2
+farklı değer (0/1) olduğu için parquet bunu Float64 bile olsa küçük
+bir sözlük + referans indeksleriyle sıkıştırıyor. Tip değişikliği bu
+seviyede neredeyse hiçbir şey katmıyor.
+
+**ClickHouse'un kendi deposu ise bu akıllılığı miras almıyor** --
+parquet'ten Float64 olarak okuyup düz ZSTD'ye bırakınca, ClickHouse
+her değeri 8 byte olarak görüyor, parquet'in sözlük hilesinden
+yararlanamıyor. `UInt8`+`T64` vererek bu akıllılığı ClickHouse
+tarafında da EL İLE sağlamış olduk.
+
+**Sonuç -- iki ayrı katman, iki ayrı karar**:
+- **Bölüm 30.1'deki parquet vs `.tab.zst` karşılaştırması GEÇERLİ
+  kalıyor** -- parquet zaten en iyi haliyle (dictionary encoding
+  sayesinde) ölçülmüştü, tip sorunu onu neredeyse hiç etkilemiyordu.
+- **Bölüm 28.3'teki ClickHouse'un kendi depolama codec testi
+  EKSİKTİ** -- orada UInt8+T64 hiç denenmemişti, gerçek büyük kazanç
+  (parquet'ten değil) ClickHouse'un KENDİ hedef tablo şemasında
+  bekliyormuş.
+
+**GÜNCEL TAVSİYE**: ClickHouse hedef tablosunda binary/düşük-
+kardinaliteli sütunlar için `UInt8` (ya da uygun küçük tam sayı tipi)
++ `T64, ZSTD` codec zinciri kullanılmalı -- parquet üretiminde
+tip değişikliğine gerek yok (kazanç yok), ama ClickHouse tablo
+şemasında bu kesinlikle uygulanmalı (~%32 disk, ~%87 hız kazancı).
+
+### 31.3 Kazancın kaynağı izole edildi -- tip mi codec mi
+
+31.1'de aynı anda iki şey değişmişti (Float64->UInt8 TİP + ZSTD->T64
+CODEC), hangisinin asıl kazancı sağladığı ayrıştırılmamıştı. Üç
+konfigürasyon ayrı ayrı test edildi:
+
+| | Süre | Disk boyutu |
+|---|---|---|
+| A) Float64 + ZSTD (baseline) | 32,12sn | 1.088,7MB |
+| **B) UInt8 + ZSTD (sadece TİP değişti)** | **22,51sn (~%30 hızlı)** | **869,0MB (~%20 küçük)** |
+| C) UInt8 + T64,ZSTD (tip+codec) | 24,19sn | 680,4MB (B'den ~%22 daha küçük) |
+
+**Sonuç: asıl temel/kök düzeltme doğru TİP seçimi** -- sadece
+Float64'ten UInt8'e geçmek (codec hâlâ düz ZSTD), T64'e hiç gerek
+kalmadan tek başına ~%20 boyut/~%30 hız kazandırıyor. `T64` codec'i
+bunun üzerine EK bir ~%22 boyut kazancı katıyor (hız üzerinde
+belirgin fayda yok, B->C'de süre aslında hafif arttı, gürültü
+seviyesinde). **İkisi birlikte en iyi sonucu veriyor ama tip
+düzeltmesi tek başına bile (T64 olmadan) önemli, düşük riskli bir
+kazanç -- iki ayrı, birbirini tamamlayan optimizasyon.**
+
+### 31.4 GÜVENLİK UYARISI -- `b0`-`b699`'un GERÇEK üretimde UInt8'e sığacağı doğrulanmadı, sessiz veri bozulması riski var
+
+Kullanıcının "bu sütunlar kesin UInt8 mi" sorusu kritik bir boşluk
+açığa çıkardı. **Bizim SENTETİK test verimizde** `b0`-`b699` bilinçli
+olarak hep 0/1 üretiliyor (`generate_test_tab.py`) -- ama **gerçek
+`.ham` üretim verisinde bu hiç doğrulanmadı** (plan açık sorular
+listesindeki "kaynak sütunların gerçek genişliği teyit edilmedi"
+maddesiyle doğrudan bağlantılı).
+
+**Risk somut olarak test edildi -- ClickHouse `toUInt8()` aralık dışı
+değerlerde SESSİZCE YANLIŞ SONUÇ üretiyor, hata vermiyor**:
+
+| Girdi | `toUInt8()` sonucu | Davranış |
+|---|---|---|
+| 300 | 44 | 300 mod 256 = 44 (sessiz taşma) |
+| -1 | 255 | negatif -> en üst değere sarma |
+| 256 | 0 | sınırın tam üstü -> sıfıra sarma |
+
+Yani eğer gerçek üretimde bu 700 sütundan biri beklenmedik bir anda
+UInt8 aralığının (0-255) dışına çıkarsa, veri **sessizce ve fark
+edilmeden bozulur** -- hiçbir hata/uyarı olmadan.
+
+**Sonuç: UInt8 optimizasyonu (Bölüm 31.1-31.3) üretime ALINMAMALI**,
+gerçek `.ham` sütunlarının değer aralığı `.ham` formatını çözen
+kişiden teyit alınana kadar. Teyit gelene kadar/sonrasında güvenli
+uygulama yolları:
+1. **Doğrulama adımı**: yükleme öncesi her sütun için
+   `SELECT count() WHERE bN NOT IN (0,1)` (ya da beklenen aralık)
+   kontrolü, aralık dışı değer varsa reddet/uyar
+2. **`toUInt8OrNull()`** kullan (sessizce sarmak yerine aralık dışı
+   değerleri NULL yapar -- anomali en azından fark edilebilir hale
+   gelir)
+
+Bu, Bölüm 31'deki performans kazancının hâlâ geçerli/değerli olduğunu
+ama üretime alınmadan önce bir veri-doğrulama adımı gerektirdiğini
+gösteriyor -- performans optimizasyonu ile veri güvenliği ayrı ele
+alınmalı.
+
+### 31.5 Otomatik sütun sınıflandırma -- sabit %30/%70 varsayımına gerek yok, veri kendini sınıflandırıyor
+
+Kullanıcı haklı bir noktaya değindi: sentetik test verimizdeki sabit
+"%30 float/%70 binary" oranı gerçek üretim verisinde değişken
+olacaktır -- sabit bir varsayım yerine, HANGİ sütunların gerçekten
+UInt8'e güvenle sığdığını **veriden otomatik** tespit eden bir yöntem
+gerekiyor.
+
+DuckDB ile, sütun İSMİNE hiç bakmadan, sadece her sütunun `MIN()`,
+`MAX()` ve "tüm değerler tam sayı mı" (`değer = FLOOR(değer)`)
+özelliklerini tarayan bir otomatik sınıflandırma test edildi (1001
+sütunun tamamı, tek bir SQL sorgusunda):
+
+| | Otomatik tespit edilen | Gerçek |
+|---|---|---|
+| UInt8'e (0-255 aralığı, tam sayı) güvenle sığan sütun | 700 | 700 (hepsi doğru) |
+| Float64 kalması gereken sütun | 301 | 301 (hepsi doğru) |
+
+**%100 isabet -- sütun ismi (`b`/`f` öneki) hiç kullanılmadan, sadece
+gerçek veri değerlerine bakarak.** Tarama süresi 87,2sn (100k satır,
+1001 sütun) -- ama bu **dosya başına tekrarlanması gereken bir adım
+değil**, şema/sütun semantiği stabil olduğu sürece BİR KEZ (ya da
+periyodik olarak, şema değişikliği ihtimaline karşı) yapılıp sonucu
+bir yapılandırma/manifest'te saklanabilir, sonraki tüm yüklemelerde
+bu sınıflandırma kullanılır.
+
+**Pratik uygulama**: (1) Bu otomatik tarama ile sütun sınıflandırması
+BİR KEZ yapılır ve saklanır (hangi sütunlar UInt8-güvenli). (2)
+Yükleme sırasında `toUInt8OrNull()` (Bölüm 31.4'teki güvenlik notu)
+kullanılarak, gerçek veri zamanla beklenenin dışına çıkarsa (örn. yeni
+bir sütun aralığı genişlerse) bu NULL olarak yakalanır, sessizce
+bozulmaz. Bu, sabit varsayım yerine hem esnek hem güvenli bir yöntem
+-- performans kazancını (Bölüm 31.1-31.3) veri güvenliğinden ödün
+vermeden, gerçek üretim verisinin değişkenliğine uyarlanabilir şekilde
+uygulamayı mümkün kılıyor.
+
+## 32. Eğitilmiş ZSTD sözlüğü denendi -- dosya boyutumuz için uygun değil, elendi
+
+Kullanıcı T64'ü bir kenara bırakıp (sadece düz ZSTD ile devam), kalan
+iyileştirme önerilerinden "eğitilmiş ZSTD sözlüğü" fikrini denemek
+istedi. Kullanıcı önemli bir hatırlatma yaptı: **farklı uçak tipleri
+için farklı sayıda sütun var** -- yani tek bir "evrensel" sözlük tüm
+1,5M dosya için uygun olmaz (farklı tiplerin byte örüntüleri
+farklıdır), uçak tipi başına ayrı sözlük gerekirdi. Bu yüzden önce
+temel varsayımı (aynı tip dosyalarda sözlük fayda sağlıyor mu) test
+etmek gerekti -- eğer bu bile başarısız olursa, çapraz-tip
+genelleme testine hiç gerek kalmayacaktı.
+
+**Test**: `bench_sample.tab` 49 parçaya bölündü (2000 satır/parça,
+hepsi aynı 1000-sütunlu şema), ilk 48'i eğitim örneği olarak
+kullanılıp 64KB'lık bir ZSTD sözlüğü eğitildi (9,7sn), son parça
+(9.305,8KB, eğitimde KULLANILMAMIŞ "held-out") sözlüksüz ve sözlüklü
+ZSTD(12) ile ayrı ayrı sıkıştırıldı:
+
+| | Boyut |
+|---|---|
+| Sözlüksüz ZSTD(12) | 3.417,3KB |
+| Sözlüklü ZSTD(12) | 3.481,7KB (**%1,9 DAHA BÜYÜK**) |
+
+(Kayıpsızlık ayrıca doğrulandı -- sözlüklü sıkıştırma da tam
+kayıpsız, ama boyut kazancı yok.)
+
+**Sonuç -- temel varsayım YANLIŞ çıktı, elendi**: Sözlük yaklaşımı
+aynı-tip dosyalarda bile fayda sağlamadı, hatta hafifçe kötüleştirdi.
+Sebep: ZSTD sözlükleri ÇOK SAYIDA KÜÇÜK dosyayı sıkıştırırken işe
+yarar (her dosya tek başına yeterli iç-tekrar barındırmadığı için
+ortak sözlük eksikliği kapatır). Bizim dosyalarımız BÜYÜK (~500MB) --
+test edilen ~9MB'lık parça bile ZSTD'nin kendi penceresi içinde
+zaten yeterli tekrar örüntüsü buluyor, sözlüğün katacağı ek bir şey
+kalmıyor (üstelik küçük bir sözlük-referans maliyeti bindiriyor).
+**Bu fikir elendi -- çapraz-uçak-tipi genelleme testine gerek
+kalmadı, temel senaryoda zaten kazanç yok.**
+
+## 33. Binary sütun bit-paketleme -- bugüne kadarki EN İYİ sıkıştırma sonucu
+
+Binary sütunları (700 tane, 0/1) metinde ("0\t1\t0...") değil, 8
+değeri 1 byte'a paketleyerek (numpy `packbits`) saklamak test edildi
+-- float sütunlar (`timestamp`+`f0`-`f299`) binary float64 (8 byte)
+olarak, binary sütunlar bit-paketli (700 bit -> 87,5 byte/satır)
+olarak birleştirilip üzerine ZSTD(12) uygulandı.
+
+| Format | Boyut |
+|---|---|
+| Parquet (Bölüm 30.1) | 227,7MB |
+| `.tab.zst` (ham metin, seviye 12, Bölüm 30.1) | 165,9MB |
+| **Bit-paketli + ZSTD(12)** | **146,1MB** |
+
+**`.tab.zst`'ten ~%12, parquet'ten ~%36 daha küçük -- bugüne kadarki
+en iyi sıkıştırma sonucu.** Süre de rekabetçi: okuma+parse 10,3sn +
+paketleme 2,4sn + sıkıştırma 10,4sn = toplam **23,1sn** (ham
+`.tab.zst`'in tek başına 27,5sn'sinden bile hızlı). **Kayıpsızlık
+doğrulandı** (byte-byte birebir aynı, decompress sonrası).
+
+**Neden bu kadar iyi**: Sıkıştırma ÖNCESİ bile ham boyut 454,0MB'dan
+238,0MB'a iniyor (float64 binary temsili metinden kompakt, bit-paketli
+binary sütunlar metinden ~16x küçük) -- ZSTD zaten küçülmüş bu veriye
+uygulanıyor, ek kazanç katıyor.
+
+**Bedeli**: Bu artık STANDART bir format değil (parquet ya da düz
+metin gibi evrensel araçlarla okunamaz) -- özel bir paketle/aç
+(pack/unpack) kodu yazılıp bakımı yapılmalı, MinIO'daki arşivi
+okumak isteyen her sistemin bu özel formatı bilmesi gerekir. Bu,
+daha önce önerilen "daha invaziv mühendislik" bedelinin somut
+karşılığı -- kazanç gerçek ve büyük, ama format-evrenselliğinden
+ödün veriliyor. Üretime alınıp alınmayacağı bu ödünleşime bağlı bir
+karar.
+
+## 34. Farklı sıkıştırma ALGORİTMALARI test edildi -- bz2, ZSTD'yi geçti, yeni nihai tavsiye
+
+Kullanıcı özel bit-paketleme yerine standart `.tab.zst` formatında
+kalmaya karar verdi, ama farklı bir sıkıştırma ALGORİTMASI (ZSTD
+dışında) denenip denenmediğini sordu. Şimdiye kadar sadece ZSTD'nin
+seviyeleri tarandı (Bölüm 30.4) -- algoritmanın kendisi hiç
+değiştirilmemişti. Üç alternatif test edildi (aynı `bench_sample.tab`,
+454,0MB):
+
+| Algoritma | Boyut | Süre |
+|---|---|---|
+| ZSTD seviye 12 (önceki tavsiye) | 165,9MB | 27,5sn |
+| LZMA preset=6 | 144,5MB | 476,0sn (17x yavaş) |
+| Brotli q=9 | 163,8MB | 65,4sn (2,4x yavaş, kazanç yok denecek kadar az) |
+| **bz2 seviye 9** | **136,3MB** | **32,4sn** |
+
+**`bz2`, ZSTD'den %17,8 daha küçük çıkıyor, süre farkı ihmal
+edilebilir (~%18 yavaş, ~5sn fark)** -- LZMA'nın (17x yavaş) ve
+Brotli'nin (kazanç neredeyse yok) aksine, gerçek ve ucuz bir kazanç.
+SHA256 ile kayıpsızlık doğrulandı (byte-byte birebir aynı).
+
+**Neden bz2 bu kadar iyi**: bz2, Burrows-Wheeler dönüşümü (BWT)
+tabanlı bir algoritma -- ZSTD'nin sözlük/eşleştirme tabanlı
+yaklaşımından farklı olarak, veriyi önce özel bir şekilde yeniden
+sıralayıp (benzer bağlamdaki karakterleri bir araya getirerek) sonra
+sıkıştırıyor. Bizim tab-ayraçlı, çok tekrarlı (700 binary sütun)
+verimizin yapısı bu dönüşüme özellikle uygun görünüyor.
+
+**GÜNCEL NİHAİ TAVSİYE: `.tab.zst` yerine `.tab.bz2` kullanılmalı**
+-- aynı basitlik/evrensellik (bz2 de standart, yaygın desteklenen bir
+format), daha iyi sıkıştırma (136,3MB, ~%18 daha küçük), ihmal
+edilebilir hız bedeli. Bu, Bölüm 30'daki tüm `.tab.zst`
+tavsiyelerinin `.tab.bz2` ile güncellenmesi gerektiği anlamına
+geliyor -- mimari (MinIO'da ham arşiv, ClickHouse parquet üzerinden
+yüklenir) aynı kalıyor, sadece MinIO arşivinin sıkıştırma algoritması
+değişiyor.
+
+### 34.1 bz2 vs ZSTD -- büyük veri ve farklı binary/float oranlarıyla genişletilmiş test
+
+Karar kesinleştirmeden önce, `bz2` avantajının farklı ölçek ve veri
+kompozisyonlarında tutarlı kalıp kalmadığı test edildi -- 463k
+satırlık büyük bir örnek, ve iki uç kompozisyon (tüm-binary,
+tüm-float) hazırlandı.
+
+| Senaryo | ZSTD(12) boyut | bz2(9) boyut | bz2 kazancı | Açma hızı farkı (bz2/ZSTD) |
+|---|---|---|---|---|
+| Büyük veri (463k satır, 300f+700b) | 829,5MB | 681,6MB | %17,8 küçük | 16,9x yavaş |
+| Tüm-binary (700 sütun) | 14,2MB | 10,7MB | **%25,0 küçük** | 16,2x yavaş |
+| Tüm-float (300 sütun) | 141,0MB | 124,9MB | %11,4 küçük | 19,8x yavaş |
+
+**İki net örüntü**:
+1. **bz2'nin boyut avantajı binary oranı arttıkça büyüyor** -- tüm-
+   float %11,4 -> karışık (gerçek veri) %17,8 -> tüm-binary %25.
+   Bizim gerçek verimiz (%70 binary) bu avantajın güçlü tarafında.
+2. **Açma hızı dezavantajı (16-20x) her senaryoda tutarlı** -- tek
+   seferlik bir anomali değil, bz2'nin genel/kalıcı bir özelliği.
+   Büyük veride (463k satır) her iki algoritma da orantılı/makul
+   ölçekleniyor, ani bir kötüleşme yok.
+
+**NİHAİ KARAR (kullanıcı onayı): `.tab.bz2` (bz2 seviye 9) kullanılacak.**
+Boyut avantajı gerçek ve tutarlı (özellikle bizim binary-ağırlıklı
+verimizde güçlü), açma hızı dezavantajı bilinçli olarak kabul
+edildi -- MinIO arşivinin "soğuk depolama" rolü (nadiren geri
+okunması) göz önünde bulundurularak. İleride toplu geri-yükleme
+senaryosu gerçek bir ihtiyaç haline gelirse bu karar yeniden
+gözden geçirilebilir.
+
+## 35. Uç senaryo testi -- 45.000 sütunlu (1000 float+44.000 sabit-sıfır), 10GB dosyada bz2 çöküyor
+
+Kullanıcı, çok daha uç bir kompozisyonda (bugüne kadarki 1000
+sütunlu/%70-binary verimizden çok farklı) ZSTD ve bz2'yi karşılaştırmak
+istedi: **45.000 sütun, 1000'i float64, 44.000'i HER ZAMAN sadece 0**
+(sabit), toplam dosya boyutu ~10GB.
+
+*(Not: bu test öncesi Docker Desktop/WSL2 yine ~22 saatlik bir
+boşluktan sonra yeniden başlatılması gerekti -- `docker start` ile
+container'lar sorunsuz geri geldi, veri/paket kaybı olmadı.)*
+
+**Veri üretimi**: numpy+pandas ile verimli iki-aşamalı üretim (1000
+float sütunu pandas.to_csv ile hızlıca üretilip, önceden hesaplanmış
+44.000 sabit-sıfır sonekiyle birleştirildi) -- 179,9sn'de 113.869
+satır, nihai boyut **10,46GB**. Bellek testere-dişi paterniyle (5,8-
+9,5Gi arası salındı) güvenli kaldı, OOM olmadı.
+
+**Sıkıştırma (streaming/akış yöntemiyle, 10GB'ı belleğe tek seferde
+almadan)**:
+
+| | Boyut | Sıkıştırma süresi | Oran |
+|---|---|---|---|
+| ZSTD(12) | 0,576GB (618,1MB) | **86,8sn** | 18,17x |
+| **bz2(9)** | **0,464GB (497,9MB)** | **1.234,3sn (20,6 DAKİKA)** | 22,56x |
+
+**Kritik bulgu: bu ölçekte/kompozisyonda bz2, ZSTD'den 14,22x daha
+yavaş sıkışıyor** -- bugüne kadarki testlerimizdeki ~1,18-1,33x
+farktan ÇOK daha büyük bir uçurum. bz2 hâlâ %19,4 daha küçük çıkıyor
+(boyut avantajı tutarlı korunuyor) ama süre bedeli artık **orantısız
+büyük**. İlginç bir yan not: ZSTD, doğrusal ölçekleme tahmininden
+(~630sn) çok daha hızlı çıktı (86,8sn) -- aşırı tekrarlı veride ZSTD'nin
+eşleşme bulması kolaylaşıyor gibi görünüyor, ama bz2'nin BWT
+yaklaşımı aynı avantajı göstermiyor, tam tersine bu ölçekte/
+kompozisyonda zorlanıyor.
+
+**Açma hızı**: ZSTD 7,4sn, bz2 96,4sn -- oran 13,0x (bu, önceki
+bulduğumuz 13-26x aralığıyla tutarlı, aşırı bir sapma yok, sadece
+sıkıştırma tarafında sapma var).
+
+**Kayıpsızlık**: her iki format için de doğrulandı (açılan boyut
+kaynakla birebir aynı).
+
+**Sonuç -- Bölüm 34'teki bz2 kararı bu uç senaryo için GEÇERLİ
+DEĞİL**: `.tab.bz2` kararı, bugüne kadarki test verimize (1000
+sütun, %70 binary/%30 float, dengeli bir kompozisyon) dayanıyordu --
+orada bz2'nin süre bedeli ihmal edilebilirdi (~1,2-1,3x). Ama eğer
+gerçek üretim verisinde bu tür AŞIRI GENİŞ (onbinlerce sütun) ve
+AŞIRI SABİT-AĞIRLIKLI (neredeyse tüm sütunlar sabit/değişmeyen)
+dosyalar olacaksa, bz2 kararı bu dosya TİPİ için yeniden
+değerlendirilmeli -- ya ZSTD'ye geri dönülmeli ya da dosya tipine
+göre algoritma seçen bir mantık (adaptif sıkıştırma) düşünülmeli.
+**Bu, tek bir "her duruma uyan" sıkıştırma kararının riskli
+olabileceğinin somut kanıtı -- gerçek üretim veri şekli netleşince
+bu test tekrarlanmalı.**
+
+### 35.1 Aynı uç senaryoda ZSTD'nin tüm seviyeleri (3-22) tarandı -- 19 gizli bir tatlı nokta
+
+Kullanıcı, aynı 45.000 sütunlu/10,46GB dosyada bz2 ile karşılaştırma
+yerine bu kez sadece ZSTD'yi farklı seviyelerle taramamızı istedi.
+Aynı dosya yeniden üretildi (121,6sn, birebir aynı boyut: 10,46GB),
+streaming yöntemiyle 7 seviye (3, 6, 9, 12, 15, 19, 22) sırayla
+sıkıştırılıp açıldı, her seviyede kayıpsızlık doğrulandı.
+
+| Seviye | Boyut (GB) | Sıkıştırma süresi | Açma süresi | Oran |
+|---|---|---|---|---|
+| 3 | 0,605 | 27,3sn | 6,7sn | 17,28x |
+| 6 | 0,581 | 40,2sn | 6,7sn | 18,01x |
+| 9 | 0,578 | 57,4sn | 6,8sn | 18,10x |
+| 12 | 0,576 | 83,4sn | 6,4sn | 18,17x |
+| 15 | 0,574 | 192,8sn | 7,7sn | 18,21x |
+| **19** | **0,524** | **420,4sn (7,0dk)** | **8,3sn** | **19,97x** |
+| 22 | 0,524 | 1.392,6sn (23,2dk) | 8,3sn | 19,96x |
+
+Karşılaştırma için bz2(9) (Bölüm 35'ten): 0,464GB, 1.234,3sn
+(20,6dk), açma 96,4sn, oran 22,56x.
+
+**Üç net bulgu**:
+
+1. **3->15 arası kademeli/beklenen ölçekleme** (27sn'den 193sn'e,
+   boyut sadece %5 iyileşiyor) -- daha önceki (Bölüm 30.4) dar/normal
+   veride gördüğümüz 12->15 cliff'i burada yok, çünkü veri zaten
+   aşırı tekrarlı (44.000 sabit-sıfır sütun) ve düşük seviyeler bile
+   bu deseni kolayca yakalıyor.
+
+2. **YENİ bir cliff 15->19 arasında ortaya çıktı**: süre 2,2x artıyor
+   (193sn->420sn) ama bu kez boyutta da GERÇEK bir kazanç var
+   (0,574GB->0,524GB, oranı 18,21x'ten 19,97x'e çıkarıyor, yani
+   %8,7 daha küçük). Bu, önceki normal-veri testlerinden farklı --
+   orada üst seviyeler sadece süre yakıyordu, boyutta anlamlı kazanç
+   yoktu. Bu uç/aşırı-tekrarlı veri şeklinde seviye 19'un optimal
+   parse (btultra2) stratejisi gerçekten daha iyi bir sıkıştırma
+   buluyor.
+
+3. **22, 19'a göre KESİNLİKLE daha kötü** -- boyut aslında minicik
+   bir miktar BÜYÜYOR (562.804.930 byte, 19'daki 562.293.181 byte'tan
+   fazla) ve süre 3,3x artıyor (420sn->1.393sn). Bu, Bölüm 30.6'daki
+   "seviye 22, 19'dan daha kötü bir takas" bulgusunu bu uç senaryoda
+   da doğruluyor -- seviye 22 hiçbir zaman seçilmemeli.
+
+**Sonuç -- ZSTD(19), bu uç senaryo için gerçek bir orta yol**:
+bz2(9) hâlâ en küçük boyutu veriyor (0,464GB, ZSTD(19)'dan %11,4
+daha küçük) ama neredeyse aynı sürede (1.234sn'e karşı 420sn --
+ZSTD(19) ~2,9x DAHA HIZLI) ve açmada çok daha hızlı (8,3sn'e karşı
+96,4sn -- ~11,6x daha hızlı). Yani bu dosya tipinde bz2'nin "sabit
+süre bedeli kabul edilebilir" mantığı çöküyor (Bölüm 35), ama
+ZSTD(19) makul bir süre karşılığında ZSTD(12)'nin sağladığından
+belirgin daha iyi bir sıkıştırma sağlıyor. **Eğer üretimde bu tür
+aşırı geniş/sabit-ağırlıklı dosyalar çıkarsa, ZSTD(19) mantıklı bir
+uzlaşma noktası olabilir** -- ne ZSTD(12)'nin bıraktığı sıkıştırma
+kazancından tamamen vazgeçmek, ne de bz2'nin dakikalarca süren
+sıkıştırma/açma bedelini ödemek.
+
+### 35.2 Aynı uç senaryoda bz2'nin de tüm seviyeleri (1-9) tarandı -- bz2'de "hafif seviye" diye bir şey yok
+
+Kullanıcı, ZSTD'ye simetrik olarak bz2'nin de seviyelerini (1, 3, 5,
+7, 9) bu aynı dosyada test etmemizi istedi. Dosya yeniden üretildi
+(137,3sn, yine birebir 10,46GB/113.869 satır), streaming yöntemiyle
+5 seviye sırayla sıkıştırılıp açıldı, kayıpsızlık her seviyede
+doğrulandı.
+
+| Seviye | Boyut (GB) | Sıkıştırma süresi | Açma süresi | Oran |
+|---|---|---|---|---|
+| 1 | 0,496 | 1.023,4sn (17,1dk) | 81,9sn | 21,08x |
+| 3 | 0,479 | 1.146,3sn (19,1dk) | 87,9sn | 21,84x |
+| 5 | 0,471 | 1.186,2sn (19,8dk) | 96,4sn | 22,19x |
+| 7 | 0,467 | 1.195,1sn (19,9dk) | 92,1sn | 22,41x |
+| 9 | 0,464 | 1.248,8sn (20,8dk) | 100,3sn | 22,56x |
+
+**Çarpıcı bulgu: bz2'de bu senaryoda "hafif/hızlı seviye" diye bir
+şey yok.** Seviye 1 (bz2'nin EN DÜŞÜK/en hızlı ayarı) bile 1.023,4sn
+(17,1 dakika) sürüyor -- seviye 9'un (1.248,8sn) sadece %18 altında.
+Bu, bz2'nin normal/dengeli verideki (Bölüm 34) davranışından kökten
+farklı: orada seviyeler arası fark BWT blok boyutuyla (seviye
+N=N×100KB) doğrusal/kademeli değişiyordu. Burada ise seviye 1->9
+arası süre sadece 1,22x artarken (1.023->1.249sn), boyut kazancı da
+mütevazı (%6,5, 0,496->0,464GB). **Yorum**: BWT'nin (Burrows-Wheeler
+dönüşümü) maliyeti, 44.000 sabit-sıfır sütunun yarattığı aşırı
+tekrarlı/uzun ortak alt-dizi yapısında blok boyutundan bağımsız
+olarak zaten yüksek -- düşük blok boyutu (seviye 1=100KB) bile bu
+veri yapısında pahalı bir sıralama/dönüşüm işi yapıyor. **Pratik
+sonuç: bu dosya tipinde bz2'nin HİÇBİR seviyesi ZSTD(19)'un (420,4sn)
+hızına yaklaşamıyor** -- en hızlı bz2 (seviye 1, 1.023,4sn) bile
+ZSTD(19)'dan ~2,4x yavaş. Boyut tarafında bz2(1) yine de ZSTD(19)'dan
+biraz daha iyi sıkışıyor (21,08x'e karşı 19,97x) ama süre bedeli
+orantısız büyük. **Bu uç senaryoda bz2'nin "seviye düşürerek
+hızlandırma" stratejisi işe yaramıyor -- eğer bz2'nin boyut avantajı
+isteniyorsa süre bedeli (17+ dakika, seviyeden bağımsız) kaçınılmaz;
+hız isteniyorsa ZSTD(19)'a geçilmeli.**
+
+## 36. Kalıcı test dosyası oluşturuldu -- `mixed_wide_test.tab` (45.000 sütun, 3 tip karışık, rastgele dağılım)
+
+Bundan sonraki testlerde tekrar tekrar kullanılmak üzere (üretip
+silmek yerine) KALICI bir sentetik dosya oluşturuldu. Şema:
+
+- **45.000 sütun toplam**: 1.000 float64 + 20.000 SABİT-sıfır +
+  20.000 SABİT-bir + 4.000 KARIŞIK (hücre başına rastgele 0/1).
+- **Sütun SIRASI rastgele karıştırıldı** (sabit seed=42 ile) --
+  float/sabit-sıfır/sabit-bir/karışık türleri dosya boyunca
+  dağılmış durumda, önceki testlerdeki gibi bloklar halinde
+  gruplanmadı. Gerçek telemetri dosyalarındaki düzensiz sütun
+  dizilimini taklit ediyor.
+- **Satır sayısı düzgün/yuvarlak bir sayı**: **100.000** (önceki
+  testlerdeki "113.869" gibi çirkin sayılar yerine).
+- **Nihai boyut: 9,186GB (9.862.938.544 byte)** -- hedeflenen ~10GB'a
+  yakın.
+
+**Üretim scripti kalıcı olarak repoya kaydedildi**:
+`scripts/gen_mixed_binary_test_file.py` -- sabit seed (42) ile tekrar
+çalıştırıldığında birebir aynı dosyayı üretir (kayıp durumunda
+kurtarma garantili). Üretim süresi: 1.927,9sn (~32,1dk) -- önceki
+basit (sadece float+sabit-sıfır) generator'dan çok daha yavaş,
+çünkü her chunk'ta 3 ayrı DataFrame (float64 + int8×2 + rastgele
+int8) oluşturup birleştirmek ve sütun sırasını karıştırmak
+(`chunk_df[shuffled_cols]`) ek yük getiriyor.
+
+**Dosyanın kendisi ve bir "column manifest" (JSON) container'ın
+`/work` klasöründe KALICI olarak bırakıldı (silinmedi)**:
+- `/work/mixed_wide_test.tab` -- ana veri dosyası (9,19GB)
+- `/work/mixed_wide_test_columns.json` -- her sütunun adı ve TÜRÜ
+  (`float64`/`constant_zero`/`constant_one`/`mixed_binary`) ile
+  birlikte tam sütun sırası -- ileride otomatik sınıflandırma
+  doğrulaması (Bölüm 31.5) ve genel referans için.
+
+**Not**: `/work` bir Docker named volume (`t2p-work4`) üzerinde --
+container yeniden başlatılırsa (`docker start`) korunur, ama
+Docker Desktop "purge/clean data" işlemiyle SİLİNİR (bu oturumda
+birkaç kez yaşandığı gibi). Eğer purge olursa, `scripts/
+gen_mixed_binary_test_file.py` ile birebir aynı dosya yeniden
+üretilebilir -- veri kaybı riski YOK, sadece ~32 dakikalık yeniden
+üretim maliyeti var.
+
+## 37. `mixed_wide_test.tab` ile uçtan uca pipeline -- ZSTD(3) -> MinIO -> ClickHouse -> sorgu, 45.000 sütunda İKİ YENİ altyapı sınırı bulundu
+
+Bölüm 36'daki kalıcı test dosyası (45.000 sütun, 100.000 satır,
+9,19GB) ile tam pipeline denendi: ZSTD(3) sıkıştır -> MinIO'ya yükle
+-> ClickHouse hedef tablosuna `s3()` ile toplu yükle -> birkaç sorgu
+çalıştır. Yol boyunca 45.000 sütunun ClickHouse'un VARSAYILAN
+limitlerini aştığı İKİ AYRI nokta bulundu -- ikisi de bugüne kadarki
+testlerde (en fazla 1.000-1.700 sütunluk şemalarda) hiç görülmemişti.
+
+### 37.1 ZSTD(3) sıkıştırma ve MinIO yükleme -- sorunsuz
+
+| Adım | Sonuç |
+|---|---|
+| ZSTD(3) sıkıştırma (streaming) | 9,186GB -> 1,857GB, **46,4sn**, oran **4,95x** |
+| MinIO'ya yükleme | 9,3sn (204,9MB/sn) |
+
+**Not**: bu dosyanın sıkıştırma oranı (4,95x) Bölüm 35'teki aşırı
+uç senaryodan (44.000 sütunun TAMAMI sabit-sıfır, ZSTD(3) oranı
+17,28x) çok daha düşük -- beklenen bir sonuç, çünkü bu dosyada
+binary sütunların sadece yarısı sabit (20.000 sıfır + 20.000 bir),
+4.000'i tamamen rastgele (hiç sıkışmayan gürültü) ve sütun sırası da
+karıştırılmış (aynı türden sütunlar yan yana değil, ZSTD'nin
+satır-içi tekrar yakalama şansı azalıyor). Bu, **gerçekçi/dengeli bir
+kompozisyonda ZSTD oranının aşırı-uç senaryolardan çok farklı
+çıkabileceğinin somut kanıtı**.
+
+### 37.2 İLK engel -- `max_query_size` / `max_ast_elements` (45.000 sütunlu CREATE TABLE)
+
+Manifest'ten otomatik üretilen `CREATE TABLE` DDL'i (her sütun için
+tip+codec tanımıyla) **1.542.643 karakter** çıktı. İki varsayılan
+ClickHouse limiti sırayla aşıldı:
+
+1. `max_query_size` (varsayılan 262.144 byte/~256KB) -- "Max query
+   size exceeded" hatası.
+2. Bunu düzeltince `max_ast_elements` (varsayılan 50.000 AST
+   düğümü) -- "AST is too big. Maximum: 50000" hatası (45.000 sütun
+   × sütun-başına birden fazla AST düğümü = 50.000'i kolayca aşıyor).
+
+**Çözüm**: sorgu ayarlarına `max_query_size=200_000_000`,
+`max_ast_elements=5_000_000`, `max_expanded_ast_elements=5_000_000`
+eklendi -- DDL sorunsuz çalıştı. **Ders: 10.000+ sütunlu şemalarda bu
+üç ayar rutin olarak yükseltilmeli, varsayılanlar bu ölçek için
+tasarlanmamış.**
+
+### 37.3 İKİNCİ ve daha ciddi engel -- "Wide" parça formatı, sütun başına ayrı yazma tamponu -- bellek taşması
+
+Tablo oluşturulduktan sonra `s3()` ile yükleme (`INSERT INTO ...
+SELECT * FROM s3(...)`) **"(total) memory limit exceeded... maximum:
+9.21-9.37 GiB"** hatasıyla iki kez çöktü:
+
+- 1. deneme (varsayılan ayarlar): hata `ParallelParsingBlockInputFormat`
+  içinde -- paralel parse sırasında bellek taştı. `input_format_parallel_parsing=0`,
+  `max_threads=2`, `max_insert_threads=1`, `max_block_size=8192` ile
+  düzeltilmeye çalışıldı.
+- 2. deneme (düşük-bellek parse ayarlarıyla): hata bu kez FARKLI bir
+  yerde -- `MergeTreeDataPartWriterWide::addStreams` /
+  `CompressedWriteBuffer` içinde, yani **YAZMA tarafında**. Kök
+  neden: ClickHouse'un varsayılan **"Wide" MergeTree parça formatı,
+  HER SÜTUN İÇİN AYRI bir sıkıştırılmış yazma akışı/tamponu açıyor**
+  -- 45.000 sütunda bu, parse ayarlarından tamamen BAĞIMSIZ olarak
+  sunucunun bellek bütçesini (~9,2-9,4GB) tek başına dolduruyor.
+
+**Gerçek çözüm -- "Compact" parça formatını zorlamak**: tablo
+`min_bytes_for_wide_part` ve `min_rows_for_wide_part` ayarları çok
+yüksek bir değere (pratikte asla aşılmayacak) çekilerek yeniden
+oluşturuldu:
+
+```sql
+CREATE TABLE mixed_wide_test (...)
+ENGINE = MergeTree() ORDER BY tuple()
+SETTINGS min_bytes_for_wide_part = 10737418240000,
+         min_rows_for_wide_part = 1000000000
+```
+
+Bu, ClickHouse'a HER ZAMAN "Compact" format (tüm sütunlar TEK bir
+dosyada, sütun başına ayrı akış YOK) kullanmasını zorluyor. Bu
+değişiklikle yükleme **sorunsuz tamamlandı** (`system.parts.part_type
+= 'Compact'` ile doğrulandı). **Ders: 10.000+ sütunlu tablolarda
+varsayılan "Wide" format kullanılamaz -- `min_bytes_for_wide_part`/
+`min_rows_for_wide_part` ile "Compact" format ZORUNLU olarak
+tercih edilmeli.** (Not: Compact format normalde küçük/az-satırlı
+parçalar için düşünülmüştür; çok-sütunlu/çok-satırlı senaryoda sorgu
+performansına etkisi bu testte ölçülmedi, sadece yükleme başarısı
+doğrulandı -- ayrı bir performans karşılaştırması gerekebilir.)
+
+### 37.4 Nihai sonuçlar (Compact format + düşük-bellek parse ayarlarıyla)
+
+| Aşama | Sonuç |
+|---|---|
+| ZSTD(3) sıkıştırma | 46,4sn, 4,95x oran, 1,857GB |
+| MinIO'ya yükleme | 9,3sn |
+| ClickHouse yükleme (`s3()`->tablo, Compact format) | **186,9sn, 535,2 satır/sn** |
+| ClickHouse'daki disk boyutu (`UInt8+T64,ZSTD` + `Float64+ZSTD`) | 2,048GB |
+
+**535,2 satır/sn, bugüne kadarki en düşük yükleme hızı** -- ama
+karşılaştırılabilir değil, çünkü önceki tüm hız ölçümleri (Bölüm
+24-28) ~1.000 sütunlu şemalardaydı. 45.000 sütun/satır başına
+düşen decode+yazma maliyeti (Bölüm 29'un "decode dominant" bulgusunun
+45x'e büyütülmüş hali) bu düşüşü açıklıyor.
+
+**Sorgu testleri** (Compact formatta, tabloya önceden yüklenmiş
+haliyle):
+
+| Sorgu | Süre |
+|---|---|
+| `SELECT count()` | 69,7ms |
+| Float sütununda `avg/min/max` | 1.063,3ms |
+| Karışık binary sütunda filtre (`=1`) -- 50.108/100.000 satır döndü (~%50, beklenen) | 660,1ms |
+| Sabit sütunlarda `sum()` -- (0, 100.000) döndü, doğru | 1.924,4ms |
+| Küçük projeksiyon (2 sütun, 10 satır) | 427,7ms |
+
+**Doğruluk kontrolü**: sabit-sıfır sütununun toplamı 0, sabit-bir
+sütununun toplamı satır sayısına (100.000) eşit çıktı -- veri
+kaybı/yanlış eşleşme yok. Karışık sütunda `=1` filtresi ~%50 satır
+döndürdü, `rng.integers(0,2)` ile üretilen gerçek rastgele
+dağılıma tutarlı.
+
+**Genel değerlendirme**: 45.000 sütunlu bir tablo ClickHouse'da
+ÇALIŞABİLİR ama varsayılan ayarlarla DEĞİL -- hem DDL hem yükleme
+tarafında birden fazla varsayılan limit manuel olarak yükseltilmesi/
+değiştirilmesi gerekti. Sorgu performansı (özellikle tek-sütun
+agregasyonları saniyenin altında) makul, ama bu ölçekte HİÇBİR
+optimizasyon (partition/order key, index) henüz denenmedi -- sadece
+temel işlevsellik doğrulandı. **Tablo ve MinIO'daki `.tab.zst`
+kalıcı bırakıldı, silinmedi -- kullanıcının "bir süre kullanacağız"
+isteğine uygun olarak ileride üzerinde daha fazla test yapılabilir.**
+
+## 38. `mixed_wide_test.tab` -> parquet -> MinIO -> ClickHouse denemesi -- ClickHouse'un Parquet okuyucusu 45.000 sütunda GERÇEK bir sınıra çarpıyor
+
+Kullanıcı Bölüm 37'nin (ham metin, ZSTD3) karşılaştırması için aynı
+işlemi parquet ile de denemeyi istedi: `.tab` -> parquet -> MinIO ->
+ClickHouse -> aynı sorgular. Bu, oturumun en sorunlu testi oldu --
+hem host'un Docker Desktop/WSL2 alt yapısı hem de ClickHouse'un
+kendisi ciddi kararlılık sorunları gösterdi.
+
+### 38.1 Host çöküşleri -- tab->parquet dönüşümünün kendisi bile host'u defalarca devirdi
+
+`.tab -> parquet` dönüşümü (DuckDB ve ardından pandas tabanlı
+denemeler) **host'un tamamını (Docker Desktop + WSL2) 4 KEZ
+çökertti** -- her seferinde `docker ps` 500 Internal Server Error
+vermeye başladı, bazen PowerShell komutları bile yanıt vermez oldu
+(host CPU/kaynak baskısı altında tamamen tıkandı). Her seferinde
+`wsl --shutdown` + Docker Desktop yeniden başlatma ile kurtarıldı,
+veri kaybı olmadı (`/work` volume korundu).
+
+**Kök neden bulundu -- pyarrow'un ParquetWriter'ı ÇOK SAYIDA KÜÇÜK
+row group ile kullanılınca patlıyor**: ilk yaklaşım (pandas chunked
++ ardından pyarrow streaming CSV okuyucusu, ~40 satırlık mini-batch'ler
+halinde her batch'i ayrı `write_batch()` ile yazmak) 45.000 sütun ×
+binlerce mini-row-group çarpımıyla milyonlarca küçük meta veri
+nesnesi biriktiriyordu -- container'ın 4GB cgroup limitine takılıp
+"Killed" (OOM) ile öldü, 100.000 satırın sadece %4,2'sinde. **Düzeltme**:
+pyarrow batch'lerini biriktirip DAHA AZ ama DAHA BÜYÜK row group'lar
+halinde (`ROW_GROUP_TARGET=5000`) yazmaya geçildi -- bu, 100.000
+satır için ~2.500 yerine ~20 row group anlamına geliyor, sütun-başı
+meta veri çarpanını ~125x azaltıyor.
+
+**Kullanıcı isteğiyle** ("yine iptal olursa farklı bir şey dene"),
+tam 100.000 satırlık dosya yerine **ilk 20.000 satırlık bir alt küme**
+(`mixed_wide_test_20k.tab`, 1,84GB) ile devam edildi -- host'u daha
+az zorlayarak anlamlı bir karşılaştırma elde etmek için.
+
+### 38.2 tab->parquet dönüşümü ve MinIO yükleme -- BAŞARILI
+
+Düzeltilmiş (az/büyük row-group) script, container 1 CPU + 6GB'a
+sınırlanmış halde, 20.000 satırlık alt kümede sorunsuz çalıştı:
+
+| Adım | Sonuç |
+|---|---|
+| `.tab` (sıkıştırılmamış) kaynak boyutu | 1,837GB |
+| Parquet dönüşümü | 209,2sn, **0,219GB, oran 8,40x** |
+| MinIO'ya yükleme | 2,7sn (82,6MB/sn) |
+| ClickHouse hedef tablosu oluşturma (Compact format zorlanmış) | başarılı |
+
+### 38.3 ClickHouse'a `s3()` ile parquet yükleme -- 3 denemede de BAŞARISIZ, gerçek bir ClickHouse sınırı
+
+Parquet dosyasını ClickHouse'a `INSERT ... SELECT * FROM s3(...,
+'Parquet')` ile yüklemek **3 farklı denemede de** aynı hatayla
+çöktü: `(total) memory limit exceeded`, `ParquetV3BlockInputFormat`
+içinde, `Parquet::Reader::decodeDictionaryPage` sırasında.
+
+1. **1. deneme** (düşük-bellek parse ayarlarıyla, `max_threads=1`
+   vb.): 6,56GB sunucu tavanında çöktü.
+2. **2. deneme** (`input_format_parquet_use_native_reader_v3=0`
+   sorgu ayarıyla eski okuyucuya dönmeye çalışıldı -- **ayar sorgu
+   seviyesinde etkisiz çıktı**, hâlâ V3 okuyucu kullanıldı): 9,67GB
+   tavanında, sütun `o6550`'de çöktü (45.000 sütunun sadece
+   %14,5'inde).
+3. **3. deneme** (ClickHouse sunucu config'ine `max_server_memory_usage_to_ram_ratio`
+   0,90'dan **0,95**'e çıkarıldı -- 9,6GB'tan **11,09GB**'a; ayrıca
+   profil seviyesinde V3 okuyucuyu kapatma denendi, o da etkisiz
+   kaldı): daha ileri gitti ama yine çöktü, 10,22GB tavanında, sütun
+   `f156`'da.
+
+**Kritik gözlem: hata her seferinde FARKLI bir sütunda oluyor, ama
+her seferinde RSS neredeyse tam tavanda.** Bu, satır sayısıyla değil
+**işlenen sütun sayısıyla kümülatif büyüyen, serbest bırakılmayan
+bir bellek birikimi** olduğunu gösteriyor -- yani **satır sayısını
+daha da azaltmak bu sorunu ÇÖZMEZ**, çünkü 45.000 sütunun kendisi
+zaten orada; ~6.550 sütun işlendiğinde bile (sadece 20.000 satırlık,
+235MB'lık bir dosyada) GB'larca bellek birikmiş oluyordu.
+`input_format_parquet_use_native_reader_v3` ayarı hem sorgu hem
+sunucu-profili seviyesinde denendi, **hiçbiri gerçek okuyucu seçimini
+değiştirmedi** (`system.settings` sorgusunda değer değişse bile stack
+trace hep `ParquetV3BlockInputFormat` gösterdi) -- bu ClickHouse
+sürümünde V3 okuyucudan çıkış yolu bulunamadı.
+
+**Sonuç -- bu ClickHouse sürümünün Parquet okuyucusu (V3), aşırı
+geniş (45.000 sütunlu) dosyalarda GERÇEK bir bellek yönetimi
+sorununa sahip** -- ayar değişikliğiyle, thread azaltmayla, ya da
+sunucu bellek tavanını %5 artırmayla çözülemedi. **Bu, ince ayar
+sorunu değil, mimari bir sınırlama gibi görünüyor.**
+
+**Doğrudan karşılaştırma -- aynı 45.000 sütunlu veri, iki format,
+iki farklı sonuç**:
+
+| | Ham metin + ZSTD3 (Bölüm 37) | Parquet (Bölüm 38) |
+|---|---|---|
+| Satır sayısı | 100.000 (tam dosya) | 20.000 (alt küme, host stabilitesi için) |
+| ClickHouse'a yükleme | **BAŞARILI** (186,9sn, 535,2 satır/sn) | **BAŞARISIZ** (3 denemede de bellek taşması) |
+| Kaynak format boyutu | 1,857GB (ZSTD3) | 0,219GB (parquet, ~8,4x küçük) |
+
+**Bu, oturumun en önemli mimari bulgularından biri**: parquet dosya
+BOYUTU olarak ham metinden çok daha küçük çıksa bile (beklenen,
+Bölüm 30'un bulgusuyla tutarlı), **45.000 sütunlu aşırı geniş
+dosyalarda ClickHouse'a YÜKLENEBİLİRLİK açısından ham metin (TSV/
+`TabSeparatedWithNames`) parquet'ten daha güvenilir** -- en azından
+bu ClickHouse sürümünde/bu ortamda. Gerçek üretim verisi bu kadar
+geniş sütunlu olacaksa (kullanıcının "her uçak tipi için farklı
+sayıda sütun var" notu, bazı tiplerin çok geniş olabileceğini
+düşündürüyor), **parquet'in ClickHouse'a yükleme adımında kör nokta
+olabileceği ciddiye alınmalı** -- ya ClickHouse'un daha yeni/farklı
+bir sürümü denenmeli, ya da bu ölçekte ham-metin yükleme yolu (Bölüm
+30'daki hibrit mimarinin "parquet ClickHouse'a, `.tab.zst` MinIO'ya"
+kararı) YENİDEN gözden geçirilmeli -- belki her iki hedefte de
+ham-metin/sıkıştırılmış format kullanılmalı, aşırı geniş şemalar
+için.
+
+**Ortam notu**: ClickHouse sunucu config'i (`max_server_memory_usage_to_ram_ratio`)
+test sonunda güvenli varsayılana (0,90) geri alındı, host riski
+azaltmak için. `t2p-cmp3` container'ı hâlâ 1 CPU/6GB sınırlı --
+ileride ağır iş yükleri için bu sınırlar gerekirse gevşetilmeli.
+20.000 satırlık alt küme dosyaları (`mixed_wide_test_20k.tab`,
+`.parquet`) `/work`'te kalıcı bırakıldı.
+
+## 39. NİHAİ MİMARİ KARARI -- parquet tamamen çıkarıldı, hem MinIO hem ClickHouse için ham `.tab`+sıkıştırma kullanılacak
+
+**Kritik bağlam düzeltmesi**: kullanıcı, gerçek üretimdeki "normal"
+genişliğin en az **10.000 sütun** olacağını, 45.000 sütunlu
+dosyaların da yaygın olacağını netleştirdi. Bu, Bölüm 24-34'teki
+"parquet güvenilir çalışıyor" testlerinin (~1.000 sütun) gerçek
+üretimin HİÇBİR yerini temsil etmediği anlamına geliyor -- parquet'in
+güvenilir olduğu KANITLANMIŞ tek aralık, üretimde hiç
+karşılaşılmayacak bir ölçek.
+
+**Karar gerekçesi**: Bölüm 38'de parquet 45.000 sütunda (ClickHouse'un
+V3 Parquet okuyucüsünde) kesin olarak çöktü -- ve hata SATIR sayısıyla
+değil İŞLENEN SÜTUN sayısıyla kümülatif büyüyordu (20.000 satırlık
+sadece 235MB'lık bir dosyada, sütunların sadece %14,5'i işlendiğinde
+GB'larca bellek tükenmişti). Bu, 10.000 sütunda da benzer/yakın bir
+sorun çıkma riskinin gerçek olduğu, ama net bir güvenli eşik
+bilinmediği anlamına geliyor. **İki ayrı kod yolu (parquet + ham
+metin, hangisinin ne zaman güvenli olduğu bilinmeden) inşa etmek,
+tek bir kanıtlanmış-çalışan yola geçmekten daha riskli.**
+
+**NİHAİ KARAR: parquet pipeline'dan tamamen çıkarılıyor.** Hem MinIO
+arşivi hem ClickHouse'a yükleme kaynağı olarak **ham `.tab` +
+sıkıştırma** (ZSTD ya da bz2, dosya kompozisyonuna göre -- bkz. Bölüm
+34/35/35.1/35.2) kullanılacak. Bölüm 30'daki "parquet ClickHouse'a
+geçici, `.tab.zst` MinIO'ya kalıcı" hibrit mimarisi GEÇERSİZ --
+artık parquet üretimine hiç gerek yok, tek format/tek dosya iki amaca
+da (arşiv + yükleme) hizmet ediyor.
+
+**Bu kararın somut faydaları**:
+1. **Basitlik**: tek format, tek dönüşüm adımı yok -- `.tab` dosyası
+   sıkıştırılıp doğrudan hem MinIO'ya hem (gerektiğinde) ClickHouse'a
+   `s3()` + `TabSeparatedWithNames` ile yüklenir (Bölüm 37'de 45.000
+   sütun/100.000 satırda uçtan uca kanıtlandı).
+2. **Güvenilirlik**: parquet'in ClickHouse okuma tarafındaki
+   öngörülemeyen/ayarla-düzeltilemeyen bellek sorunundan (Bölüm 38)
+   tamamen kaçınılıyor.
+3. **Kırılgan bağımlılık ortadan kalkıyor**: DuckDB/pyarrow ile
+   parquet üretimi kendi başına host'u 4 kez çökertmişti (Bölüm 38.1)
+   -- bu adım artık pipeline'da hiç yok.
+
+**Bilinçli olarak kabul edilen bedel**: ham metin yükleme, parquet'in
+çalıştığı ölçekte (~1.000 sütun, Bölüm 30) parquet'ten ~2,27x daha
+yavaştı. Ama bu bir "seçim" değil -- parquet'in gerçek üretim
+ölçeğinde (10.000+ sütun) güvenle çalıştığına dair hiç kanıt yok,
+o yüzden bu hız farkı zaten hiçbir zaman güvenle elde edilemeyecek
+bir avantajdı.
+
+**Değişmeyen/hâlâ geçerli kararlar**:
+- ClickHouse hedef tablosunda `CODEC(ZSTD)` (Bölüm 28.3) ve binary
+  sütunlar için `UInt8`+`CODEC(T64,ZSTD)` (Bölüm 31, gerçek `.ham`
+  değer aralığı doğrulanana kadar üretime ALINMAMALI -- Bölüm 31.4
+  güvenlik uyarısı hâlâ geçerli) -- bu, kaynak formattan (parquet/TSV)
+  BAĞIMSIZ, ClickHouse'un kendi depolama şemasıyla ilgili, hâlâ
+  geçerli.
+- Sıkıştırma algoritması/seviyesi kararı dosya kompozisyonuna göre
+  değişebilir (Bölüm 34: dengeli kompozisyonda bz2; Bölüm 35: aşırı
+  sabit-ağırlıklı kompozisyonda ZSTD19 daha iyi) -- gerçek üretim
+  dosya şekli netleşince bu karar 10.000+ sütun ölçeğinde YENİDEN
+  test edilmeli (şu ana kadarki tüm sıkıştırma testleri ya ~1.000 ya
+  da 45.000 sütunda yapıldı, 10.000 sütunluk gerçek "normal" ölçekte
+  hiç test edilmedi).
+
+**Açık takip maddesi**: Bölüm 26'daki worker/thread eşzamanlılık
+ayarları (N=2 optimal, `max_download_threads` vb.) da ~1.000 sütunluk
+ölçekte yapılmıştı -- gerçek 10.000+ sütunluk ölçekte bu ayarların
+hâlâ geçerli olup olmadığı doğrulanmadı, ileride tekrar test
+edilmeli.

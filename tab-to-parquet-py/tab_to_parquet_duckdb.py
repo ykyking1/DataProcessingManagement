@@ -15,6 +15,14 @@ paralellik/OOM riskini onlemek icin).
 
 Kullanim:
     python3 tab_to_parquet_duckdb.py --input sample.tab --output sample.parquet --threads 1
+
+NOT (2026-08-18, plan Bolum 21-23): bu makinede dogrulanmis en iyi
+worker-per-process kurulumu N=20 paralel surec + her surece --threads 1
+(varsayilan degil, HER ZAMAN elle verilmeli -- cifte paralellik OOM
+riski icin Bolum 13/17) + --row-group-size 10000 (artik varsayilan).
+--row-group-size 20000+ N=20'de sistem kilitlenmesine yol acabiliyor,
+denenmis/guvenli deger disinda kullanmadan once mutlaka gercek dosya
+boyutuyla tam olcekte test edin.
 """
 import argparse
 import os
@@ -63,7 +71,13 @@ if __name__ == "__main__":
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--threads", type=int, default=None)
-    p.add_argument("--row-group-size", type=int, default=None)
+    # Varsayilan 10000 (2026-08-18, plan Bolum 21/23): N=20 worker'da
+    # container'in ~11GB bellek butcesine sigan, ayni zamanda 5000'den
+    # de hizli/iyi sikistirilan dogrulanmis en iyi nokta (235sn, 20/20,
+    # 1.99x). 50000 (eski varsayilan davranis) N=20'de veri kaybina/
+    # sistem kilitlenmesine yol aciyordu (Bolum 19/22) -- bilerek
+    # None birakilmiyor, guvenli deger varsayilan yapildi.
+    p.add_argument("--row-group-size", type=int, default=10000)
     args = p.parse_args()
 
     result = convert(args.input, args.output, args.threads, args.row_group_size)
