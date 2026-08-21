@@ -62,12 +62,14 @@ import os
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import clickhouse_connect
 import pandas as pd
 import psycopg2
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
@@ -106,6 +108,30 @@ REFRESH_OPTIONS = {
     "30 sn": 30,
     "60 sn": 60,
 }
+
+# ============================================================
+# ANA SEKMELER
+# ============================================================
+#
+# st.tabs() Streamlit'te programatik/URL tabanlı olarak kontrol
+# edilemediği (native sekmeler her zaman ilk sekmeden açılır) için,
+# paylaşılan bir bağlantının (bkz. render_download_section, "🔗
+# Paylaşılabilir Bağlantı Oluştur") doğrudan "Veri Gözat / Dışa
+# Aktar" sekmesini açabilmesi amacıyla main() içinde native st.tabs()
+# yerine session_state ile kontrol edilen bir st.radio "sekme"
+# görünümü kullanılır (bkz. main()).
+
+MAIN_TAB_RUNS = "Pipeline Metrikleri"
+MAIN_TAB_CATALOG = "Katalog"
+MAIN_TAB_ALERTS = "🚨 Alertler"
+MAIN_TAB_EXPORT = "Veri Gözat / Dışa Aktar"
+
+MAIN_TAB_LABELS = [
+    MAIN_TAB_RUNS,
+    MAIN_TAB_CATALOG,
+    MAIN_TAB_ALERTS,
+    MAIN_TAB_EXPORT,
+]
 
 # ============================================================
 # AU-AIR KOLONLARI
@@ -565,6 +591,12 @@ VALUE_FILTER_OPERATORS = {
     "!=": "!=",
 }
 
+# "İki değer arasında" (BETWEEN) filtresi -- yukarıdaki tekli
+# operatörlerden farklı olarak iki değer (min/maks) gerektirdiği için
+# ayrı ele alınır (bkz. build_clickhouse_where ve render_data_export
+# içindeki değer bazlı filtre UI'ı).
+RANGE_FILTER_OPERATOR = "between"
+
 
 def build_clickhouse_where(
     start_time=None,
@@ -575,6 +607,9 @@ def build_clickhouse_where(
 ):
     """
     value_filters: [{"column": "altitude", "operator": "<", "value": 23}, ...]
+    "between" operatörü için ayrıca "value2" (maks) de gerekir, örn.
+    {"column": "altitude", "operator": "between", "value": 10, "value2": 50}
+    -> "altitude BETWEEN 10 AND 50".
     selected_flights: ["flight_1", "flight_2", ...] -> flight_id IN (...)
 
     Her filtre AND ile birleştirilir (örn. "altitude < 23 AND box_w >= 50").
@@ -637,6 +672,28 @@ def build_clickhouse_where(
             value = value_filter.get("value")
 
             if column not in available_columns:
+                continue
+
+            if operator == RANGE_FILTER_OPERATOR:
+
+                value2 = value_filter.get("value2")
+
+                if value is None or value2 is None:
+                    continue
+
+                param_min = f"value_filter_{index}_min"
+                param_max = f"value_filter_{index}_max"
+
+                conditions.append(
+                    f"`{column}` BETWEEN "
+                    f"{{{param_min}:Float64}} AND {{{param_max}:Float64}}"
+                )
+
+                # Kullanıcı min/maks'ı ters girmiş olsa bile (örn. min=50,
+                # maks=10) BETWEEN'in boş sonuç dönmemesi için sıralanır.
+                parameters[param_min] = float(min(value, value2))
+                parameters[param_max] = float(max(value, value2))
+
                 continue
 
             if operator not in VALUE_FILTER_OPERATORS:
@@ -2111,6 +2168,10 @@ def render_alerts(
                 "Bilinmeyen hata",
             )
 
+            run_id = row.get(
+                "run_id"
+            )
+
             with st.expander(
                 f"🚨 {job_name} → {step_name} | {timestamp}"
             ):
@@ -2130,6 +2191,24 @@ def render_alerts(
                 st.error(
                     error
                 )
+
+                # -------------------------------------------------------
+                # Tekrar çalıştırma bağlantısı
+                # -------------------------------------------------------
+                #
+                # Eski alertlerde run_id yok (bu alan sonradan eklendi),
+                # bu yüzden yalnızca mevcutsa gösteriliyor. Dagster UI'daki
+                # run sayfasından "Re-execute from failure" ile aynı adım
+                # tekrar çalıştırılabilir.
+
+                if run_id and not pd.isna(run_id):
+
+                    run_url = f"{get_ui_url()}/runs/{run_id}"
+
+                    st.link_button(
+                        "🔁 Dagster'da Aç ve Tekrar Çalıştır",
+                        run_url,
+                    )
 
     elif not alerts_df.empty:
 
@@ -2236,6 +2315,7 @@ def render_download_section(
     dataframe: pd.DataFrame,
     start_time: datetime,
     end_time: datetime,
+    share_params: dict,
 ) -> None:
     """
     "3️⃣ İndir" adımının içeriği.
@@ -2251,6 +2331,11 @@ def render_download_section(
     başlamaması için, her format kendi alt fonksiyonunda ayrıca bir
     "Oluştur" butonuna basılmasını bekler (bkz. _render_all_data_csv_download
     vb.) -- dönüşüm yalnızca o butona basılınca çalışır.
+
+    share_params: mevcut filtre durumunun URL query parametresi olarak
+    kodlanmış hâli (bkz. _encode_export_state_to_query_params). Burada,
+    format seçiminin hemen yanında "bu filtreleri bağlantı olarak
+    paylaş" seçeneği için kullanılır.
     """
 
     time_suffix = (
@@ -2265,6 +2350,15 @@ def render_download_section(
     if has_flight_id:
         format_keys += ["zip", "each"]
 
+    if "download_format_choice" not in st.session_state:
+
+        pending_format = _decode_export_state_from_query_params(
+            st.query_params.to_dict()
+        ).get("download_format")
+
+        if pending_format in format_keys:
+            st.session_state["download_format_choice"] = pending_format
+
     selected_format = st.radio(
         "İndirme formatı seçin",
         options=format_keys,
@@ -2273,6 +2367,119 @@ def render_download_section(
         horizontal=True,
         key="download_format_choice",
     )
+
+    # --------------------------------------------------------
+    # URL İLE PAYLAŞMA
+    # --------------------------------------------------------
+    #
+    # Butona basıldığında hem tarayıcı adres çubuğundaki URL
+    # (st.query_params ile) hem de tam, doğrudan kopyalanabilir bir
+    # bağlantı (aşağıdaki metin kutusu) güncellenir. Parametrelere
+    # "tab=export" eklenir; bu sayede bağlantı açıldığında uygulama
+    # otomatik olarak "Veri Gözat / Dışa Aktar" sekmesinde açılır
+    # (bkz. main() içindeki sekme seçim mantığı) ve filtreler
+    # render_data_export'taki "PAYLAŞILAN BAĞLANTIDAN GELEN FİLTRE
+    # DURUMU" bölümü sayesinde otomatik doldurulur -- alıcı hiçbir
+    # sekmeye tıklamak zorunda kalmadan filtrelenmiş veriyi görür.
+
+    with st.expander(
+        "🔗 Bu Filtreleri Bağlantı Olarak Paylaş",
+        expanded=False,
+    ):
+
+        st.caption(
+            "Aşağıdaki butona basınca, şu an seçili zaman aralığı, "
+            "uçuş/class/değer filtreleri, kolon seçimi ve indirme "
+            "formatını içeren tam bir bağlantı oluşturulur. Bu "
+            "bağlantıyı kopyalayıp paylaştığınızda, açan kişi doğrudan "
+            "\"Veri Gözat / Dışa Aktar\" sekmesinde, aynı filtrelerle "
+            "karşılaşır."
+        )
+
+        if st.button(
+            "🔗 Paylaşılabilir Bağlantı Oluştur",
+            key="build_export_share_link_btn",
+        ):
+
+            full_share_params = dict(share_params)
+            full_share_params["export_fmt"] = selected_format
+            full_share_params["tab"] = "export"
+
+            for existing_key in list(st.query_params.keys()):
+                if existing_key.startswith("export_") or existing_key == "tab":
+                    del st.query_params[existing_key]
+
+            st.query_params.update(full_share_params)
+
+            st.session_state["export_share_query_string"] = urlencode(
+                full_share_params
+            )
+
+        query_string = st.session_state.get("export_share_query_string")
+
+        if query_string:
+
+            st.success(
+                "Bağlantı hazır — aşağıdaki kutudaki tam URL'yi "
+                "kopyalayıp paylaşabilirsiniz."
+            )
+
+            # window.parent kullanılır çünkü components.html içeriği
+            # kendi (srcdoc) iframe'inde çalışır; window.location orada
+            # "about:srcdoc" döner, asıl sayfanın URL'i window.parent
+            # üzerinden okunur. Kopyalama, HTTPS olmayan ortamlarda
+            # (navigator.clipboard güvenli bağlam ister) çalışmayabilir
+            # diye document.execCommand("copy") ile yedeklenir.
+            components.html(
+                f"""
+                <div style="display:flex; gap:6px; font-family: inherit;">
+                  <input id="export_share_link_input" type="text" readonly
+                         style="flex:1; padding:8px; font-size:14px;
+                                border:1px solid #999; border-radius:4px;" />
+                  <button id="export_share_copy_btn"
+                          style="padding:8px 14px; font-size:14px;
+                                 border-radius:4px; border:1px solid #999;
+                                 cursor:pointer; white-space:nowrap;">
+                    📋 Kopyala
+                  </button>
+                </div>
+                <script>
+                  const input = document.getElementById(
+                    "export_share_link_input"
+                  );
+                  const btn = document.getElementById(
+                    "export_share_copy_btn"
+                  );
+                  const fullUrl = window.parent.location.origin
+                    + window.parent.location.pathname
+                    + "?{query_string}";
+                  input.value = fullUrl;
+
+                  btn.addEventListener("click", function () {{
+                    input.select();
+                    input.setSelectionRange(0, 999999);
+
+                    function fallbackCopy() {{
+                      try {{ document.execCommand("copy"); }} catch (e) {{}}
+                    }}
+
+                    if (navigator.clipboard && window.isSecureContext) {{
+                      navigator.clipboard.writeText(input.value)
+                        .catch(fallbackCopy);
+                    }} else {{
+                      fallbackCopy();
+                    }}
+
+                    const original = btn.innerText;
+                    btn.innerText = "✅ Kopyalandı";
+                    setTimeout(function () {{
+                      btn.innerText = original;
+                    }}, 1500);
+                  }});
+                </script>
+                """,
+                height=55,
+            )
 
     st.divider()
 
@@ -2549,6 +2756,192 @@ def _render_flight_individual_downloads(
             )
 
 
+# ============================================================
+# VERİ GÖZAT / DIŞA AKTAR — URL İLE PAYLAŞMA
+# ============================================================
+#
+# "Veri Gözat / Dışa Aktar" sekmesindeki filtre durumu (zaman aralığı,
+# uçuş/class/değer filtreleri, kolon seçimi) URL query parametrelerine
+# yazılıp geri okunabilir. Kullanıcı "🔗 Paylaşılabilir Bağlantı
+# Oluştur"a bastığında bu parametreler tarayıcı adres çubuğundaki
+# URL'ye yazılır (st.query_params ile); o URL kopyalanıp paylaşıldığında
+# ve açıldığında aynı filtreler otomatik olarak uygulanır.
+#
+# Operatörler URL'de "<", ">=" gibi özel karakterler yerine kısa kod
+# adlarıyla (lt, gte, ...) tutulur -- sorgu string'inde bu karakterler
+# çalışsa da (tarayıcı/streamlit yüzde-kodlaması yapar) okunabilirlik
+# ve olası ayrıştırma sorunlarını önlemek için kod adları tercih edildi.
+
+EXPORT_VALUE_FILTER_OP_CODES = {
+    "<": "lt",
+    "<=": "lte",
+    ">": "gt",
+    ">=": "gte",
+    "=": "eq",
+    "!=": "neq",
+    RANGE_FILTER_OPERATOR: "bt",
+}
+
+EXPORT_VALUE_FILTER_OP_CODES_REVERSE = {
+    code: op
+    for op, code in EXPORT_VALUE_FILTER_OP_CODES.items()
+}
+
+
+def _encode_export_state_to_query_params(
+    start_time,
+    end_time,
+    selected_flights,
+    selected_classes,
+    selected_columns,
+    value_filters,
+) -> dict:
+
+    params = {
+        "export_st": start_time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "export_et": end_time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    if selected_flights:
+        params["export_fl"] = ",".join(
+            str(flight) for flight in selected_flights
+        )
+
+    if selected_classes:
+        params["export_cl"] = ",".join(
+            str(cls) for cls in selected_classes
+        )
+
+    if selected_columns:
+        params["export_co"] = ",".join(
+            str(col) for col in selected_columns
+        )
+
+    if value_filters:
+
+        def _encode_value_filter(vf: dict) -> str:
+
+            chunk = (
+                f"{vf['column']}:"
+                f"{EXPORT_VALUE_FILTER_OP_CODES.get(vf['operator'], 'lt')}:"
+                f"{vf['value']}"
+            )
+
+            if vf["operator"] == RANGE_FILTER_OPERATOR:
+                chunk += f":{vf.get('value2', 0.0)}"
+
+            return chunk
+
+        params["export_vf"] = "|".join(
+            _encode_value_filter(vf) for vf in value_filters
+        )
+
+    return params
+
+
+def _decode_export_state_from_query_params(query_params: dict) -> dict:
+
+    state = {}
+
+    if "export_st" in query_params:
+
+        try:
+            state["start_time"] = datetime.strptime(
+                query_params["export_st"],
+                "%Y-%m-%dT%H:%M:%S",
+            )
+        except ValueError:
+            pass
+
+    if "export_et" in query_params:
+
+        try:
+            state["end_time"] = datetime.strptime(
+                query_params["export_et"],
+                "%Y-%m-%dT%H:%M:%S",
+            )
+        except ValueError:
+            pass
+
+    if "export_fl" in query_params:
+        state["selected_flights"] = [
+            flight
+            for flight in query_params["export_fl"].split(",")
+            if flight
+        ]
+
+    if "export_cl" in query_params:
+        state["selected_classes"] = [
+            cls
+            for cls in query_params["export_cl"].split(",")
+            if cls
+        ]
+
+    if "export_co" in query_params:
+        state["selected_columns"] = [
+            col
+            for col in query_params["export_co"].split(",")
+            if col
+        ]
+
+    if "export_fmt" in query_params:
+        state["download_format"] = query_params["export_fmt"]
+
+    if "export_vf" in query_params:
+
+        value_filters = []
+
+        for chunk in query_params["export_vf"].split("|"):
+
+            if not chunk:
+                continue
+
+            parts = chunk.split(":")
+
+            if len(parts) == 3:
+                column, op_code, raw_value = parts
+                raw_value2 = None
+            elif len(parts) == 4:
+                column, op_code, raw_value, raw_value2 = parts
+            else:
+                continue
+
+            operator = EXPORT_VALUE_FILTER_OP_CODES_REVERSE.get(
+                op_code
+            )
+
+            if operator is None:
+                continue
+
+            if operator == RANGE_FILTER_OPERATOR and raw_value2 is None:
+                continue
+
+            try:
+                value = float(raw_value)
+                value2 = (
+                    float(raw_value2)
+                    if raw_value2 is not None
+                    else None
+                )
+            except ValueError:
+                continue
+
+            decoded_filter = {
+                "column": column,
+                "operator": operator,
+                "value": value,
+            }
+
+            if value2 is not None:
+                decoded_filter["value2"] = value2
+
+            value_filters.append(decoded_filter)
+
+        state["value_filters"] = value_filters
+
+    return state
+
+
 def render_data_export():
 
     st.subheader(
@@ -2635,6 +3028,27 @@ def render_data_export():
     st.divider()
 
     # ==========================================================
+    # PAYLAŞILAN BAĞLANTIDAN GELEN FİLTRE DURUMU
+    # ==========================================================
+    #
+    # URL'de export_* query parametreleri varsa (bkz.
+    # _encode_export_state_to_query_params / "🔗 Bu Filtreleri Bağlantı
+    # Olarak Paylaş" bölümü) burada çözülür. Her widget kendi
+    # session_state key'ini oluşturmadan ÖNCE bu değerleri okuyup
+    # (ve mevcut seçeneklere göre süzüp) session_state'e yazar --
+    # aksi halde Streamlit widget'ları kendi varsayılanını kullanır.
+    #
+    # Bir widget key'i session_state'te zaten varsa (kullanıcı elle
+    # değiştirmiş ya da bu sekme bu oturumda daha önce render
+    # edilmişse) buradaki değerler UYGULANMAZ -- yoksa kullanıcı
+    # filtreyi değiştirdikten sonra her rerun'da URL'deki eski
+    # değere geri dönerdi.
+
+    pending_url_state = _decode_export_state_from_query_params(
+        st.query_params.to_dict()
+    )
+
+    # ==========================================================
     # ADIM 1 — FİLTRELE
     # ==========================================================
     #
@@ -2652,6 +3066,22 @@ def render_data_export():
         expanded=True,
     ):
 
+        if (
+            "export_start_time" not in st.session_state
+            and "start_time" in pending_url_state
+        ):
+            st.session_state["export_start_time"] = pending_url_state[
+                "start_time"
+            ]
+
+        if (
+            "export_end_time" not in st.session_state
+            and "end_time" in pending_url_state
+        ):
+            st.session_state["export_end_time"] = pending_url_state[
+                "end_time"
+            ]
+
         col1, col2 = st.columns(2)
 
         with col1:
@@ -2659,6 +3089,7 @@ def render_data_export():
             start_time = st.datetime_input(
                 "Başlangıç zamanı",
                 value=min_time,
+                key="export_start_time",
             )
 
         with col2:
@@ -2666,6 +3097,7 @@ def render_data_export():
             end_time = st.datetime_input(
                 "Bitiş zamanı",
                 value=max_time,
+                key="export_end_time",
             )
 
         # Uçuş seçimi (flight_id)
@@ -2684,6 +3116,16 @@ def render_data_export():
 
         if available_flights:
 
+            if (
+                "export_selected_flights" not in st.session_state
+                and "selected_flights" in pending_url_state
+            ):
+                st.session_state["export_selected_flights"] = [
+                    flight
+                    for flight in pending_url_state["selected_flights"]
+                    if flight in available_flights
+                ]
+
             selected_flights = st.multiselect(
                 "Uçuş(lar)",
                 options=available_flights,
@@ -2692,6 +3134,7 @@ def render_data_export():
                     "uçuş seçerseniz, aşağıdaki filtrelere uyan satırlar her "
                     "uçuş için ayrı ayrı CSV olarak indirilebilir."
                 ),
+                key="export_selected_flights",
             )
 
         else:
@@ -2718,18 +3161,31 @@ def render_data_export():
 
         if available_classes:
 
+            if (
+                "export_selected_classes" not in st.session_state
+                and "selected_classes" in pending_url_state
+            ):
+                st.session_state["export_selected_classes"] = [
+                    cls
+                    for cls in pending_url_state["selected_classes"]
+                    if cls in available_classes
+                ]
+
             selected_classes = st.multiselect(
                 "Class",
                 options=available_classes,
                 help="Boş bırakılırsa tüm class değerleri seçilir.",
+                key="export_selected_classes",
             )
 
         # Değer bazlı satır filtresi (örn. altitude < 23)
 
         st.caption(
             "Sayısal bir kolon için koşul tanımlayarak satır bazlı arama "
-            "yapabilirsiniz. Örn: `altitude < 23` gibi. Birden fazla "
-            "filtre eklenirse hepsi AND ile birleştirilir."
+            "yapabilirsiniz. Örn: `altitude < 23` gibi. \"aralıkta "
+            "(min–maks)\" operatörüyle iki değer arasındaki satırları da "
+            "filtreleyebilirsiniz (örn. `10 <= altitude <= 50`). Birden "
+            "fazla filtre eklenirse hepsi AND ile birleştirilir."
         )
 
         try:
@@ -2738,10 +3194,36 @@ def render_data_export():
             numeric_columns = []
 
         if "value_filters" not in st.session_state:
-            st.session_state["value_filters"] = []
 
-        if "value_filter_next_id" not in st.session_state:
-            st.session_state["value_filter_next_id"] = 0
+            restored_value_filters = []
+
+            for index, vf in enumerate(
+                pending_url_state.get("value_filters", [])
+            ):
+
+                valid_operator = (
+                    vf["operator"] in VALUE_FILTER_OPERATORS
+                    or vf["operator"] == RANGE_FILTER_OPERATOR
+                )
+
+                if vf["column"] in numeric_columns and valid_operator:
+
+                    restored_filter_row = {
+                        "id": index,
+                        "column": vf["column"],
+                        "operator": vf["operator"],
+                        "value": vf["value"],
+                    }
+
+                    if "value2" in vf:
+                        restored_filter_row["value2"] = vf["value2"]
+
+                    restored_value_filters.append(restored_filter_row)
+
+            st.session_state["value_filters"] = restored_value_filters
+            st.session_state["value_filter_next_id"] = len(
+                restored_value_filters
+            )
 
         if not numeric_columns:
 
@@ -2774,8 +3256,8 @@ def render_data_export():
 
                 row_id = filter_row["id"]
 
-                fcol1, fcol2, fcol3, fcol4 = st.columns(
-                    [3, 2, 3, 1]
+                fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(
+                    [2.5, 2, 2, 2, 1]
                 )
 
                 with fcol1:
@@ -2795,27 +3277,55 @@ def render_data_export():
 
                     operator_options = list(
                         VALUE_FILTER_OPERATORS.keys()
-                    )
+                    ) + [RANGE_FILTER_OPERATOR]
 
                     filter_row["operator"] = st.selectbox(
                         "Operatör",
                         options=operator_options,
                         index=operator_options.index(
                             filter_row["operator"]
+                        )
+                        if filter_row["operator"] in operator_options
+                        else 0,
+                        format_func=lambda op: (
+                            "aralıkta (min–maks)"
+                            if op == RANGE_FILTER_OPERATOR
+                            else op
                         ),
                         key=f"value_filter_operator_{row_id}",
                     )
 
+                is_range_filter = (
+                    filter_row["operator"] == RANGE_FILTER_OPERATOR
+                )
+
                 with fcol3:
 
                     filter_row["value"] = st.number_input(
-                        "Değer",
-                        value=float(filter_row["value"]),
+                        "Min" if is_range_filter else "Değer",
+                        value=float(filter_row.get("value", 0.0)),
                         key=f"value_filter_value_{row_id}",
                         format="%.4f",
                     )
 
                 with fcol4:
+
+                    if is_range_filter:
+
+                        filter_row["value2"] = st.number_input(
+                            "Maks",
+                            value=float(
+                                filter_row.get("value2", 0.0)
+                            ),
+                            key=f"value_filter_value2_{row_id}",
+                            format="%.4f",
+                        )
+
+                    else:
+
+                        filter_row.pop("value2", None)
+
+                with fcol5:
 
                     st.write("")
                     st.write("")
@@ -2825,6 +3335,20 @@ def render_data_export():
                         key=f"value_filter_remove_{row_id}",
                     ):
                         rows_to_remove.append(row_id)
+
+                # Maks < min olsa da sorgu hâlâ çalışır (build_clickhouse_where
+                # değerleri otomatik sıralar) ama kullanıcı muhtemelen yanlışlıkla
+                # ters girmiştir -- bu yüzden burada sadece bilgilendirici bir
+                # uyarı gösterilir, filtre engellenmez.
+                if (
+                    is_range_filter
+                    and filter_row.get("value2", 0.0) < filter_row.get("value", 0.0)
+                ):
+                    st.caption(
+                        "⚠️ Maks değeri min değerinden küçük — filtre yine "
+                        "de çalışır (değerler otomatik sıralanır), ancak "
+                        "girdiğiniz aralığı kontrol etmek isteyebilirsiniz."
+                    )
 
             if rows_to_remove:
 
@@ -2838,10 +3362,24 @@ def render_data_export():
 
             if st.session_state["value_filters"]:
 
+                def _format_value_filter(filter_row: dict) -> str:
+
+                    if filter_row["operator"] == RANGE_FILTER_OPERATOR:
+
+                        return (
+                            f"{filter_row['column']} aralıkta "
+                            f"[{filter_row['value']} , "
+                            f"{filter_row.get('value2', 0.0)}]"
+                        )
+
+                    return (
+                        f"{filter_row['column']} "
+                        f"{filter_row['operator']} "
+                        f"{filter_row['value']}"
+                    )
+
                 filter_summary = " AND ".join(
-                    f"{filter_row['column']} "
-                    f"{filter_row['operator']} "
-                    f"{filter_row['value']}"
+                    _format_value_filter(filter_row)
                     for filter_row in st.session_state["value_filters"]
                 )
 
@@ -2869,10 +3407,21 @@ def render_data_export():
             if column in available_columns
         ]
 
+        if (
+            "export_selected_columns" not in st.session_state
+            and "selected_columns" in pending_url_state
+        ):
+            st.session_state["export_selected_columns"] = [
+                col
+                for col in pending_url_state["selected_columns"]
+                if col in available_columns
+            ]
+
         selected_columns = st.multiselect(
             "Gösterilecek / dışa aktarılacak kolonlar",
             options=available_columns,
             default=default_columns,
+            key="export_selected_columns",
         )
 
         columns = (
@@ -2921,6 +3470,22 @@ def render_data_export():
     else:
         st.caption("🔎 Aktif filtre yok — tüm veri dahil edilecek.")
 
+    # Şu anki filtre durumu, URL query parametresi olarak kodlanır --
+    # kendisi burada bir UI göstermez, sadece hazırlanır. "🔗 Bu
+    # Filtreleri Bağlantı Olarak Paylaş" seçeneği "3️⃣ İndir" adımında,
+    # indirme formatı seçiminin hemen yanında gösterilir (bkz.
+    # render_download_section) -- bu sayede paylaşılan bağlantı, seçilen
+    # indirme formatını da (export_fmt) içerebilir.
+
+    share_params = _encode_export_state_to_query_params(
+        start_time=start_time,
+        end_time=end_time,
+        selected_flights=selected_flights,
+        selected_classes=selected_classes,
+        selected_columns=selected_columns,
+        value_filters=value_filters,
+    )
+
     # Filtreler, en son "Satır Sayısını Hesapla" / "Veriyi Getir ve
     # Önizle" ile hesaplanan sonuçtan farklıysa (kullanıcı bir filtreyi
     # tamamlayıp yeni bir filtrelemeye geçtiyse), aşağıda eski filtreye
@@ -2934,7 +3499,12 @@ def render_data_export():
         tuple(sorted(selected_flights)),
         tuple(columns) if columns else None,
         tuple(
-            (value_filter["column"], value_filter["operator"], value_filter["value"])
+            (
+                value_filter["column"],
+                value_filter["operator"],
+                value_filter["value"],
+                value_filter.get("value2"),
+            )
             for value_filter in value_filters
         ),
     )
@@ -3103,6 +3673,7 @@ def render_data_export():
             dataframe,
             start_time,
             end_time,
+            share_params,
         )
 
     except Exception as exc:
@@ -3137,8 +3708,13 @@ def main():
     )
 
     # ========================================================
-    # SIDEBAR
+    # SIDEBAR (sadece bağlantı bilgisi)
     # ========================================================
+    #
+    # Çalıştırma kontrolleri (run sayısı, otomatik yenileme, "Şimdi
+    # yenile") artık aşağıdaki yan sekme panelinde -- bkz. "SEKME
+    # SEÇİMİ + KONTROLLER". Sidebar sadece salt-okunur bağlantı
+    # bilgisini gösterir.
 
     with st.sidebar:
 
@@ -3166,6 +3742,66 @@ def main():
             f"{get_processed_files_glob()}"
         )
 
+    # ========================================================
+    # SEKME SEÇİMİ + KONTROLLER (yan panel)
+    # ========================================================
+    #
+    # st.radio/st.tabs yerine, ekranın solunda dikey sıralanmış
+    # butonlarla "sekme" görünümü oluşturulur -- her buton aktif
+    # sekmeyse "primary" (dolu/renkli), değilse "secondary"
+    # (outline) tipiyle çizilir. st.button, Streamlit'in iç DOM
+    # yapısı sürüm sürüm değişse de (bkz. dashboard/requirements.txt
+    # içindeki pinlenmiş streamlit==1.38.0) kararlı kalan, sade bir
+    # bileşen olduğu için CSS hack'i gerekmeden güvenilir biçimde
+    # "aktif/pasif" görünümü verir.
+    #
+    # URL'de tab=export ya da herhangi bir export_* parametresi
+    # varsa (paylaşılan bir bağlantı üzerinden açılmışsa), İLK
+    # render'da otomatik olarak "Veri Gözat / Dışa Aktar" sekmesi
+    # seçilir. session_state["active_main_tab"] zaten set edilmişse
+    # (kullanıcı elle başka bir sekmeye geçtiyse) bu değer
+    # UYGULANMAZ -- yoksa kullanıcı sekme değiştirdikten sonra her
+    # rerun'da (örn. otomatik yenileme) URL'deki sekmeye geri dönerdi.
+    #
+    # Run sayısı / otomatik yenileme / "Şimdi yenile" de aynı panelde
+    # -- bunlar runs_df'i (aşağıda) ve otomatik yenilemeyi etkilediği
+    # için değerleri (run_limit, refresh_seconds) content_col'daki
+    # sekme içerikleri render edilmeden ÖNCE burada okunmalı.
+
+    if "active_main_tab" not in st.session_state:
+
+        shared_query_params = st.query_params.to_dict()
+
+        if shared_query_params.get("tab") == "export" or any(
+            key.startswith("export_")
+            for key in shared_query_params
+        ):
+            st.session_state["active_main_tab"] = MAIN_TAB_EXPORT
+        else:
+            st.session_state["active_main_tab"] = MAIN_TAB_RUNS
+
+    nav_col, content_col = st.columns(
+        [1, 5],
+        gap="large",
+    )
+
+    with nav_col:
+
+        for tab_label in MAIN_TAB_LABELS:
+
+            is_active_tab = (
+                st.session_state["active_main_tab"] == tab_label
+            )
+
+            if st.button(
+                tab_label,
+                key=f"main_nav_btn_{tab_label}",
+                type="primary" if is_active_tab else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state["active_main_tab"] = tab_label
+                st.rerun()
+
         st.divider()
 
         run_limit = st.slider(
@@ -3191,7 +3827,8 @@ def main():
         )
 
         if st.button(
-            "Şimdi yenile"
+            "🔄 Şimdi yenile",
+            use_container_width=True,
         ):
 
             fetch_runs.clear()
@@ -3211,12 +3848,14 @@ def main():
             f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
         )
 
+    active_tab = st.session_state["active_main_tab"]
+
     # ========================================================
     # AUTO REFRESH
     # ========================================================
 
     # "Veri Gözat / Dışa Aktar" akışında otomatik yenileme, gerçek
-    # ortamda doğrulanmış iki ayrı şekilde export'u bozuyordu:
+    # ortamda doğrulanmış şekilde export'u bozuyordu:
     #
     #  1) Sadece interval değerini büyütmek (ör. 24 saate çekmek)
     #     YETERLİ DEĞİL — streamlit_autorefresh bileşeninin JS tarafı
@@ -3237,15 +3876,6 @@ def main():
     #     (~874k satırlık bir export ile: otomatik yenileme AÇIKKEN
     #     asla tamamlanmadı, bu düzeltmeyle ~20-30 saniyede sorunsuz
     #     tamamlandı.)
-    #
-    # st_autorefresh() çağrısını koşula bağlı olarak tamamen var/yok
-    # etmek (fonksiyonu hiç çağırmamak), st.tabs() öncesindeki eleman
-    # sırasını/sayısını değiştirip Streamlit'in dış sekmeleri (main()
-    # içindeki "Pipeline Metrikleri" vb.) yeniden takılmış gibi
-    # algılayıp seçili sekmeyi ilk sekmeye sıfırlamasına yol açıyordu.
-    # Bunu önlemek için sabit bir st.empty() placeholder HER ZAMAN aynı
-    # noktada oluşturulur — değişen şey, bu placeholder'ın İÇİNİN
-    # doldurulup doldurulmaması.
 
     export_in_progress = (
         st.session_state.get("export_row_count") is not None
@@ -3293,108 +3923,97 @@ def main():
         load_alerts()
     )
 
-    # ========================================================
-    # TABS
-    # ========================================================
+    with content_col:
 
-    tab_runs, tab_catalog, tab_alerts, tab_export = st.tabs(
-        [
-            "Pipeline Metrikleri",
-            "Katalog",
-            "🚨 Alertler",
-            "Veri Gözat / Dışa Aktar",
-        ]
-    )
+        # ========================================================
+        # PIPELINE METRİKLERİ
+        # ========================================================
 
-    # ========================================================
-    # PIPELINE METRİKLERİ
-    # ========================================================
+        if active_tab == MAIN_TAB_RUNS:
 
-    with tab_runs:
+            if not runs_df.empty:
 
-        if not runs_df.empty:
-
-            render_run_kpis(
-                runs_df
-            )
-
-            st.divider()
-
-            left, right = st.columns(
-                [1, 1]
-            )
-
-            with left:
-
-                st.subheader(
-                    "Durum Dağılımı"
-                )
-
-                render_status_chart(
+                render_run_kpis(
                     runs_df
                 )
 
-            with right:
+                st.divider()
 
-                st.subheader(
-                    "Son Run'lar"
+                left, right = st.columns(
+                    [1, 1]
                 )
 
-            render_run_table(
+                with left:
+
+                    st.subheader(
+                        "Durum Dağılımı"
+                    )
+
+                    render_status_chart(
+                        runs_df
+                    )
+
+                with right:
+
+                    st.subheader(
+                        "Son Run'lar"
+                    )
+
+                render_run_table(
+                    runs_df
+                )
+
+            else:
+
+                st.info(
+                    "Gösterilecek run bulunamadı."
+                )
+
+        # ========================================================
+        # KATALOG
+        # ========================================================
+
+        if active_tab == MAIN_TAB_CATALOG:
+
+            try:
+
+                catalog_df = (
+                    fetch_asset_catalog()
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    f"Katalog okunamadı: {exc}"
+                )
+
+            else:
+
+                render_catalog(
+                    catalog_df
+                )
+
+            st.divider()
+
+            render_metadata_history()
+
+        # ========================================================
+        # ALERTS
+        # ========================================================
+
+        if active_tab == MAIN_TAB_ALERTS:
+
+            render_alerts(
                 runs_df
             )
-            
-        else:
 
-            st.info(
-                "Gösterilecek run bulunamadı."
-            )
+        # ========================================================
+        # VERİ GÖZAT / EXPORT
+        # ========================================================
 
-    # ========================================================
-    # KATALOG
-    # ========================================================
+        if active_tab == MAIN_TAB_EXPORT:
 
-    with tab_catalog:
-
-        try:
-
-            catalog_df = (
-                fetch_asset_catalog()
-            )
-
-        except Exception as exc:
-
-            st.error(
-                f"Katalog okunamadı: {exc}"
-            )
-
-        else:
-
-            render_catalog(
-                catalog_df
-            )
-
-        st.divider()
-
-        render_metadata_history()
-
-    # ========================================================
-    # ALERTS
-    # ========================================================
-
-    with tab_alerts:
-    
-        render_alerts(
-            runs_df
-        )
-
-    # ========================================================
-    # VERİ GÖZAT / EXPORT
-    # ========================================================
-
-    with tab_export:
-
-        render_data_export()
+            render_data_export()
 
 
 # ============================================================

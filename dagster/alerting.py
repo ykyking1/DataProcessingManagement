@@ -169,6 +169,7 @@ def alert_on_failure(context: HookContext):
         "step_name": step_name,
         "error": error_text,
         "status": "FAILURE",
+        "run_id": context.run_id,
     }
 
     # -----------------------------------------------------------------------

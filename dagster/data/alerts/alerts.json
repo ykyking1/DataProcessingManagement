@@ -166,5 +166,22 @@
     "error": "Code: 210. Hedef makine etkin olarak reddettiğinden bağlantı kurulamadı (localhost:9000)",
     "status": "RESOLVED",
     "resolved_at": "2026-08-21T04:52:36.763372+00:00"
+  },
+  {
+    "timestamp": "2026-08-21T11:25:55.578363+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "Code: 210. Hedef makine etkin olarak reddettiğinden bağlantı kurulamadı (localhost:9000)",
+    "status": "RESOLVED",
+    "resolved_at": "2026-08-21T11:34:53.010525+00:00"
+  },
+  {
+    "timestamp": "2026-08-21T12:01:44.333775+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "Code: 210. Hedef makine etkin olarak reddettiğinden bağlantı kurulamadı (localhost:9000)",
+    "status": "RESOLVED",
+    "run_id": "f4f31d20-4b26-4036-ad78-4a7bfd7897e7",
+    "resolved_at": "2026-08-21T12:02:53.307790+00:00"
   }
 ]
