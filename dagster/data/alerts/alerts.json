@@ -4,7 +4,8 @@
     "job_name": "uav_data_pipeline_job",
     "step_name": "dvc_published_telemetry",
     "error": "Command '['C:\\\\Users\\\\PC_6276\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe', 'D:\\\\Haluk Yıldız\\\\DataProcessingManagement\\\\scripts\\\\publish_validated_data.py', '--data-path', 'D:\\\\Haluk Yıldız\\\\DataProcessingManagement\\\\dagster\\\\data\\\\processed', '--pipeline-version', 'unreleased-741b390', '--pipeline-git-sha', '741b390', '--raw-batches', '2026-08-07']' returned non-zero exit status 1.",
-    "status": "FAILURE",
-    "run_id": "fdd7cd80-c5a3-4368-91b8-5eb57d782f49"
+    "status": "RESOLVED",
+    "run_id": "fdd7cd80-c5a3-4368-91b8-5eb57d782f49",
+    "resolved_at": "2026-08-21T12:39:49.120798+00:00"
   }
 ]
