@@ -66,6 +66,8 @@ from urllib.parse import urlencode
 
 import clickhouse_connect
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import psycopg2
 import requests
 import streamlit as st
@@ -125,12 +127,14 @@ MAIN_TAB_RUNS = "Pipeline Metrikleri"
 MAIN_TAB_CATALOG = "Katalog"
 MAIN_TAB_ALERTS = "🚨 Alertler"
 MAIN_TAB_EXPORT = "Veri Gözat / Dışa Aktar"
+MAIN_TAB_FLIGHT_MAP = "🗺️ Uçuş Rotası"
 
 MAIN_TAB_LABELS = [
     MAIN_TAB_RUNS,
     MAIN_TAB_CATALOG,
     MAIN_TAB_ALERTS,
     MAIN_TAB_EXPORT,
+    MAIN_TAB_FLIGHT_MAP,
 ]
 
 # ============================================================
@@ -3692,6 +3696,289 @@ def render_data_export():
 
 
 # ============================================================
+# UÇUŞ ROTASI HARİTASI (Plotly)
+# ============================================================
+#
+# Seçilen tek bir uçuşun (flight_id) zaman sıralı lat/lon/altitude
+# noktalarını Plotly (Scattermapbox) ile haritada gösterir: rota
+# çizgisi, irtifaya göre sürekli bir renk skalasıyla renklendirilmiş
+# noktalar ve başlangıç/bitiş işaretçileri. mapbox_style="carto-darkmatter"
+# token gerektirmeyen bir açık kaynak harita stilidir.
+
+ALTITUDE_COLOR_SCALE = ["#2166ac", "#b2182b"]  # düşük (mavi) -> yüksek (kırmızı)
+
+START_POINT_COLOR = "rgb(26, 152, 80)"   # başlangıç -- yeşil
+END_POINT_COLOR = "rgb(215, 48, 39)"     # bitiş -- kırmızı
+
+
+def _format_duration(delta: pd.Timedelta) -> str:
+    """
+    pd.Timedelta'yı "1s 04dk 12sn" gibi okunabilir bir Türkçe metne
+    çevirir; saat 0 ise saat kısmı gösterilmez.
+    """
+
+    total_seconds = int(delta.total_seconds())
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}s {minutes:02d}dk {seconds:02d}sn"
+
+    if minutes:
+        return f"{minutes}dk {seconds:02d}sn"
+
+    return f"{seconds}sn"
+
+
+@st.cache_data(ttl=60)
+def fetch_flight_route(flight_id: str) -> pd.DataFrame:
+    """
+    Seçilen uçuşun zaman sıralı rota noktalarını (time, latitude,
+    longitude, altitude) döner. Sıralama fetch_filtered_telemetry
+    içinde "ORDER BY time" ile yapılır -- PathLayer'ın rotayı uçuşun
+    gerçek izlediği sırayla çizebilmesi için bu sıralama gereklidir.
+    """
+
+    return fetch_filtered_telemetry(
+        columns=["time", "latitude", "longitude", "altitude"],
+        selected_flights=[flight_id],
+    )
+
+
+def render_flight_map():
+
+    st.subheader(
+        "Uçuş Rotası"
+    )
+
+    st.caption(
+        "Seçilen uçuşun güzergahını, başlangıç/bitiş noktalarını ve "
+        "irtifaya göre renklendirilmiş rotasını haritada gösterir."
+    )
+
+    try:
+
+        check_clickhouse_connection()
+
+    except Exception as exc:
+
+        st.error(
+            f"ClickHouse'a bağlanılamadı: {exc}"
+        )
+
+        return
+
+    try:
+
+        available_flights = get_available_flights()
+
+    except Exception as exc:
+
+        st.error(
+            f"Uçuş listesi okunamadı: {exc}"
+        )
+
+        return
+
+    if not available_flights:
+
+        st.info(
+            "Tabloda 'flight_id' kolonu bulunamadı ya da hiç uçuş yok. "
+            "Pipeline en az bir kez çalıştıktan sonra burada uçuşlar "
+            "görünecektir."
+        )
+
+        return
+
+    no_selection = "— Uçuş seçin —"
+
+    selected_flight = st.selectbox(
+        "Uçuş ara / seç",
+        options=[no_selection] + available_flights,
+        index=0,
+        key="flight_map_selected_flight",
+        help=(
+            "Yazarak arayabilir, listeden bir uçuş (flight_id) "
+            "seçebilirsiniz."
+        ),
+    )
+
+    if selected_flight == no_selection:
+
+        st.info(
+            "Rotasını görmek istediğiniz uçuşu yukarıdan seçin."
+        )
+
+        return
+
+    try:
+
+        route_df = fetch_flight_route(
+            selected_flight
+        )
+
+    except Exception as exc:
+
+        st.error(
+            f"Rota verisi okunamadı: {exc}"
+        )
+
+        return
+
+    route_df = route_df.dropna(
+        subset=["latitude", "longitude", "altitude"]
+    )
+
+    if route_df.empty:
+
+        st.warning(
+            f"'{selected_flight}' için konum verisi bulunamadı."
+        )
+
+        return
+
+    min_altitude = float(
+        route_df["altitude"].min()
+    )
+    max_altitude = float(
+        route_df["altitude"].max()
+    )
+
+    start_row = route_df.iloc[0]
+    end_row = route_df.iloc[-1]
+
+    # Uçuş süresi: irtifanın 0 olduğu (yerde/kalkış-iniş anı) zaman
+    # noktalarının en erken ve en geç olanı arasındaki fark alınarak
+    # hesaplanır. İrtifası hiç 0 olmayan uçuşlarda (örn. yalnızca havada
+    # kayıt yapılmış veri) bu hesap yapılamaz.
+
+    zero_altitude_times = route_df.loc[
+        route_df["altitude"] == 0,
+        "time",
+    ]
+
+    if len(zero_altitude_times) >= 2:
+        flight_duration = _format_duration(
+            zero_altitude_times.max() - zero_altitude_times.min()
+        )
+    else:
+        flight_duration = "—"
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("Nokta sayısı", len(route_df))
+    metric_col2.metric("Min irtifa", f"{min_altitude:.1f}")
+    metric_col3.metric("Maks irtifa", f"{max_altitude:.1f}")
+    metric_col4.metric(
+        "Uçuş süresi",
+        flight_duration,
+        help=(
+            "İrtifanın 0 olduğu ilk ve son zaman arasındaki fark "
+            "(kalkış/iniş anları) baz alınarak hesaplanır."
+        ),
+    )
+
+    # px.scatter_mapbox, zoom/center verilmezse rota noktalarının
+    # kapladığı alana göre bunları otomatik hesaplar -- rota geniş bir
+    # alana yayılmış olsa bile harita her zaman tüm rotayı gösterecek
+    # şekilde açılır. Asıl figür go.Figure ile elle kurulur (px'in
+    # döndürdüğü figure.data'ya yeni trace atamak Plotly'de desteklenmiyor),
+    # bu yüzden burada sadece otomatik zoom/center değerleri alınır.
+
+    auto_view = px.scatter_mapbox(
+        route_df,
+        lat="latitude",
+        lon="longitude",
+    )
+
+    path_trace = go.Scattermapbox(
+        lat=route_df["latitude"],
+        lon=route_df["longitude"],
+        mode="lines",
+        line=dict(width=1.5, color="rgba(130, 130, 130, 0.6)"),
+        hoverinfo="skip",
+        showlegend=False,
+        name="Rota",
+    )
+
+    points_trace = go.Scattermapbox(
+        lat=route_df["latitude"],
+        lon=route_df["longitude"],
+        mode="markers",
+        marker=dict(
+            size=7,
+            color=route_df["altitude"],
+            colorscale=ALTITUDE_COLOR_SCALE,
+            cmin=min_altitude,
+            cmax=max_altitude,
+            colorbar=dict(title="İrtifa"),
+        ),
+        text=[
+            f"İrtifa: {alt:.1f}<br>Zaman: {time}"
+            for alt, time in zip(
+                route_df["altitude"],
+                route_df["time"].astype(str),
+            )
+        ],
+        hoverinfo="text",
+        showlegend=False,
+        name="Rota noktaları",
+    )
+
+    markers_trace = go.Scattermapbox(
+        lat=[start_row["latitude"], end_row["latitude"]],
+        lon=[start_row["longitude"], end_row["longitude"]],
+        mode="markers",
+        marker=dict(
+            size=16,
+            color=[START_POINT_COLOR, END_POINT_COLOR],
+        ),
+        text=[
+            f"Başlangıç (irtifa: {start_row['altitude']:.1f})",
+            f"Bitiş (irtifa: {end_row['altitude']:.1f})",
+        ],
+        hoverinfo="text",
+        showlegend=False,
+        name="Başlangıç/Bitiş",
+    )
+
+    # Rota çizgisi en altta, irtifa noktaları ortada, başlangıç/bitiş
+    # işaretçileri en üstte görünsün diye trace'ler bu sırayla eklenir.
+    fig = go.Figure(
+        data=[path_trace, points_trace, markers_trace]
+    )
+
+    fig.update_layout(
+        mapbox=dict(
+            style="carto-darkmatter",
+            center=auto_view.layout.mapbox.center,
+            zoom=auto_view.layout.mapbox.zoom,
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=600,
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+    )
+
+    legend_col1, legend_col2 = st.columns(2)
+
+    with legend_col1:
+
+        st.markdown(
+            "🟢 Başlangıç &nbsp;&nbsp; 🔴 Bitiş"
+        )
+
+    with legend_col2:
+
+        st.markdown(
+            "🔵 Düşük irtifa &nbsp;→&nbsp; 🔴 Yüksek irtifa"
+        )
+
+
+# ============================================================
 # ANA UYGULAMA
 # ============================================================
 
@@ -4014,6 +4301,14 @@ def main():
         if active_tab == MAIN_TAB_EXPORT:
 
             render_data_export()
+
+        # ========================================================
+        # UÇUŞ ROTASI HARİTASI
+        # ========================================================
+
+        if active_tab == MAIN_TAB_FLIGHT_MAP:
+
+            render_flight_map()
 
 
 # ============================================================

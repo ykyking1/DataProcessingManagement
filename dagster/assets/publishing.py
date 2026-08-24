@@ -6,6 +6,7 @@ from pathlib import Path
 from dagster import MaterializeResult, MetadataValue, asset
 
 from partitions import daily_partitions
+from metadata_store import record_asset_metadata
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -134,6 +135,21 @@ def dvc_published_telemetry(context, processed_telemetry):
         batch_id,
     )
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+
+    record_asset_metadata(
+        context,
+        group_name="publishing",
+        flight_id=None,
+        row_count=None,
+        metadata={
+            "partition": batch_id,
+            "data_path": str(PROCESSED_DATA_DIR),
+            "pipeline_version": pipeline_version,
+            "pipeline_git_sha": pipeline_git_sha,
+            "raw_batches": batch_id,
+            "git_commit_created": False,
+        },
+    )
 
     return MaterializeResult(
         metadata={

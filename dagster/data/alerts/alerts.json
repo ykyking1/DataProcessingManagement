@@ -7,5 +7,14 @@
     "status": "RESOLVED",
     "run_id": "fdd7cd80-c5a3-4368-91b8-5eb57d782f49",
     "resolved_at": "2026-08-21T12:39:49.120798+00:00"
+  },
+  {
+    "timestamp": "2026-08-21T14:03:48.231380+00:00",
+    "job_name": "uav_data_pipeline_job",
+    "step_name": "clickhouse_telemetry",
+    "error": "Code: 81.\nDB::Exception: Database default does not exist. Stack trace:\n\n0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x00000000165f672a\n1. DB::Exception::Exception(String&&, int, String, bool) @ 0x0000000010226112\n2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x0000000010225986\n3. DB::Exception::Exception<String>(int, FormatStringHelperImpl<std::type_identity<String>::type>, String&&) @ 0x00000000102255f6\n4. DB::DatabaseCatalog::assertDatabaseExists(String const&) const @ 0x000000001b3e00e0\n5. DB::TCPHandler::runImpl() @ 0x000000001d348ea2\n6. DB::TCPHandler::run() @ 0x000000001d374c64\n7. Poco::Net::TCPServerConnection::start() @ 0x00000000230940c7\n8. Poco::Net::TCPServerDispatcher::run() @ 0x00000000230945c2\n9. Poco::PooledThread::run() @ 0x000000002305651c\n10. Poco::ThreadImpl::runnableEntry(void*) @ 0x0000000023054a4f\n11. ? @ 0x0000000000094a83\n12. clone @ 0x0000000000125a44\n",
+    "status": "RESOLVED",
+    "run_id": "b25a3f66-1562-4b7f-b8f6-3c5489030fa3",
+    "resolved_at": "2026-08-21T14:06:05.793715+00:00"
   }
 ]
