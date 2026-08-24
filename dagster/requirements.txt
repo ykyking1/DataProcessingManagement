@@ -5,5 +5,7 @@ clickhouse-driver
 psycopg2-binary
 pandas
 pyarrow
+pyspark==4.1.1
+great_expectations==1.20.0
 requests
 python-dotenv
