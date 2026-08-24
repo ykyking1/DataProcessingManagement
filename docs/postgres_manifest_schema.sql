@@ -7,9 +7,17 @@ CREATE TABLE conversion_manifest (
     id                      BIGSERIAL PRIMARY KEY,
 
     -- Kaynak tanımlama / izlenebilirlik
-    tab_file_name           TEXT NOT NULL,
+    tab_file_name           TEXT NOT NULL,      -- temiz dosya adı (örn. "dataset_01.tab")
     ham_file_name           TEXT,               -- varsa, izlenebilirlik için
     flight_id               TEXT,               -- uçuş/görev kimliği (varsa)
+    aircraft_type            TEXT,               -- uçak tipi -- her tipte sütun sayısı
+                                                  -- farklı olabildiği için ÖNEMLİ,
+                                                  -- yeni veri üretilirken MUTLAKA doldurulmalı
+
+    -- Alt küme/test çalıştırması izlenebilirliği (tam dosya yerine
+    -- sadece bir kısmı işlendiyse)
+    is_subset                BOOLEAN NOT NULL DEFAULT FALSE,
+    subset_row_count         BIGINT,             -- is_subset=true ise kaç satır alındı
 
     -- Pipeline durumu
     status                  TEXT NOT NULL DEFAULT 'pending',
@@ -22,14 +30,37 @@ CREATE TABLE conversion_manifest (
     row_count_parquet       BIGINT,
     row_count_clickhouse    BIGINT,
 
+    -- Şema/sütun bilgisi
+    column_count              INT,
+    had_trailing_tab_issue    BOOLEAN,           -- temizleme sırasında fazladan
+                                                  -- tab bulunup düzeltildi mi
+
     -- İçerik doğrulama (byte checksum değil, sütun istatistik parmak izi)
     content_fingerprint     TEXT,               -- örn. sütun sum/min/max hash'i
 
-    -- MinIO konumu
+    -- MinIO konumu (ESKİ/parquet akışından kalma alanlar -- Bölüm 39
+    -- kararıyla parquet pipeline'dan çıkarıldı, şimdilik dokunulmadı,
+    -- ileride detaylıca gözden geçirilecek)
     parquet_object_key      TEXT,               -- MinIO'daki tam yol
     parquet_size_bytes      BIGINT,
 
-    -- ClickHouse yükleme durumu
+    -- MinIO konumu (GÜNCEL -- ham metin + sıkıştırma akışı, Bölüm 39)
+    tab_zst_object_key      TEXT,               -- MinIO'daki .tab.zst tam yolu
+    tab_zst_size_bytes      BIGINT,
+    original_size_bytes      BIGINT,             -- sıkıştırma öncesi ham .tab boyutu
+
+    -- Sıkıştırma bilgisi
+    compression_algorithm    TEXT,               -- 'zstd' | 'bz2'
+    compression_level        INT,
+
+    -- Süre/performans bilgisi -- pipeline sağlığını zamanla takip etmek için
+    compress_duration_seconds         DOUBLE PRECISION,
+    minio_upload_duration_seconds     DOUBLE PRECISION,
+    clickhouse_load_duration_seconds  DOUBLE PRECISION,
+
+    -- ClickHouse hedef bilgisi
+    clickhouse_table_name    TEXT,               -- hangi tabloya yüklendi
+    clickhouse_disk_bytes    BIGINT,             -- ClickHouse'daki nihai disk boyutu
     clickhouse_loaded_at    TIMESTAMPTZ,
 
     -- Hata takibi

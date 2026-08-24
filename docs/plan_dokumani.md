@@ -3014,3 +3014,169 @@ ayarları (N=2 optimal, `max_download_threads` vb.) da ~1.000 sütunluk
 ölçekte yapılmıştı -- gerçek 10.000+ sütunluk ölçekte bu ayarların
 hâlâ geçerli olup olmadığı doğrulanmadı, ileride tekrar test
 edilmeli.
+
+## 40. İlk uçtan uca pipeline denemesi -- gerçek şekilli veriyle (küçük ölçek), Postgres manifest devreye alındı
+
+Kullanıcı, artık sentetik "test dosyası" değil, gerçek şemaya sahip
+(`testdata/dataset_01.tab`, 300 float + 700 binary + timestamp,
+10,9GB) bir dosyayla TÜM pipeline'ı (temizleme -> sıkıştırma -> MinIO
+-> ClickHouse -> Postgres manifest) uçtan uca denemeyi istedi. Önce
+küçük bir alt kümeyle doğrulama yapıldı, tam dosya henüz denenmedi.
+
+**Ortam notu**: Docker Desktop oturum başında tamamen kapalıydı,
+yeniden başlatıldı; container'lar (`minio`, `clickhouse`, `t2p-cmp3`)
+korunmuş halde geri geldi.
+
+**Temizlik (kullanıcı isteğiyle, yer açmak için)**: önceki oturumlardan
+kalan büyük test dosyaları silindi -- container'da ~14GB
+(`mixed_wide_test.tab` ve türevleri, `bench_sample.*`), MinIO'da
+**~49GB** (`scale200/` ve `codec_test/` klasörlerindeki 210 adet eski
+parquet dosyası + eski `.tab.zst`/`.parquet` nesneleri). Eski
+ClickHouse test tabloları (`mixed_wide_test`, `mixed_wide_test_parquet_20k`)
+de silindi.
+
+**Yeni bileşen -- Postgres**: proje boyunca hiç kurulmamıştı, bu
+oturumda ilk kez `postgres:16` container'ı (`t2p-net` ağında, `t2p-pgdata`
+volume'ünde) ayağa kaldırıldı. `docs/postgres_manifest_schema.sql`
+şeması uygulandı; şemaya iki yeni alan eklendi (`tab_zst_object_key`,
+`tab_zst_size_bytes`) -- eski `parquet_object_key`/`parquet_size_bytes`
+alanları Bölüm 39 kararıyla artık kullanılmıyor ama şimdilik
+dokunulmadı (kullanıcı isteğiyle: "birkaç şey ekle, sonra detaylıca
+bakarız").
+
+**Kaynak veride bulunan ve düzeltilen sorun**: `dataset_01.tab`'ın
+HER satırının sonunda fazladan bir tab karakteri olduğu tespit edildi
+(`...b699\t\n`) -- bu, gerçek 1001 sütun yerine 1002 alan (biri boş
+"hayali sütun") sayılmasına yol açıyordu. Temizleme adımı bunu
+düzeltiyor (`rstrip` ile satır sonundaki fazla tab/satır sonu
+karakterleri siliniyor).
+
+**Küçük ölçekte uçtan uca test (ilk 2.000 satır)**:
+
+| Adım | Sonuç |
+|---|---|
+| Kaynak doğrulama | 1001 sütun (timestamp+300f+700b), 2.000 satır |
+| ZSTD(12) sıkıştırma | 9,08MB -> 3,34MB, 0,67sn, 2,72x oran |
+| MinIO'ya yükleme | 0,03sn |
+| ClickHouse tablo oluşturma | 1001 sütun (tümü Float64, güvenlik-önce yaklaşımı) |
+| ClickHouse yükleme (`s3()`) | 2.000 satır, 0,35sn |
+| Üç yönlü doğrulama | tab satır sayısı = ClickHouse satır sayısı (2.000=2.000) ✓ |
+| Postgres manifest kaydı | başarıyla eklendi, `status='done'` |
+
+**Tip kararı**: `b0`-`b699` sütunları şimdilik hepsi `Float64` olarak
+yüklendi (Bölüm 31.4'teki güvenlik uyarısı gereği -- gerçek değer
+aralığı henüz tek tek doğrulanmadı). `UInt8`+`T64` optimizasyonu,
+kullanıcının "sonra detaylıca bakarız" dediği ileriki adımda ele
+alınacak.
+
+**Sonuç: pipeline uçtan uca çalışıyor, doğrulandı.** Bir sonraki adım
+kullanıcı onayıyla `dataset_01.tab`'ın TAMAMIYLA (10,9GB) aynı
+pipeline'ı denemek.
+
+### 40.1 Postgres manifest -- tarayıcıdan erişim ve şema genişletmesi
+
+Kullanıcı Postgres'i tarayıcıdan kontrol etmek isteyince **Adminer**
+(hafif, tek-sayfalık web DB yöneticisi) `adminer` imajıyla ayağa
+kaldırıldı (`t2p-net` ağında, `localhost:8080`). Ayrıca Postgres
+container'ı başlangıçta host'a port açmadan kurulmuştu -- host'tan
+(GUI araçlarından) erişim için `-p 5432:5432` ile **volume korunarak**
+yeniden oluşturuldu (veri kaybı olmadı, doğrulandı).
+
+**Şema genişletmesi**: kullanıcı "Show structure" görünümündeki
+`NULL`/varsayılan değerleri gerçek veri sanıp kafası karıştı --
+bunun şema tanımı olduğu, gerçek kayıtların "Select data" sekmesinde
+olduğu açıklandı. Ardından kullanıcı önerilen tüm yeni alanların
+eklenmesini istedi. `conversion_manifest` tablosuna **13 yeni alan**
+eklendi (`ALTER TABLE`, mevcut veri korunarak):
+
+- **Sıkıştırma**: `compression_algorithm`, `compression_level`, `original_size_bytes`
+- **Şema/sütun**: `column_count`, `aircraft_type`, `had_trailing_tab_issue`
+- **Süre/performans**: `compress_duration_seconds`, `minio_upload_duration_seconds`, `clickhouse_load_duration_seconds`
+- **ClickHouse hedefi**: `clickhouse_table_name`, `clickhouse_disk_bytes`
+- **İzlenebilirlik düzeltmesi**: `is_subset`, `subset_row_count` (önceden `tab_file_name`
+  alanına "ilk 2000 satırlık test alt kümesi" gibi açıklama sıkıştırılmıştı,
+  bu artık ayrı/temiz alanlara taşındı -- `tab_file_name` artık sade dosya adı)
+
+`docs/postgres_manifest_schema.sql` güncellendi, pipeline scripti
+(`scripts/pipeline_tab_to_clickhouse.py`) tüm yeni alanları doldurup
+tekrar çalıştırıldı -- tüm alanlar doğru doluyor, doğrulandı.
+
+**ÖNEMLİ KURAL (kullanıcı talebiyle) -- bundan sonra yeni veri/pipeline
+çalıştırmalarında `aircraft_type` MUTLAKA doldurulmalı** (farklı uçak
+tiplerinde sütun sayısı değişebiliyor, bu alan olmadan hangi kaydın
+hangi şemaya ait olduğu izlenemez). Şu anki `dataset_01.tab` sentetik
+bir dosya olduğu için (gerçek uçak tipi bilgisi yok, repo'da da böyle
+bir kayıt bulunamadı) `aircraft_type` bilinçli olarak `NULL` bırakıldı
+-- uydurulmadı. Gerçek üretim verisiyle çalışılmaya başlanınca bu alan
+zorunlu tutulmalı.
+
+**Kalıcı script'ler repoya kaydedildi**:
+- `scripts/pipeline_tab_to_clickhouse.py` -- tam pipeline (temizle
+  [şu an ayrı adımda] -> sıkıştır -> MinIO -> ClickHouse -> Postgres
+  manifest). Şu an `dataset_01.tab`'ın 2.000 satırlık alt kümesine göre
+  sabit değerlerle yazılı -- tam dosyayla çalıştırmadan önce
+  parametrize edilmesi gerekiyor.
+- `scripts/clean_tab_trailing_tab.py` -- temizleme adımı (fazladan
+  satır-sonu tab'ını siler), tüm dosya ya da alt küme için kullanılabilir.
+
+## 41. 5 sütun-sayısı x 4 satır-sayısı sentetik test grid'i (20 dosya) -- gerçek 10.000+ sütun ölçeğinde testler için
+
+Kullanıcı, Bölüm 39/40'ta tespit edilen "sıkıştırma/eşzamanlılık
+kararları hâlâ ~1.000 sütun ölçeğinde, 10.000+ ölçekte doğrulanmadı"
+açık maddesini kapatmak için bir test grid'i istedi: **5 sütun-sayısı
+tier'i (10k/20k/30k/40k/50k VERİ sütunu) x 4 satır sayısı (1k/5k/50k/
+100k) = 20 dosya**.
+
+**Sütun tasarımı** (her tier için N = veri sütunu sayısı):
+- `timestamp` + `aircraft_type` -- EK olarak en başta (N'e dahil değil)
+- %10 float64 -- HER ZAMAN N'in en başında, sıralı (f0, f1, ...)
+- %10 karışık 0/1, %40 sabit-sıfır, %40 sabit-bir -- bu üçü BİRLİKTE
+  rastgele karıştırılıyor (float'larla değil, sadece kendi aralarında)
+
+**5 "uçak tipi"** sütun sayısına göre tanımlandı: `AIRCRAFT_10K`,
+`AIRCRAFT_20K`, `AIRCRAFT_30K`, `AIRCRAFT_40K`, `AIRCRAFT_50K`.
+
+**Verimlilik iyileştirmesi**: önceki generator'da (Bölüm 36) binary
+sütunlar ayrı ayrı DataFrame'ler halinde üretilip sonra TÜM sütun
+setine (float dahil) `reindex` uygulanıyordu. Bu sefer float'lar
+sabit sırada tutulduğu için sadece binary blok, doğrudan hedef
+(karıştırılmış) sırada bir numpy array'e yazılıp (`binary_arr[:,
+one_positions]=1` gibi konum-bazlı atamalarla) tek adımda
+oluşturuldu -- ayrı reindex adımına hiç gerek kalmadı.
+
+**Sonuçlar (dosya boyutu/süre, satır sayısına göre artan)**:
+
+| Tier | 1k satır | 5k satır | 50k satır | 100k satır | Tier toplam |
+|---|---|---|---|---|---|
+| 10k sütun | 1,7sn | 8,9sn | 93,1sn | 185,1sn | 4,16GB / 4,8dk |
+| 20k sütun | 5,5sn | 27,5sn | 279,7sn | 561,7sn | 8,32GB / 14,6dk |
+| 30k sütun | 10,1sn | 48,1sn | 486,2sn | 956,4sn | 12,48GB / 25,0dk |
+| 40k sütun | 16,8sn | 83,9sn | 850,9sn | 1.736,3sn | 16,64GB / 44,8dk |
+| 50k sütun | 38,3sn | 192,0sn | 1.889,1sn | 3.707,2sn (61,8dk) | 20,80GB / 61,8dk |
+
+**Bulgu -- süre sütun sayısıyla DOĞRUSALDAN biraz daha hızlı artıyor**:
+10k->20k (2x sütun) süreyi ~3x artırdı; 40k->50k (1,25x sütun) süreyi
+de (son dosya artık tamamlandığı için kesinleşti) benzer bir oranda
+artırdı. Muhtemel sebep: pandas'ın büyük DataFrame birleştirme
+(`concat`)/CSV yazma maliyeti sütun sayısıyla tam doğrusal değil.
+
+**TAMAMLANDI (2. oturumda)**: kullanıcı bilgisayarı kapattıktan sonra
+geri dönüldü, ortam (Docker Desktop + 5 container) yeniden ayağa
+kaldırıldı, hepsi sorunsuz döndü. Yarım kalan `synthetic_50k_100000.tab`
+(kesilme anında 3,69GB'taydı) ve eşlik eden `_columns.json` silinip
+üretici script (artık idempotent -- var olan dosyaları atlıyor)
+yeniden çalıştırıldı. Sonuç: **son dosya 100.000 satır, 50.002 sütun,
+13,333GB, 3.707,2sn (61,8dk) sürede tamamlandı** -- diğer 19 dosya
+otomatik atlandı (`[atlanildi, zaten var]`), yeniden üretilmedi.
+
+**20/20 dosya TAMAMLANDI, toplam 62,40GB, `/work/synthetic_grid/`
+altında kalıcı olarak duruyor.** Üretici script kalıcı olarak
+`scripts/gen_synthetic_grid.py`'e kaydedildi (idempotent hale
+getirildi -- tekrar çalıştırılırsa sadece eksik dosyaları üretir).
+
+**Henüz yapılmadı**: bu 20 dosyanın pipeline'dan (temizle->sıkıştır->
+MinIO->ClickHouse->Postgres) geçirilmesi -- sadece ham `.tab` üretimi
+tamamlandı. Sıkıştırma/eşzamanlılık testleri bu dosyalarla henüz
+YAPILMADI, bu hâlâ açık bir takip maddesi -- Bölüm 39'daki "sıkıştırma
+kararı ve worker/thread ayarları 10.000+ sütun ölçeğinde doğrulanmadı"
+açık maddesini kapatmak için asıl amaç buydu.
