@@ -18,10 +18,7 @@ load_dotenv(
     Path(__file__).resolve().parent / ".env"
 )
 
-from assets import ingestion
-from assets import processing
-from assets import clickhouse
-from assets import publishing
+import assets
 
 from schedules.telemetry_sensor import telemetry_sensor
 
@@ -33,14 +30,7 @@ from alerting import alert_on_failure, clear_alert_on_success
 # ASSETS
 # ===========================================================================
 
-all_assets = load_assets_from_modules(
-    [
-        ingestion,
-        processing,
-        clickhouse,
-        publishing,
-    ]
-)
+all_assets = load_assets_from_modules([assets])
 
 
 # ===========================================================================

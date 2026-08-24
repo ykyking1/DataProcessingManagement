@@ -1121,7 +1121,15 @@ def fetch_metadata_history(
             params.append(list(assets))
 
         if flights:
-            clauses.append("flight_id = ANY(%s)")
+            # flight_id = ANY(...) yerine OR flight_id IS NULL de eklenir:
+            # dvc_published_telemetry gibi belirli bir uçuşa değil, tüm
+            # partition'a ait asset'ler flight_id=NULL ile kaydediliyor
+            # (bkz. dagster/assets/publishing.py). Sadece ANY(...) ile
+            # filtrelenseydi, bir uçuş seçildiğinde bu tür asset'ler
+            # sonuçlardan tamamen kaybolurdu.
+            clauses.append(
+                "(flight_id = ANY(%s) OR flight_id IS NULL)"
+            )
             params.append(list(flights))
 
         if start_date:
@@ -4226,25 +4234,19 @@ def main():
 
                 st.divider()
 
-                left, right = st.columns(
-                    [1, 1]
+                st.subheader(
+                    "Durum Dağılımı"
                 )
 
-                with left:
+                render_status_chart(
+                    runs_df
+                )
 
-                    st.subheader(
-                        "Durum Dağılımı"
-                    )
+                st.divider()
 
-                    render_status_chart(
-                        runs_df
-                    )
-
-                with right:
-
-                    st.subheader(
-                        "Son Run'lar"
-                    )
+                st.subheader(
+                    "Son Run'lar"
+                )
 
                 render_run_table(
                     runs_df
