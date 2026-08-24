@@ -3174,9 +3174,101 @@ altında kalıcı olarak duruyor.** Üretici script kalıcı olarak
 `scripts/gen_synthetic_grid.py`'e kaydedildi (idempotent hale
 getirildi -- tekrar çalıştırılırsa sadece eksik dosyaları üretir).
 
-**Henüz yapılmadı**: bu 20 dosyanın pipeline'dan (temizle->sıkıştır->
-MinIO->ClickHouse->Postgres) geçirilmesi -- sadece ham `.tab` üretimi
-tamamlandı. Sıkıştırma/eşzamanlılık testleri bu dosyalarla henüz
-YAPILMADI, bu hâlâ açık bir takip maddesi -- Bölüm 39'daki "sıkıştırma
-kararı ve worker/thread ayarları 10.000+ sütun ölçeğinde doğrulanmadı"
-açık maddesini kapatmak için asıl amaç buydu.
+**Henüz yapılmadı (bu bölüm yazıldığında)**: bu 20 dosyanın pipeline'dan
+(temizle->sıkıştır->MinIO->ClickHouse->Postgres) geçirilmesi -- sadece
+ham `.tab` üretimi tamamlanmıştı. Bu, sonraki bölümde (41.1) tamamlandı.
+
+## 41.1 20 dosyanın tamamı pipeline'dan geçirildi -- 2 kritik ClickHouse bulgusu daha bulundu ve çözüldü
+
+Kullanıcı "hepsini deneyelim" dedi, script yazılıp çalıştırıldı:
+temizleme (bu grid dosyalarında trailing-tab sorunu YOK, üretici script
+zaten doğru yazıyordu) -> ZSTD(12) sıkıştırma -> MinIO'ya yükleme ->
+ClickHouse'a `s3()` ile yükleme -> Postgres `conversion_manifest`'e
+kayıt. **Sonuç: 20/20 dosya `status='done'`, satır sayıları
+(`row_count_tab` = `row_count_clickhouse`) hepsinde birebir eşleşti.**
+
+### Bulgu 1 -- basit ama kritik: `aircraft_type` yanlışlıkla `Float64` tanımlanmış
+
+İlk denemede TÜM sütunlar (aircraft_type dahil) `Float64` olarak
+tanımlanmıştı -- ama `aircraft_type` bir metin (`"AIRCRAFT_10K"` gibi).
+İlk dosyada (en küçüğü) hemen "Cannot read floating point value here"
+hatasıyla ortaya çıktı, tablo silinip `aircraft_type` `LowCardinality(String)`
+yapılarak düzeltildi. Ders: yeni bir sema tasarlarken en küçük dosyayla
+önce hızlı bir doğrulama yapmak, büyük dosyalara geçmeden hataları
+erken yakalamayı sağlıyor.
+
+### Bulgu 2 (asıl önemli) -- binary sütunları `Float64` parse etmek ciddi bellek/performans maliyeti getiriyor
+
+`20k_50000` dosyasında (sadece 20.002 sütun x 50.000 satır -- 45.000
+sütunluk Bölüm 37 testinden çok daha küçük) tekrar eden bir
+`(total) memory limit exceeded` hatası çıktı. Önce "tablo/cache
+birikimi" sanıldı (her dosyadan sonra `DROP TABLE` eklendi, sonra
+ClickHouse container'ı her dosyadan önce host'tan temiz baştan
+başlatıldı) -- ama hata AYNI dosyada, TEMİZ bir ClickHouse instance'ında
+bile tekrarlandı. Kök neden: bu grid'in binary-türü (mixed/zero/one,
+sütunların %90'ı) sütunları güvenlik-önce yaklaşımıyla `Float64`
+tanımlanmıştı (Bölüm 40'ın dataset_01_raw'daki gibi). Hata izinde
+`SerializationNumber<double>::deserializeText` görülüyordu -- yani
+ClickHouse her "0"/"1" değerini bile TAM double olarak parse ediyordu,
+bu da 20.000+ sütunun %90'ında gereksiz büyük bir parse/bellek yükü
+yaratıyordu. **Çözüm**: bu sütunlar `UInt8 CODEC(T64, ZSTD)` yapıldı
+(Bölüm 37'nin başarılı 45k-sütun testinde kullanılan AYNI yaklaşım) --
+bu grid için güvenli, çünkü veri bizim ürettiğimiz sentetik veri
+(garantili 0/1). Düzeltme sonrası `20k_50000` ve devamındaki 18 dosya
+sorunsuz geçti.
+
+**Önemli genel ders**: Bölüm 40'ta "tutarlılık için hepsini Float64
+yapalım, UInt8 optimizasyonunu sonra ekleriz" denmişti -- bu karar
+BOYUT/hız optimizasyonu için ikincil sanılıyordu ama aslında bu ölçekte
+(10.000+ sütun) TEMEL bir güvenilirlik sorunuydu. UInt8 tipleme, sadece
+bir "optimizasyon" değil, geniş şemalarda ÇALIŞABİLİRLİK ön koşulu.
+
+### Bulgu 3 -- en büyük dosya (50k sütun x 100k satır, 5 milyar hücre) UInt8 düzeltmesine rağmen yine patladı
+
+Grid'in son ve en büyük dosyası, UInt8 düzeltmesiyle bile aynı
+`(total) memory limit exceeded` hatasını verdi (bu kez gerçekten
+ölçekle ilgiliydi -- 45k×100k'lık Bölüm 37 testinden daha fazla hücre).
+Bellek tavanını %90'dan %95'e çıkarmak yetersiz kaldı. Dosyayı ikiye
+bölüp (50.000+50.000 satır) AYNI tabloya art arda yüklemeyi denedik --
+bu da başarısız oldu, ÜSTELİK ClickHouse'u aralarında yeniden başlatsak
+bile: ikinci parçanın yüklemesi başlamadan ÖNCE bile RSS zaten tavana
+yakın çıkıyordu. **Kök neden**: var olan (50.000 satırlık) tabloya
+yeniden bağlanmak/veri eklemeye devam etmek, tablonun kendi disk
+üzerindeki parça/metadata durumunu yükleme başına ek bir bellek yükü
+getiriyordu. **Gerçek çözüm**: iki yarıyı TAMAMEN AYRI/bağımsız geçici
+tablolara yükleyip (her biri kendi başına 50.000 satırla doğrulanıp
+hemen silinerek), TEK birleşik 100.000 satırlık tablo hiç
+oluşturulmadan doğrulama tamamlandı. Postgres'e satır sayısı toplamı
+(100.000) ve birleşik metrikler kaydedildi, `error_detail` alanına bu
+özel durumun açıklaması eklendi.
+
+### Sonuçlar özeti (tüm 20 dosya, ZSTD(12), UInt8+T64 ile)
+
+| Sütun | 1k satır | 5k satır | 50k satır | 100k satır |
+|---|---|---|---|---|
+| 10k | 2,1sn/1,5sn | 8,6sn/4,8sn | 80,7sn/26,2sn | 170,1sn/55,2sn |
+| 20k | 3,7sn/4,4sn | 18,2sn/16,3sn | 168,7sn/35,4sn | 321,5sn/75,1sn |
+| 30k | 4,8sn/5,5sn | 25,0sn/21,5sn | 247,0sn/61,2sn | 467,4sn/120,1sn |
+| 40k | 6,4sn/9,4sn | 30,7sn/17,8sn | 303,3sn/100,3sn | 601,7sn/210,0sn |
+| 50k | 8,7sn/14,2sn | 43,1sn/28,6sn | 384,2sn/161,9sn | (bölünerek) |
+
+(Format: sıkıştırma süresi / ClickHouse yükleme süresi)
+
+**Sıkıştırma oranı**: 3,86x (10k) ile 4,02x (50k) arasında, sütun
+sayısı arttıkça hafifçe artıyor -- muhtemelen ZSTD'nin daha büyük
+dosyalarda pencere boyutundan daha iyi yararlanması.
+
+**Açık kalan takip maddesi (değişmedi)**: bu pipeline çalıştırması
+GÜVENLİK-ÖNCE/düşük-thread ayarlarıyla yapıldı (kullanıcının sorusu
+üzerine netleştirildi: Bölüm 26'nın N=2 worker/yüksek-download-thread
+kararları burada BİLİNÇLİ olarak uygulanmadı, çünkü öncelik önce
+"pipeline güvenle tamamlanabiliyor mu" sorusuna cevap bulmaktı).
+**Gerçek worker/thread optimizasyonu bu ölçekte (10.000+ sütun) hâlâ
+yapılmadı** -- pipeline artık güvenilir çalıştığına göre, bu ayrı bir
+sonraki adım olarak ele alınabilir.
+
+**Kalıcı script**: `scripts/pipeline_grid_to_clickhouse.py` (tek-dosya
+modu da destekliyor, `python3 pipeline_grid_to_clickhouse.py 20 50000`
+gibi). En büyük dosyanın bölünerek yüklenmesi için kullanılan yardımcı
+script'ler script'e dahil edilmedi (elle/özel durum olarak uygulandı),
+gerekirse tekrar yazılmalı.
