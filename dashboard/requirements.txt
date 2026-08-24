@@ -6,4 +6,5 @@ pyarrow==17.0.0
 clickhouse-connect==1.7.1
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
-plotly==5.22.0
+folium==0.17.0
+streamlit-folium==0.23.1

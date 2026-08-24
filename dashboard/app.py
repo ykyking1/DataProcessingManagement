@@ -49,6 +49,8 @@ Dashboard bölümleri:
        - ClickHouse bağlantısı
        - Time filtresi
        - Class filtresi
+       - Alan (harita) bazlı filtre -- haritada çizilen alanda uçmuş
+         satırları filtreler (pointInPolygon)
        - Değer bazlı satır filtresi (örn. altitude < 23)
        - Kolon seçimi
        - Satır sayısı
@@ -65,15 +67,16 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import clickhouse_connect
+import folium
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import psycopg2
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from folium.plugins import Draw
 from streamlit_autorefresh import st_autorefresh
+from streamlit_folium import st_folium
 
 
 # ============================================================
@@ -581,6 +584,39 @@ def get_time_range():
     return min_time, max_time
 
 
+@st.cache_data(ttl=60)
+def get_lat_lon_bounds():
+    """
+    latitude/longitude kolonlarının min/maks değerlerini döner --
+    alan seçim haritasının (render_data_export içindeki "🗺️ Alan
+    Bazlı Filtre") başlangıç merkezi/yakınlaştırması, verinin
+    kapladığı bölgeye göre ayarlanabilsin diye kullanılır. Kolonlar
+    tabloda yoksa (None, None, None, None) döner.
+    """
+
+    columns = get_available_columns()
+
+    if "latitude" not in columns or "longitude" not in columns:
+        return None, None, None, None
+
+    client = get_clickhouse_client()
+
+    query = f"""
+    SELECT
+        min(latitude), max(latitude),
+        min(longitude), max(longitude)
+    FROM {get_clickhouse_source()}
+    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+    """
+
+    result = client.query(query)
+
+    if not result.result_rows:
+        return None, None, None, None
+
+    return result.result_rows[0]
+
+
 # ============================================================
 # CLICKHOUSE WHERE OLUŞTURMA
 # ============================================================
@@ -608,6 +644,7 @@ def build_clickhouse_where(
     selected_classes=None,
     value_filters=None,
     selected_flights=None,
+    area_polygons=None,
 ):
     """
     value_filters: [{"column": "altitude", "operator": "<", "value": 23}, ...]
@@ -615,6 +652,16 @@ def build_clickhouse_where(
     {"column": "altitude", "operator": "between", "value": 10, "value2": 50}
     -> "altitude BETWEEN 10 AND 50".
     selected_flights: ["flight_1", "flight_2", ...] -> flight_id IN (...)
+    area_polygons: [[(lon1, lat1), (lon2, lat2), ...], ...] -- haritada
+    çizilen bir ya da birden fazla alanın köşe noktaları (her poligon en
+    az 3 nokta). ClickHouse'un pointInPolygon fonksiyonuyla, bu
+    poligonlardan HERHANGİ BİRİNİN içinde kalan (longitude, latitude)
+    satırları eşleştirilir (poligonlar OR ile birleştirilir; yani "bölge
+    A veya bölge B"). Her poligonun nokta listesi, clickhouse_connect'in
+    parametre bağlamada (client-side) doğrudan desteklemediği
+    Tuple(...) tipinden kaçınmak için iki ayrı Array(Float64) (boylam/
+    enlem) parametresi olarak gönderilir ve sorgu içinde arrayZip ile
+    Array(Tuple(...))'a dönüştürülür.
 
     Her filtre AND ile birleştirilir (örn. "altitude < 23 AND box_w >= 50").
     Kolon adı ve operatör beyaz listeye (whitelist) karşı doğrulanır,
@@ -662,6 +709,51 @@ def build_clickhouse_where(
             str(x)
             for x in selected_flights
         ]
+
+    valid_area_polygons = [
+        polygon
+        for polygon in (area_polygons or [])
+        if polygon and len(polygon) >= 3
+    ]
+
+    if valid_area_polygons:
+
+        available_columns = set(
+            get_available_columns()
+        )
+
+        if (
+            "latitude" in available_columns
+            and "longitude" in available_columns
+        ):
+
+            area_conditions = []
+
+            for index, polygon in enumerate(valid_area_polygons):
+
+                lon_param = f"area_lons_{index}"
+                lat_param = f"area_lats_{index}"
+
+                area_conditions.append(
+                    "pointInPolygon((longitude, latitude), "
+                    f"arrayZip({{{lon_param}:Array(Float64)}}, "
+                    f"{{{lat_param}:Array(Float64)}}))"
+                )
+
+                parameters[lon_param] = [
+                    float(lon) for lon, lat in polygon
+                ]
+                parameters[lat_param] = [
+                    float(lat) for lon, lat in polygon
+                ]
+
+            # Birden fazla poligon OR ile birleştirilir (bölge A veya
+            # bölge B içinde kalan satırlar eşleşir); tüm poligon
+            # koşulları da tek bir AND'lenebilir grup olması için
+            # parantez içine alınır.
+            conditions.append(
+                "(" + " OR ".join(area_conditions) + ")"
+            )
 
     if value_filters:
 
@@ -735,6 +827,7 @@ def count_filtered_rows(
     selected_classes=None,
     value_filters=None,
     selected_flights=None,
+    area_polygons=None,
 ):
 
     client = get_clickhouse_client()
@@ -745,6 +838,7 @@ def count_filtered_rows(
         selected_classes,
         value_filters,
         selected_flights,
+        area_polygons,
     )
 
     query = f"""
@@ -776,6 +870,7 @@ def fetch_filtered_telemetry(
     columns=None,
     value_filters=None,
     selected_flights=None,
+    area_polygons=None,
 ):
 
     client = get_clickhouse_client()
@@ -786,6 +881,7 @@ def fetch_filtered_telemetry(
         selected_classes,
         value_filters,
         selected_flights,
+        area_polygons,
     )
 
     if columns:
@@ -2807,6 +2903,7 @@ def _encode_export_state_to_query_params(
     selected_classes,
     selected_columns,
     value_filters,
+    area_polygons=None,
 ) -> dict:
 
     params = {
@@ -2846,6 +2943,19 @@ def _encode_export_state_to_query_params(
 
         params["export_vf"] = "|".join(
             _encode_value_filter(vf) for vf in value_filters
+        )
+
+    if area_polygons:
+
+        # Poligonlar "|" ile, her poligonun köşeleri ";" ile, her
+        # köşenin boylam/enlemi "," ile ayrılır -- 6 ondalık basamak
+        # (~11 cm hassasiyet) URL'yi gereksiz uzatmadan yeterli.
+        params["export_ap"] = "|".join(
+            ";".join(
+                f"{lon:.6f},{lat:.6f}"
+                for lon, lat in polygon
+            )
+            for polygon in area_polygons
         )
 
     return params
@@ -2950,6 +3060,38 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
             value_filters.append(decoded_filter)
 
         state["value_filters"] = value_filters
+
+    if "export_ap" in query_params:
+
+        area_polygons = []
+
+        for polygon_chunk in query_params["export_ap"].split("|"):
+
+            if not polygon_chunk:
+                continue
+
+            polygon = []
+
+            for point_chunk in polygon_chunk.split(";"):
+
+                point_parts = point_chunk.split(",")
+
+                if len(point_parts) != 2:
+                    continue
+
+                try:
+                    lon = float(point_parts[0])
+                    lat = float(point_parts[1])
+                except ValueError:
+                    continue
+
+                polygon.append((lon, lat))
+
+            if len(polygon) >= 3:
+                area_polygons.append(polygon)
+
+        if area_polygons:
+            state["area_polygons"] = area_polygons
 
     return state
 
@@ -3156,6 +3298,252 @@ def render_data_export():
                 "kullanılamıyor. Pipeline'ı bu güncellemeyle tekrar "
                 "çalıştırdığınızda bu alan otomatik olarak dolacaktır."
             )
+
+    # NOT: Bu bölüm kasıtlı olarak st.expander() İÇİNDE DEĞİL. Folium/
+    # Leaflet haritası mount olurken kapsayıcısının genişliğini/
+    # yüksekliğini bir kez ölçüyor; st.expander kapalıyken (varsayılan
+    # expanded=False) bu ölçüm 0 çıkıyor ve harita kullanıcı expander'ı
+    # açtıktan sonra bile boş/görünmez kalıyor (bilinen bir streamlit-
+    # folium/streamlit sorunu). st.container(border=True) aynı görsel
+    # kutuyu verir ama içeriği gizlemediği için bu sorun oluşmuyor.
+
+    st.markdown(
+        "##### 🗺️ Alan Bazlı Filtre (Haritadan Seç)"
+    )
+
+    # Ek güvenlik önlemi -- iki ayrı streamlit-folium sorununa karşı:
+    #  1) İlk render'da harita iframe'i yüksekliği 0 ile çiziliyor
+    #     (sayfa yenilenince düzeliyor).
+    #  2) streamlit-folium'un JS tarafı, Leaflet "draw:*"/"overlayadd"
+    #     olaylarında Streamlit.setFrameHeight()'ı argümansız çağırıyor;
+    #     bu da varsayılan olarak iframe İÇİNDEKİ document.body.
+    #     scrollHeight'ı kullanıyor. Bu ölçüm kararsız (aynı sayfa
+    #     birkaç kez yeniden yüklendiğinde bazen 420px yerine ~1900px
+    #     ölçülüyor) ve iframe'i haritanın gerçek boyutundan çok daha
+    #     uzun çizip altında koca bir boş alan bırakıyor, sayfanın
+    #     geri kalanını aşağı itiyordu ("haritanın konumu bozuk"
+    #     şikayeti buradan geliyordu). min-height tek başına bunu
+    #     engellemiyor çünkü sorun MAKSİMUM yüksekliğin kaçması;
+    #     height'ı !important ile sabitlemek, JS'in inline stilde
+    #     (!important OLMADAN) ayarladığı değeri geçersiz kılıyor.
+    st.markdown(
+        """
+        <style>
+        iframe[title="streamlit_folium.st_folium"] {
+            height: 420px !important;
+            min-height: 420px;
+            max-height: 420px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+
+        try:
+            has_lat_lon = (
+                "latitude" in get_available_columns()
+                and "longitude" in get_available_columns()
+            )
+        except Exception:
+            has_lat_lon = False
+
+        area_polygons = []
+
+        if not has_lat_lon:
+
+            st.info(
+                "Tabloda 'latitude'/'longitude' kolonu bulunamadı, "
+                "alan bazlı filtre kullanılamıyor."
+            )
+
+        else:
+
+            st.caption(
+                "Haritada dikdörtgen ya da poligon çizerek yalnızca o "
+                "alan(lar)da uçmuş uçakların satırlarını filtreleyin "
+                "(sol üstteki çizim araçlarını kullanın). Birden fazla "
+                "şekil çizebilirsiniz; herhangi birinin içinde kalan "
+                "satırlar (OR) filtreye dahil edilir."
+            )
+
+            (
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon,
+            ) = get_lat_lon_bounds()
+
+            if min_lat is None:
+                map_center = [0.0, 0.0]
+                map_zoom = 2
+            else:
+                map_center = [
+                    (min_lat + max_lat) / 2,
+                    (min_lon + max_lon) / 2,
+                ]
+                map_zoom = 11
+
+            # Haritanın kendisi (folium.Map) her rerun'da yeniden
+            # kurulur, ama st_folium bileşeni aynı "key" ile aynı
+            # widget kabul edildiği için önceki çizimini (all_drawings)
+            # döndürmeye devam eder -- "🗑️ Alanı Temizle" butonu bu
+            # key'i değiştirerek çizimi gerçekten sıfırlar.
+
+            area_map_version = st.session_state.get(
+                "area_map_version",
+                0,
+            )
+
+            # Paylaşılan bir bağlantı ("🔗 Bu Filtreleri Bağlantı Olarak
+            # Paylaş") harita üzerinde çizilmiş alan(lar)ı da URL'ye
+            # kodluyor (bkz. export_ap / _decode_export_state_from_query_
+            # params). O bağlantı açıldığında -- kullanıcı bu widget'ta
+            # DAHA HENÜZ hiçbir şey çizmemişse ve URL'deki alan daha önce
+            # "Alanı Temizle" ile reddedilmemişse -- URL'deki poligon(lar)
+            # hem AKTİF filtre olarak kullanılır hem de haritada kesikli
+            # çizgiyle önizleme olarak gösterilir. Kullanıcı haritada
+            # kendi şeklini çizdiği an bu tamamen devre dışı kalır --
+            # "url_seed_dismissed" o andan itibaren kalıcı olarak True'ya
+            # çekilir (aksi halde her rerun'da URL'deki eski alan geri
+            # gelirdi).
+            #
+            # existing_widget_state, bu component'in ÖNCEKİ rerun'daki
+            # (varsa) dönüş değeridir -- Streamlit `key` verilen her
+            # widget'ın son değerini session_state'te otomatik tutar; bu
+            # sayede st_folium'u çağırmadan ÖNCE (yani haritayı kurarken)
+            # kullanıcının bu widget'ta daha önce bir şey çizip
+            # çizmediğini bilebiliyoruz.
+
+            existing_widget_state = st.session_state.get(
+                f"area_filter_map_{area_map_version}"
+            )
+            existing_drawings = (
+                (existing_widget_state or {}).get("all_drawings") or []
+            )
+
+            url_seed_polygons = pending_url_state.get("area_polygons")
+            url_seed_dismissed = st.session_state.get(
+                "area_filter_url_seed_dismissed",
+                False,
+            )
+
+            show_url_seed = bool(
+                url_seed_polygons
+                and not existing_drawings
+                and not url_seed_dismissed
+            )
+
+            area_map = folium.Map(
+                location=map_center,
+                zoom_start=map_zoom,
+                tiles="CartoDB dark_matter",
+            )
+
+            if show_url_seed:
+
+                for polygon in url_seed_polygons:
+
+                    folium.Polygon(
+                        locations=[
+                            (lat, lon) for lon, lat in polygon
+                        ],
+                        color="#eda100",
+                        weight=2,
+                        dash_array="6,4",
+                        fill=True,
+                        fill_opacity=0.15,
+                        tooltip="Paylaşılan bağlantıdan yüklenen alan",
+                    ).add_to(area_map)
+
+            Draw(
+                export=False,
+                draw_options={
+                    "polyline": False,
+                    "circle": False,
+                    "circlemarker": False,
+                    "marker": False,
+                    "polygon": {"allowIntersection": False},
+                    "rectangle": True,
+                },
+                edit_options={"edit": True},
+            ).add_to(area_map)
+
+            map_output = st_folium(
+                area_map,
+                key=f"area_filter_map_{area_map_version}",
+                height=420,
+                use_container_width=True,
+                returned_objects=["all_drawings"],
+            )
+
+            drawings = (
+                (map_output or {}).get("all_drawings") or []
+            )
+
+            for drawing in drawings:
+
+                geometry = drawing.get("geometry", {})
+
+                if geometry.get("type") == "Polygon":
+
+                    ring = geometry.get("coordinates", [[]])[0]
+
+                    if len(ring) >= 3:
+                        area_polygons.append([
+                            (point[0], point[1])
+                            for point in ring
+                        ])
+
+            if drawings:
+
+                # Kullanıcı haritada kendi şeklini çizdi -- URL'den gelen
+                # alan artık geçerli değil, bir daha geri gelmesin.
+                st.session_state["area_filter_url_seed_dismissed"] = True
+
+                st.success(
+                    f"✅ {len(area_polygons)} alan seçildi — "
+                    "aşağıdaki filtrelerle birlikte (bölgeler OR ile "
+                    "birleştirilerek) uygulanacak."
+                )
+
+                if st.button(
+                    "🗑️ Alanı Temizle",
+                    key="clear_area_filter_btn",
+                ):
+                    st.session_state["area_map_version"] = (
+                        area_map_version + 1
+                    )
+                    st.rerun()
+
+            elif show_url_seed:
+
+                area_polygons = url_seed_polygons
+
+                st.info(
+                    f"🔗 {len(area_polygons)} alan paylaşılan bağlantıdan "
+                    "yüklendi (haritada kesikli çizgiyle gösteriliyor) — "
+                    "aşağıdaki filtrelerle birlikte uygulanacak. Değiştirmek "
+                    "için haritada yeni bir şekil çizin."
+                )
+
+                if st.button(
+                    "🗑️ Alanı Temizle",
+                    key="clear_area_filter_btn",
+                ):
+                    st.session_state["area_filter_url_seed_dismissed"] = True
+                    st.session_state["area_map_version"] = (
+                        area_map_version + 1
+                    )
+                    st.rerun()
+
+            else:
+
+                st.caption(
+                    "Henüz bir alan seçilmedi — tüm konumlar dahil "
+                    "edilecek."
+                )
 
     with st.expander(
         "🎯 Class ve Değer Bazlı Filtreler",
@@ -3474,6 +3862,13 @@ def render_data_export():
     if selected_classes:
         active_filters.append(f"{len(selected_classes)} class")
 
+    if area_polygons:
+        active_filters.append(
+            f"harita alanı ({len(area_polygons)})"
+            if len(area_polygons) > 1
+            else "harita alanı"
+        )
+
     if value_filters:
         active_filters.append(f"{len(value_filters)} değer filtresi")
 
@@ -3496,6 +3891,7 @@ def render_data_export():
         selected_classes=selected_classes,
         selected_columns=selected_columns,
         value_filters=value_filters,
+        area_polygons=area_polygons,
     )
 
     # Filtreler, en son "Satır Sayısını Hesapla" / "Veriyi Getir ve
@@ -3519,6 +3915,9 @@ def render_data_export():
             )
             for value_filter in value_filters
         ),
+        tuple(
+            tuple(polygon) for polygon in area_polygons
+        ) if area_polygons else None,
     )
 
     if st.session_state.get("export_filters_signature") != filter_signature:
@@ -3572,6 +3971,7 @@ def render_data_export():
                     selected_classes=selected_classes,
                     value_filters=value_filters,
                     selected_flights=selected_flights,
+                    area_polygons=area_polygons,
                 )
 
             st.session_state[
@@ -3628,6 +4028,7 @@ def render_data_export():
                     columns=columns,
                     value_filters=value_filters,
                     selected_flights=selected_flights,
+                    area_polygons=area_polygons,
                 )
 
             st.session_state[
@@ -3652,6 +4053,25 @@ def render_data_export():
     st.info(
         f"Toplam {len(dataframe):,} satır getirildi."
     )
+
+    if area_polygons and "flight_id" in dataframe.columns:
+
+        flights_in_area = sorted(
+            dataframe["flight_id"].dropna().unique().tolist()
+        )
+
+        if flights_in_area:
+
+            st.success(
+                f"🗺️ Seçilen alanda uçmuş **{len(flights_in_area)}** "
+                f"uçuş bulundu: {', '.join(flights_in_area)}"
+            )
+
+        else:
+
+            st.warning(
+                "Seçilen alanda uçmuş bir uçuş bulunamadı."
+            )
 
     with st.expander(
         "👁️ Önizleme (ilk 200 satır)",
@@ -3704,19 +4124,55 @@ def render_data_export():
 
 
 # ============================================================
-# UÇUŞ ROTASI HARİTASI (Plotly)
+# UÇUŞ ROTASI HARİTASI (Folium)
 # ============================================================
 #
-# Seçilen tek bir uçuşun (flight_id) zaman sıralı lat/lon/altitude
-# noktalarını Plotly (Scattermapbox) ile haritada gösterir: rota
-# çizgisi, irtifaya göre sürekli bir renk skalasıyla renklendirilmiş
-# noktalar ve başlangıç/bitiş işaretçileri. mapbox_style="carto-darkmatter"
-# token gerektirmeyen bir açık kaynak harita stilidir.
+# Seçilen bir ya da birden fazla uçuşun (flight_id) zaman sıralı
+# lat/lon/altitude noktalarını folium/Leaflet ile haritada gösterir:
+# her uçuş kendi kategorik renginde bir PolyLine ile çizilir, ortak
+# (uçuştan bağımsız) yeşil/kırmızı CircleMarker'lar başlangıç/bitişi
+# işaretler -- kimlik tooltip'te (flight_id) taşınır. Alan Bazlı
+# Filtre haritasıyla aynı token gerektirmeyen "CartoDB dark_matter"
+# zemini kullanılır.
 
-ALTITUDE_COLOR_SCALE = ["#2166ac", "#b2182b"]  # düşük (mavi) -> yüksek (kırmızı)
+# Sabit sırayla atanan, karanlık harita zemininde (carto-darkmatter)
+# okunaklılık için doğrulanmış kategorik renk paleti -- her uçuşa,
+# seçim sırasına göre DEĞİL, ClickHouse'daki tüm uçuş listesindeki
+# sabit konumuna göre bir renk atanır (bkz. _flight_color) ki bir
+# uçuşun seçimi kaldırılıp eklendiğinde diğer uçuşların rengi
+# değişmesin ("color follows the entity, never its rank").
+FLIGHT_COLOR_PALETTE = [
+    "#3987e5",  # 1 mavi
+    "#d95926",  # 2 turuncu
+    "#199e70",  # 3 turkuaz
+    "#c98500",  # 4 sarı
+    "#d55181",  # 5 magenta
+    "#008300",  # 6 yeşil
+    "#9085e9",  # 7 mor
+    "#e66767",  # 8 kırmızı
+]
 
-START_POINT_COLOR = "rgb(26, 152, 80)"   # başlangıç -- yeşil
-END_POINT_COLOR = "rgb(215, 48, 39)"     # bitiş -- kırmızı
+# İlk 3 renk, harita/scatter gibi "herhangi iki nokta yan yana
+# olabilir" (all-pairs) bağlamında renk körlüğüne karşı tam
+# doğrulanmıştır; 8'e kadar olan renkler de kullanılabilir ama
+# birebir ayırt edilmeleri zorlaşabileceği için her uçuşun kimliği
+# ayrıca rota tooltip'inde ve haritanın altındaki lejantta adıyla
+# taşınır (renk asla tek başına kimlik taşımaz).
+MAX_COMPARABLE_FLIGHTS = len(FLIGHT_COLOR_PALETTE)
+
+START_POINT_COLOR = "rgb(26, 152, 80)"   # başlangıç -- yeşil (durum rengi, uçuş kimliğinden bağımsız)
+END_POINT_COLOR = "rgb(215, 48, 39)"     # bitiş -- kırmızı (durum rengi, uçuş kimliğinden bağımsız)
+
+
+def _flight_color(flight_id: str, available_flights: list) -> str:
+    """
+    Bir uçuşa, tüm uçuş listesindeki (sabit, ORDER BY flight_id)
+    konumuna göre kararlı bir kategorik renk atar.
+    """
+
+    index = available_flights.index(flight_id) % len(FLIGHT_COLOR_PALETTE)
+
+    return FLIGHT_COLOR_PALETTE[index]
 
 
 def _format_duration(delta: pd.Timedelta) -> str:
@@ -3761,8 +4217,11 @@ def render_flight_map():
     )
 
     st.caption(
-        "Seçilen uçuşun güzergahını, başlangıç/bitiş noktalarını ve "
-        "irtifaya göre renklendirilmiş rotasını haritada gösterir."
+        "Seçilen uçuş(lar)ın güzergahını, başlangıç/bitiş noktalarını "
+        "haritada gösterir. Birden fazla uçuş seçerek rotalarını "
+        "karşılaştırabilirsiniz -- her uçuş kendi rengiyle çizilir, "
+        "hangi rengin hangi uçuşa ait olduğu haritanın altındaki "
+        "lejantta ve rotaya tıklayınca çıkan tooltip'te görünür."
     )
 
     try:
@@ -3799,190 +4258,224 @@ def render_flight_map():
 
         return
 
-    no_selection = "— Uçuş seçin —"
-
-    selected_flight = st.selectbox(
-        "Uçuş ara / seç",
-        options=[no_selection] + available_flights,
-        index=0,
-        key="flight_map_selected_flight",
+    selected_flights = st.multiselect(
+        "Uçuş ara / seç (birden fazla seçilebilir)",
+        options=available_flights,
+        default=[],
+        key="flight_map_selected_flights",
+        max_selections=MAX_COMPARABLE_FLIGHTS,
         help=(
-            "Yazarak arayabilir, listeden bir uçuş (flight_id) "
-            "seçebilirsiniz."
+            "Yazarak arayabilir, listeden bir ya da birden fazla uçuş "
+            f"(flight_id) seçebilirsiniz (aynı anda en fazla "
+            f"{MAX_COMPARABLE_FLIGHTS} uçuş -- daha fazlası harita "
+            "üzerinde renkleri ayırt etmeyi zorlaştırır)."
         ),
     )
 
-    if selected_flight == no_selection:
+    if not selected_flights:
 
         st.info(
-            "Rotasını görmek istediğiniz uçuşu yukarıdan seçin."
+            "Rotasını görmek istediğiniz uçuş(lar)ı yukarıdan seçin."
         )
 
         return
 
-    try:
+    # Her uçuşun rota verisi ayrı ayrı (flight_id başına, cache'lenmiş
+    # fetch_flight_route ile) çekilir -- tek bir sorguda tüm uçuşları
+    # birlikte çekmek, aralarındaki "ORDER BY time" sıralamasını uçuş
+    # bazında ayıramayacağı için PathLayer'ın her rotayı kendi zaman
+    # sırasıyla çizmesini zorlaştırırdı.
 
-        route_df = fetch_flight_route(
-            selected_flight
+    flight_routes = []
+    flights_without_location = []
+
+    for flight_id in selected_flights:
+
+        try:
+
+            route_df = fetch_flight_route(
+                flight_id
+            )
+
+        except Exception as exc:
+
+            st.error(
+                f"'{flight_id}' için rota verisi okunamadı: {exc}"
+            )
+
+            return
+
+        route_df = route_df.dropna(
+            subset=["latitude", "longitude", "altitude"]
         )
 
-    except Exception as exc:
+        if route_df.empty:
+            flights_without_location.append(flight_id)
+            continue
 
-        st.error(
-            f"Rota verisi okunamadı: {exc}"
+        flight_routes.append(
+            (
+                flight_id,
+                route_df,
+                _flight_color(flight_id, available_flights),
+            )
         )
 
-        return
-
-    route_df = route_df.dropna(
-        subset=["latitude", "longitude", "altitude"]
-    )
-
-    if route_df.empty:
+    if flights_without_location:
 
         st.warning(
-            f"'{selected_flight}' için konum verisi bulunamadı."
+            "Konum verisi bulunamadığı için şu uçuşlar haritaya "
+            "eklenemedi: " + ", ".join(flights_without_location)
         )
 
+    if not flight_routes:
         return
 
-    min_altitude = float(
-        route_df["altitude"].min()
-    )
-    max_altitude = float(
-        route_df["altitude"].max()
-    )
+    # ---- Uçuş başına özet tablo (nokta sayısı, irtifa, süre) ----
+    #
+    # Önceki tek-uçuş görünümündeki 4 metrik kutusu, birden fazla uçuş
+    # aynı anda gösterilebildiği için bir tabloya dönüştürüldü.
 
-    start_row = route_df.iloc[0]
-    end_row = route_df.iloc[-1]
+    summary_rows = []
 
-    # Uçuş süresi: irtifanın 0 olduğu (yerde/kalkış-iniş anı) zaman
-    # noktalarının en erken ve en geç olanı arasındaki fark alınarak
-    # hesaplanır. İrtifası hiç 0 olmayan uçuşlarda (örn. yalnızca havada
-    # kayıt yapılmış veri) bu hesap yapılamaz.
+    for flight_id, route_df, color in flight_routes:
 
-    zero_altitude_times = route_df.loc[
-        route_df["altitude"] == 0,
-        "time",
-    ]
+        min_altitude = float(route_df["altitude"].min())
+        max_altitude = float(route_df["altitude"].max())
 
-    if len(zero_altitude_times) >= 2:
-        flight_duration = _format_duration(
-            zero_altitude_times.max() - zero_altitude_times.min()
-        )
-    else:
-        flight_duration = "—"
+        # Uçuş süresi: irtifanın 0 olduğu (yerde/kalkış-iniş anı) zaman
+        # noktalarının en erken ve en geç olanı arasındaki fark alınarak
+        # hesaplanır. İrtifası hiç 0 olmayan uçuşlarda (örn. yalnızca
+        # havada kayıt yapılmış veri) bu hesap yapılamaz.
 
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-    metric_col1.metric("Nokta sayısı", len(route_df))
-    metric_col2.metric("Min irtifa", f"{min_altitude:.1f}")
-    metric_col3.metric("Maks irtifa", f"{max_altitude:.1f}")
-    metric_col4.metric(
-        "Uçuş süresi",
-        flight_duration,
-        help=(
-            "İrtifanın 0 olduğu ilk ve son zaman arasındaki fark "
-            "(kalkış/iniş anları) baz alınarak hesaplanır."
-        ),
-    )
+        zero_altitude_times = route_df.loc[
+            route_df["altitude"] == 0,
+            "time",
+        ]
 
-    # px.scatter_mapbox, zoom/center verilmezse rota noktalarının
-    # kapladığı alana göre bunları otomatik hesaplar -- rota geniş bir
-    # alana yayılmış olsa bile harita her zaman tüm rotayı gösterecek
-    # şekilde açılır. Asıl figür go.Figure ile elle kurulur (px'in
-    # döndürdüğü figure.data'ya yeni trace atamak Plotly'de desteklenmiyor),
-    # bu yüzden burada sadece otomatik zoom/center değerleri alınır.
-
-    auto_view = px.scatter_mapbox(
-        route_df,
-        lat="latitude",
-        lon="longitude",
-    )
-
-    path_trace = go.Scattermapbox(
-        lat=route_df["latitude"],
-        lon=route_df["longitude"],
-        mode="lines",
-        line=dict(width=1.5, color="rgba(130, 130, 130, 0.6)"),
-        hoverinfo="skip",
-        showlegend=False,
-        name="Rota",
-    )
-
-    points_trace = go.Scattermapbox(
-        lat=route_df["latitude"],
-        lon=route_df["longitude"],
-        mode="markers",
-        marker=dict(
-            size=7,
-            color=route_df["altitude"],
-            colorscale=ALTITUDE_COLOR_SCALE,
-            cmin=min_altitude,
-            cmax=max_altitude,
-            colorbar=dict(title="İrtifa"),
-        ),
-        text=[
-            f"İrtifa: {alt:.1f}<br>Zaman: {time}"
-            for alt, time in zip(
-                route_df["altitude"],
-                route_df["time"].astype(str),
+        if len(zero_altitude_times) >= 2:
+            flight_duration = _format_duration(
+                zero_altitude_times.max() - zero_altitude_times.min()
             )
-        ],
-        hoverinfo="text",
-        showlegend=False,
-        name="Rota noktaları",
-    )
+        else:
+            flight_duration = "—"
 
-    markers_trace = go.Scattermapbox(
-        lat=[start_row["latitude"], end_row["latitude"]],
-        lon=[start_row["longitude"], end_row["longitude"]],
-        mode="markers",
-        marker=dict(
-            size=16,
-            color=[START_POINT_COLOR, END_POINT_COLOR],
-        ),
-        text=[
-            f"Başlangıç (irtifa: {start_row['altitude']:.1f})",
-            f"Bitiş (irtifa: {end_row['altitude']:.1f})",
-        ],
-        hoverinfo="text",
-        showlegend=False,
-        name="Başlangıç/Bitiş",
-    )
-
-    # Rota çizgisi en altta, irtifa noktaları ortada, başlangıç/bitiş
-    # işaretçileri en üstte görünsün diye trace'ler bu sırayla eklenir.
-    fig = go.Figure(
-        data=[path_trace, points_trace, markers_trace]
-    )
-
-    fig.update_layout(
-        mapbox=dict(
-            style="carto-darkmatter",
-            center=auto_view.layout.mapbox.center,
-            zoom=auto_view.layout.mapbox.zoom,
-        ),
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=600,
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-    )
-
-    legend_col1, legend_col2 = st.columns(2)
-
-    with legend_col1:
-
-        st.markdown(
-            "🟢 Başlangıç &nbsp;&nbsp; 🔴 Bitiş"
+        summary_rows.append(
+            {
+                "Uçuş": flight_id,
+                "Nokta sayısı": len(route_df),
+                "Min irtifa": round(min_altitude, 1),
+                "Maks irtifa": round(max_altitude, 1),
+                "Uçuş süresi": flight_duration,
+            }
         )
 
-    with legend_col2:
+    st.dataframe(
+        pd.DataFrame(summary_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        st.markdown(
-            "🔵 Düşük irtifa &nbsp;→&nbsp; 🔴 Yüksek irtifa"
+    # Harita, seçilen tüm uçuşların rotalarını kapsayacak şekilde
+    # fit_bounds ile otomatik ortalanıp yakınlaştırılır.
+
+    all_lat = pd.concat(
+        [route_df["latitude"] for _, route_df, _ in flight_routes]
+    )
+    all_lon = pd.concat(
+        [route_df["longitude"] for _, route_df, _ in flight_routes]
+    )
+
+    route_map = folium.Map(
+        location=[all_lat.mean(), all_lon.mean()],
+        tiles="CartoDB dark_matter",
+    )
+
+    for flight_id, route_df, color in flight_routes:
+
+        start_row = route_df.iloc[0]
+        end_row = route_df.iloc[-1]
+
+        folium.PolyLine(
+            locations=list(
+                zip(route_df["latitude"], route_df["longitude"])
+            ),
+            color=color,
+            weight=3,
+            opacity=0.85,
+            tooltip=flight_id,
+        ).add_to(route_map)
+
+        # Başlangıç/bitiş işaretçileri kasıtlı olarak uçuş renginden
+        # BAĞIMSIZ, sabit yeşil/kırmızı (bir "durum" rengi) kullanır;
+        # kimlik tooltip'teki flight_id ile taşınır.
+        folium.CircleMarker(
+            location=[start_row["latitude"], start_row["longitude"]],
+            radius=7,
+            color="white",
+            weight=1,
+            fill=True,
+            fill_color=START_POINT_COLOR,
+            fill_opacity=1.0,
+            tooltip=f"{flight_id} — Başlangıç (irtifa: {start_row['altitude']:.1f})",
+        ).add_to(route_map)
+
+        folium.CircleMarker(
+            location=[end_row["latitude"], end_row["longitude"]],
+            radius=7,
+            color="white",
+            weight=1,
+            fill=True,
+            fill_color=END_POINT_COLOR,
+            fill_opacity=1.0,
+            tooltip=f"{flight_id} — Bitiş (irtifa: {end_row['altitude']:.1f})",
+        ).add_to(route_map)
+
+    route_map.fit_bounds(
+        [
+            [all_lat.min(), all_lon.min()],
+            [all_lat.max(), all_lon.max()],
+        ]
+    )
+
+    # streamlit-folium'un JS tarafı bazen bileşenin iframe yüksekliğini
+    # (Streamlit.setFrameHeight argümansız çağrıldığında document.body.
+    # scrollHeight'a düşüyor) kararsız ölçer; height'ı !important ile
+    # sabitlemek bunu geçersiz kılar (bkz. Alan Bazlı Filtre haritasındaki
+    # aynı düzeltme). CSS, yalnızca bu haritayı saran container'a
+    # (st.container(key=...) ile eklenen "st-key-..." sınıfı) scope
+    # edilir ki Alan Bazlı Filtre haritasının kendi (420px) yüksekliğini
+    # etkilemesin.
+    st.markdown(
+        """
+        <style>
+        .st-key-flight_route_map iframe[title="streamlit_folium.st_folium"] {
+            height: 600px !important;
+            min-height: 600px;
+            max-height: 600px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    legend_items = " &nbsp;&nbsp; ".join(
+        f'<span style="color:{color};">●</span> {flight_id}'
+        for flight_id, _, color in flight_routes
+    )
+
+    st.markdown(
+        "🟢 Başlangıç &nbsp;&nbsp; 🔴 Bitiş &nbsp;&nbsp; " + legend_items,
+        unsafe_allow_html=True,
+    )
+
+    with st.container(key="flight_route_map"):
+
+        st_folium(
+            route_map,
+            height=600,
+            use_container_width=True,
+            returned_objects=[],
         )
 
 
@@ -4171,10 +4664,24 @@ def main():
     #     (~874k satırlık bir export ile: otomatik yenileme AÇIKKEN
     #     asla tamamlanmadı, bu düzeltmeyle ~20-30 saniyede sorunsuz
     #     tamamlandı.)
+    #
+    #  3) Aynı yarış, satır sayısı hesaplanmadan ÖNCE "1️⃣ Filtrele"
+    #     adımındaki Alan Bazlı Filtre haritasını (streamlit-folium/
+    #     Leaflet iframe'i) da bozuyordu: harita ekrandayken bir
+    #     otomatik yenileme rerun'u tetiklenirse, iframe'in Leaflet
+    #     içeriği tam yeniden mount olmadan komponent yeniden
+    #     boyutlandırılıyor ve iframe'in ölçülen yüksekliği 420px
+    #     yerine ~1900px'e sıçrayıp haritanın altında dev bir boş
+    #     alan bırakıyor, sayfanın geri kalanını aşağı itiyordu.
+    #     Bu yüzden duraklatma yalnızca export_in_progress ile değil,
+    #     kullanıcı "Veri Gözat / Dışa Aktar" sekmesindeyken de
+    #     (haritayla etkileşim satır sayısı hesaplanmadan önce
+    #     olduğu için) uygulanır.
 
     export_in_progress = (
         st.session_state.get("export_row_count") is not None
         or st.session_state.get("export_df") is not None
+        or active_tab == MAIN_TAB_EXPORT
     )
 
     autorefresh_slot = st.empty()
