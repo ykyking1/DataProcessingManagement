@@ -48,9 +48,13 @@ Dashboard bölümleri:
     4. Veri Gözat / Dışa Aktar
        - ClickHouse bağlantısı
        - Time filtresi
+       - Saat filtresi -- günün belirli saatlerini (0-23), tarihten/
+         uçuştan bağımsız olarak filtreler (toHour(time))
        - Class filtresi
        - Alan (harita) bazlı filtre -- haritada çizilen alanda uçmuş
-         satırları filtreler (pointInPolygon)
+         satırları filtreler (pointInPolygon); "dahil et" / "hariç tut"
+         modu (örn. Erzurum'u çevreleyen alanı çizip "hariç tut" ile
+         Erzurum DIŞINDAKİ uçuşları filtreleyebilirsiniz)
        - Değer bazlı satır filtresi (örn. altitude < 23)
        - Kolon seçimi
        - Satır sayısı
@@ -638,6 +642,48 @@ VALUE_FILTER_OPERATORS = {
 RANGE_FILTER_OPERATOR = "between"
 
 
+def _polygon_has_area(polygon) -> bool:
+    """
+    Bir poligonun (köşe noktası listesi) ClickHouse'un pointInPolygon
+    fonksiyonuna güvenle gönderilebilecek gerçek bir alanı olup
+    olmadığını kontrol eder.
+
+    Haritada fare sürüklenmeden (tek tıkla) çizilen bir dikdörtgen gibi
+    durumlarda tüm köşeler aynı noktaya ya da tek bir doğru üzerine denk
+    gelebilir -- bu "poligon" ClickHouse'a gönderildiğinde "Polygon is
+    not valid: Geometry has wrong topological dimension" hatasıyla
+    sorgunun tamamen patlamasına yol açar. Bu fonksiyon, kapanış
+    noktası (ilk = son) ve ardışık tekrarlar hariç en az 3 FARKLI köşesi
+    olan VE bu köşelerin tek bir doğru üzerinde olmadığı (shoelace
+    formülüyle alanı sıfırdan farklı) poligonları geçerli sayar.
+    """
+
+    if not polygon:
+        return False
+
+    distinct_points = []
+
+    for point in polygon:
+        if not distinct_points or distinct_points[-1] != tuple(point):
+            distinct_points.append(tuple(point))
+
+    if len(distinct_points) > 1 and distinct_points[0] == distinct_points[-1]:
+        distinct_points.pop()
+
+    if len(distinct_points) < 3:
+        return False
+
+    signed_area_x2 = 0.0
+    point_count = len(distinct_points)
+
+    for index in range(point_count):
+        x1, y1 = distinct_points[index]
+        x2, y2 = distinct_points[(index + 1) % point_count]
+        signed_area_x2 += x1 * y2 - x2 * y1
+
+    return abs(signed_area_x2) > 1e-12
+
+
 def build_clickhouse_where(
     start_time=None,
     end_time=None,
@@ -645,13 +691,38 @@ def build_clickhouse_where(
     value_filters=None,
     selected_flights=None,
     area_polygons=None,
+    selected_hours=None,
+    duration_filter=None,
+    area_mode="include",
+    time_mode="include",
+    hours_mode="include",
+    flights_mode="include",
 ):
     """
-    value_filters: [{"column": "altitude", "operator": "<", "value": 23}, ...]
-    "between" operatörü için ayrıca "value2" (maks) de gerekir, örn.
-    {"column": "altitude", "operator": "between", "value": 10, "value2": 50}
-    -> "altitude BETWEEN 10 AND 50".
-    selected_flights: ["flight_1", "flight_2", ...] -> flight_id IN (...)
+    value_filters: [{"column": "altitude", "operator": "<", "value": 23,
+    "exclude": False}, ...]. "between" operatörü için ayrıca "value2"
+    (maks) de gerekir, örn. {"column": "altitude", "operator": "between",
+    "value": 10, "value2": 50} -> "altitude BETWEEN 10 AND 50".
+    "exclude": True verilirse koşul NOT (...) ile tersine çevrilir (örn.
+    "altitude 10-50 aralığında DEĞİL" -> altitude < 10 OR altitude > 50
+    ile aynı anlama gelir, ama tek bir NOT BETWEEN ile ifade edilir).
+    selected_flights: ["flight_1", "flight_2", ...] -> flight_id IN (...);
+    flights_mode="exclude" ise flight_id NOT IN (...) (örn. "1. uçuş
+    dışındaki uçuşlar" için o uçuş seçilip flights_mode="exclude" verilir).
+    selected_hours: [7, 8, ...] -> toHour(time) IN (...). Tarihten/uçuştan
+    bağımsız olarak, günün belirli saatlerindeki satırları filtreler
+    (örn. tüm uçuşlarda saat 07:00-07:59 arasına denk gelen satırlar).
+    hours_mode="exclude" ise toHour(time) NOT IN (...) (örn. "18:00-21:00
+    aralığı dışındaki satırlar" için 18/19/20 seçilip hours_mode=
+    "exclude" verilir).
+    time_mode="exclude" ise start_time/end_time aralığı tersine çevrilir
+    -- yalnızca bu aralığın DIŞINDaki (start_time'dan önceki ya da
+    end_time'dan sonraki) satırlar tutulur.
+    duration_filter: {"operator": "<", "hours": 4} -> her uçuşun
+    min(time)/max(time) farkına (saniye) göre hesaplanan süresi bu
+    koşulu sağlamıyorsa o uçuşun TÜM satırları elenir (örn. "4 saatten
+    kısa uçuşları filtrele" -> {"operator": "<", "hours": 4}).
+    "between" operatörü için ayrıca "hours2" (maks saat) gerekir.
     area_polygons: [[(lon1, lat1), (lon2, lat2), ...], ...] -- haritada
     çizilen bir ya da birden fazla alanın köşe noktaları (her poligon en
     az 3 nokta). ClickHouse'un pointInPolygon fonksiyonuyla, bu
@@ -662,6 +733,10 @@ def build_clickhouse_where(
     Tuple(...) tipinden kaçınmak için iki ayrı Array(Float64) (boylam/
     enlem) parametresi olarak gönderilir ve sorgu içinde arrayZip ile
     Array(Tuple(...))'a dönüştürülür.
+    area_mode: "include" (varsayılan) çizilen alan(lar)IN İÇİNDEKİ
+    satırları tutar; "exclude" bunun tersini yapar -- çizilen alan(lar)IN
+    HİÇBİRİNİN içinde olmayan satırları tutar (örn. "Erzurum dışındaki
+    uçuşlar" için Erzurum'u çevreleyen bir alan çizip "exclude" seçilir).
 
     Her filtre AND ile birleştirilir (örn. "altitude < 23 AND box_w >= 50").
     Kolon adı ve operatör beyaz listeye (whitelist) karşı doğrulanır,
@@ -672,21 +747,39 @@ def build_clickhouse_where(
     conditions = []
     parameters = {}
 
-    if start_time is not None:
+    if start_time is not None and end_time is not None:
 
-        conditions.append(
-            "time >= {start_time:DateTime}"
-        )
+        parameters["start_time"] = start_time
+        parameters["end_time"] = end_time
+
+        if time_mode == "exclude":
+            conditions.append(
+                "NOT (time BETWEEN {start_time:DateTime} "
+                "AND {end_time:DateTime})"
+            )
+        else:
+            conditions.append("time >= {start_time:DateTime}")
+            conditions.append("time <= {end_time:DateTime}")
+
+    elif start_time is not None:
 
         parameters["start_time"] = start_time
 
-    if end_time is not None:
-
         conditions.append(
-            "time <= {end_time:DateTime}"
+            "time < {start_time:DateTime}"
+            if time_mode == "exclude"
+            else "time >= {start_time:DateTime}"
         )
 
+    elif end_time is not None:
+
         parameters["end_time"] = end_time
+
+        conditions.append(
+            "time > {end_time:DateTime}"
+            if time_mode == "exclude"
+            else "time <= {end_time:DateTime}"
+        )
 
     if selected_classes:
 
@@ -702,7 +795,9 @@ def build_clickhouse_where(
     if selected_flights:
 
         conditions.append(
-            "flight_id IN {flight_ids:Array(String)}"
+            "flight_id NOT IN {flight_ids:Array(String)}"
+            if flights_mode == "exclude"
+            else "flight_id IN {flight_ids:Array(String)}"
         )
 
         parameters["flight_ids"] = [
@@ -710,10 +805,78 @@ def build_clickhouse_where(
             for x in selected_flights
         ]
 
+    if selected_hours:
+
+        conditions.append(
+            "toHour(time) NOT IN {hours:Array(UInt8)}"
+            if hours_mode == "exclude"
+            else "toHour(time) IN {hours:Array(UInt8)}"
+        )
+
+        parameters["hours"] = [
+            int(hour)
+            for hour in selected_hours
+        ]
+
+    if duration_filter:
+
+        available_columns = set(
+            get_available_columns()
+        )
+
+        operator = duration_filter.get("operator")
+        hours = duration_filter.get("hours")
+
+        if (
+            "flight_id" in available_columns
+            and hours is not None
+            and (
+                operator in VALUE_FILTER_OPERATORS
+                or operator == RANGE_FILTER_OPERATOR
+            )
+        ):
+
+            duration_subquery = (
+                "flight_id IN ("
+                "SELECT flight_id FROM "
+                f"{get_clickhouse_source()} "
+                "GROUP BY flight_id "
+                "HAVING dateDiff('second', min(time), max(time)) "
+            )
+
+            if operator == RANGE_FILTER_OPERATOR:
+
+                hours2 = duration_filter.get("hours2")
+
+                if hours2 is not None:
+
+                    conditions.append(
+                        duration_subquery
+                        + "BETWEEN {duration_min_sec:UInt64} "
+                        "AND {duration_max_sec:UInt64})"
+                    )
+
+                    parameters["duration_min_sec"] = int(
+                        min(hours, hours2) * 3600
+                    )
+                    parameters["duration_max_sec"] = int(
+                        max(hours, hours2) * 3600
+                    )
+
+            else:
+
+                conditions.append(
+                    duration_subquery
+                    + f"{VALUE_FILTER_OPERATORS[operator]} "
+                    "{duration_sec:UInt64})"
+                )
+
+                parameters["duration_sec"] = int(hours * 3600)
+
     valid_area_polygons = [
         polygon
         for polygon in (area_polygons or [])
-        if polygon and len(polygon) >= 3
+        if polygon and _polygon_has_area(polygon)
     ]
 
     if valid_area_polygons:
@@ -750,10 +913,16 @@ def build_clickhouse_where(
             # Birden fazla poligon OR ile birleştirilir (bölge A veya
             # bölge B içinde kalan satırlar eşleşir); tüm poligon
             # koşulları da tek bir AND'lenebilir grup olması için
-            # parantez içine alınır.
-            conditions.append(
-                "(" + " OR ".join(area_conditions) + ")"
-            )
+            # parantez içine alınır. area_mode="exclude" ise bu grubun
+            # tamamı NOT ile tersine çevrilir -- yani "hiçbir alanın
+            # içinde olmayan" satırlar tutulur (örn. "Erzurum dışındaki
+            # uçuşlar").
+            area_group = "(" + " OR ".join(area_conditions) + ")"
+
+            if area_mode == "exclude":
+                area_group = "NOT " + area_group
+
+            conditions.append(area_group)
 
     if value_filters:
 
@@ -766,6 +935,7 @@ def build_clickhouse_where(
             column = value_filter.get("column")
             operator = value_filter.get("operator")
             value = value_filter.get("value")
+            exclude = value_filter.get("exclude", False)
 
             if column not in available_columns:
                 continue
@@ -780,9 +950,13 @@ def build_clickhouse_where(
                 param_min = f"value_filter_{index}_min"
                 param_max = f"value_filter_{index}_max"
 
-                conditions.append(
+                between_expr = (
                     f"`{column}` BETWEEN "
                     f"{{{param_min}:Float64}} AND {{{param_max}:Float64}}"
+                )
+
+                conditions.append(
+                    f"NOT ({between_expr})" if exclude else between_expr
                 )
 
                 # Kullanıcı min/maks'ı ters girmiş olsa bile (örn. min=50,
@@ -800,10 +974,14 @@ def build_clickhouse_where(
 
             param_name = f"value_filter_{index}"
 
-            conditions.append(
+            comparison_expr = (
                 f"`{column}` "
                 f"{VALUE_FILTER_OPERATORS[operator]} "
                 f"{{{param_name}:Float64}}"
+            )
+
+            conditions.append(
+                f"NOT ({comparison_expr})" if exclude else comparison_expr
             )
 
             parameters[param_name] = float(value)
@@ -828,6 +1006,12 @@ def count_filtered_rows(
     value_filters=None,
     selected_flights=None,
     area_polygons=None,
+    selected_hours=None,
+    duration_filter=None,
+    area_mode="include",
+    time_mode="include",
+    hours_mode="include",
+    flights_mode="include",
 ):
 
     client = get_clickhouse_client()
@@ -839,6 +1023,12 @@ def count_filtered_rows(
         value_filters,
         selected_flights,
         area_polygons,
+        selected_hours,
+        duration_filter,
+        area_mode,
+        time_mode,
+        hours_mode,
+        flights_mode,
     )
 
     query = f"""
@@ -871,6 +1061,12 @@ def fetch_filtered_telemetry(
     value_filters=None,
     selected_flights=None,
     area_polygons=None,
+    selected_hours=None,
+    duration_filter=None,
+    area_mode="include",
+    time_mode="include",
+    hours_mode="include",
+    flights_mode="include",
 ):
 
     client = get_clickhouse_client()
@@ -882,6 +1078,12 @@ def fetch_filtered_telemetry(
         value_filters,
         selected_flights,
         area_polygons,
+        selected_hours,
+        duration_filter,
+        area_mode,
+        time_mode,
+        hours_mode,
+        flights_mode,
     )
 
     if columns:
@@ -2416,6 +2618,7 @@ DOWNLOAD_FORMAT_LABELS = {
     "all": "📄 Tüm Veri (Tek CSV)",
     "zip": "📦 Uçuş Bazlı ZIP",
     "each": "✈️ Uçuşları Tek Tek İndir",
+    "merge": "🧩 Seçili Uçuşları Birleştir",
 }
 
 
@@ -2456,7 +2659,7 @@ def render_download_section(
     format_keys = ["all"]
 
     if has_flight_id:
-        format_keys += ["zip", "each"]
+        format_keys += ["zip", "each", "merge"]
 
     if "download_format_choice" not in st.session_state:
 
@@ -2653,9 +2856,17 @@ def render_download_section(
             dataframe_id,
         )
 
-    else:
+    elif selected_format == "each":
 
         _render_flight_individual_downloads(
+            flight_groups,
+            time_suffix,
+            dataframe_id,
+        )
+
+    else:
+
+        _render_flight_merge_download(
             flight_groups,
             time_suffix,
             dataframe_id,
@@ -2864,6 +3075,114 @@ def _render_flight_individual_downloads(
             )
 
 
+def _render_flight_merge_download(
+    flight_groups: dict,
+    time_suffix: str,
+    dataframe_id: int,
+) -> None:
+    """
+    Filtreye uyan uçuşlar arasından kullanıcının seçtiği BİRKAÇININ
+    (hepsinin değil) satırlarını tek bir CSV'de birleştirir -- örn.
+    filtreye uyan 5 uçuş varken yalnızca uçuş1 ve uçuş2'yi birleştirip
+    tek dosya olarak indirmek için. "Tüm Veri" formatından farkı budur:
+    o format filtreye uyan TÜM uçuşları birleştirir, burası ise
+    kullanıcının seçtiği bir alt kümeyi.
+    """
+
+    flight_options = sorted(flight_groups.keys())
+
+    selected_flights_to_merge = st.multiselect(
+        "Birleştirilecek uçuşlar",
+        options=flight_options,
+        help=(
+            "Filtreye uyan uçuşlar arasından, tek bir CSV'de "
+            "birleştirmek istediklerinizi seçin (örn. 5 uçuş içinden "
+            "yalnızca 2'sini birleştirip indirebilirsiniz)."
+        ),
+        key="download_merge_selected_flights",
+    )
+
+    if not selected_flights_to_merge:
+
+        st.caption(
+            "Birleştirmek için yukarıdan bir ya da daha fazla uçuş seçin."
+        )
+
+        return
+
+    merge_row_count = sum(
+        len(flight_groups[flight])
+        for flight in selected_flights_to_merge
+    )
+
+    st.caption(
+        f"{len(selected_flights_to_merge)} uçuş, toplam "
+        f"{merge_row_count:,} satır birleştirilecek."
+    )
+
+    cache_key = (
+        "merge",
+        dataframe_id,
+        tuple(sorted(selected_flights_to_merge)),
+    )
+
+    if st.button(
+        "🧩 Birleştirilmiş CSV Oluştur",
+        type="primary",
+        key="prepare_flight_merge_csv",
+    ):
+
+        with st.spinner(
+            f"{len(selected_flights_to_merge)} uçuş birleştiriliyor..."
+        ):
+
+            merged_df = pd.concat(
+                [
+                    flight_groups[flight]
+                    for flight in selected_flights_to_merge
+                ],
+                ignore_index=True,
+            )
+
+            csv_bytes = merged_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
+
+        st.session_state["download_flight_merge_cache"] = {
+            "key": cache_key,
+            "bytes": csv_bytes,
+        }
+
+    cache = st.session_state.get("download_flight_merge_cache")
+
+    if cache and cache["key"] == cache_key:
+
+        # Dosya adına en fazla 3 uçuşun adı eklenir; daha fazlasında
+        # dosya adı okunaksız uzayacağı için sadece sayı belirtilir.
+        if len(selected_flights_to_merge) <= 3:
+            flights_label = "_".join(sorted(selected_flights_to_merge))
+        else:
+            flights_label = f"{len(selected_flights_to_merge)}_ucus"
+
+        st.download_button(
+            label=(
+                f"⬇️ Birleştirilmiş CSV'yi İndir "
+                f"({len(selected_flights_to_merge)} uçuş)"
+            ),
+            data=cache["bytes"],
+            file_name=f"ucuslar_birlesik_{flights_label}_{time_suffix}.csv",
+            mime="text/csv",
+            type="primary",
+            key="download_flight_merge_csv",
+        )
+
+    else:
+
+        st.caption(
+            "İndirme dosyasını oluşturmak için yukarıdaki butona basın."
+        )
+
+
 # ============================================================
 # VERİ GÖZAT / DIŞA AKTAR — URL İLE PAYLAŞMA
 # ============================================================
@@ -2904,6 +3223,13 @@ def _encode_export_state_to_query_params(
     selected_columns,
     value_filters,
     area_polygons=None,
+    selected_hours=None,
+    duration_filter=None,
+    area_mode="include",
+    time_mode="include",
+    hours_mode="include",
+    flights_mode="include",
+    columns_mode="include",
 ) -> dict:
 
     params = {
@@ -2911,10 +3237,24 @@ def _encode_export_state_to_query_params(
         "export_et": end_time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
+    if time_mode == "exclude":
+        params["export_tm"] = "exclude"
+
     if selected_flights:
         params["export_fl"] = ",".join(
             str(flight) for flight in selected_flights
         )
+
+        if flights_mode == "exclude":
+            params["export_flm"] = "exclude"
+
+    if selected_hours:
+        params["export_hr"] = ",".join(
+            str(int(hour)) for hour in selected_hours
+        )
+
+        if hours_mode == "exclude":
+            params["export_hrm"] = "exclude"
 
     if selected_classes:
         params["export_cl"] = ",".join(
@@ -2926,13 +3266,26 @@ def _encode_export_state_to_query_params(
             str(col) for col in selected_columns
         )
 
+        if columns_mode == "exclude":
+            params["export_com"] = "exclude"
+
     if value_filters:
 
         def _encode_value_filter(vf: dict) -> str:
 
+            op_code = EXPORT_VALUE_FILTER_OP_CODES.get(
+                vf["operator"], "lt"
+            )
+
+            # "x" öneki, bu filtrenin "hariç tut" (NOT) modunda olduğunu
+            # işaretler (bkz. value_filter["exclude"] / build_clickhouse_
+            # where) -- örn. "xbt" = "aralıkta DEĞİL".
+            if vf.get("exclude"):
+                op_code = f"x{op_code}"
+
             chunk = (
                 f"{vf['column']}:"
-                f"{EXPORT_VALUE_FILTER_OP_CODES.get(vf['operator'], 'lt')}:"
+                f"{op_code}:"
                 f"{vf['value']}"
             )
 
@@ -2944,6 +3297,19 @@ def _encode_export_state_to_query_params(
         params["export_vf"] = "|".join(
             _encode_value_filter(vf) for vf in value_filters
         )
+
+    if duration_filter and duration_filter.get("hours") is not None:
+
+        op_code = EXPORT_VALUE_FILTER_OP_CODES.get(
+            duration_filter.get("operator"), "lt"
+        )
+
+        chunk = f"{op_code}:{duration_filter['hours']}"
+
+        if duration_filter.get("operator") == RANGE_FILTER_OPERATOR:
+            chunk += f":{duration_filter.get('hours2', 0.0)}"
+
+        params["export_dur"] = chunk
 
     if area_polygons:
 
@@ -2957,6 +3323,9 @@ def _encode_export_state_to_query_params(
             )
             for polygon in area_polygons
         )
+
+        if area_mode == "exclude":
+            params["export_am"] = "exclude"
 
     return params
 
@@ -2985,12 +3354,26 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
         except ValueError:
             pass
 
+    if "export_tm" in query_params:
+        state["time_mode"] = (
+            "exclude"
+            if query_params["export_tm"] == "exclude"
+            else "include"
+        )
+
     if "export_fl" in query_params:
         state["selected_flights"] = [
             flight
             for flight in query_params["export_fl"].split(",")
             if flight
         ]
+
+        if "export_flm" in query_params:
+            state["flights_mode"] = (
+                "exclude"
+                if query_params["export_flm"] == "exclude"
+                else "include"
+            )
 
     if "export_cl" in query_params:
         state["selected_classes"] = [
@@ -2999,12 +3382,34 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
             if cls
         ]
 
+    if "export_hr" in query_params:
+        state["selected_hours"] = [
+            int(hour)
+            for hour in query_params["export_hr"].split(",")
+            if hour.strip().isdigit()
+            and 0 <= int(hour) <= 23
+        ]
+
+        if "export_hrm" in query_params:
+            state["hours_mode"] = (
+                "exclude"
+                if query_params["export_hrm"] == "exclude"
+                else "include"
+            )
+
     if "export_co" in query_params:
         state["selected_columns"] = [
             col
             for col in query_params["export_co"].split(",")
             if col
         ]
+
+        if "export_com" in query_params:
+            state["columns_mode"] = (
+                "exclude"
+                if query_params["export_com"] == "exclude"
+                else "include"
+            )
 
     if "export_fmt" in query_params:
         state["download_format"] = query_params["export_fmt"]
@@ -3028,8 +3433,12 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
             else:
                 continue
 
+            # "x" öneki bu filtrenin "hariç tut" modunda kaydedildiğini
+            # işaretler (bkz. _encode_value_filter).
+            exclude = op_code.startswith("x")
+
             operator = EXPORT_VALUE_FILTER_OP_CODES_REVERSE.get(
-                op_code
+                op_code[1:] if exclude else op_code
             )
 
             if operator is None:
@@ -3052,6 +3461,7 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
                 "column": column,
                 "operator": operator,
                 "value": value,
+                "exclude": exclude,
             }
 
             if value2 is not None:
@@ -3060,6 +3470,38 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
             value_filters.append(decoded_filter)
 
         state["value_filters"] = value_filters
+
+    if "export_dur" in query_params:
+
+        parts = query_params["export_dur"].split(":")
+
+        if len(parts) in (2, 3):
+
+            op_code = parts[0]
+            operator = EXPORT_VALUE_FILTER_OP_CODES_REVERSE.get(op_code)
+
+            if operator is not None and not (
+                operator == RANGE_FILTER_OPERATOR and len(parts) != 3
+            ):
+
+                try:
+                    hours = float(parts[1])
+                    hours2 = float(parts[2]) if len(parts) == 3 else None
+                except ValueError:
+                    hours = None
+                    hours2 = None
+
+                if hours is not None:
+
+                    decoded_duration_filter = {
+                        "operator": operator,
+                        "hours": hours,
+                    }
+
+                    if hours2 is not None:
+                        decoded_duration_filter["hours2"] = hours2
+
+                    state["duration_filter"] = decoded_duration_filter
 
     if "export_ap" in query_params:
 
@@ -3092,6 +3534,13 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
 
         if area_polygons:
             state["area_polygons"] = area_polygons
+
+    if "export_am" in query_params:
+        state["area_mode"] = (
+            "exclude"
+            if query_params["export_am"] == "exclude"
+            else "include"
+        )
 
     return state
 
@@ -3220,6 +3669,179 @@ def render_data_export():
         expanded=True,
     ):
 
+        # Uçuş seçimi (flight_id)
+        #
+        # Her uçuş bir kaynak dosyaya karşılık gelir (bkz. ingestion.py).
+        # Burada seçilen uçuşlar, aşağıdaki tüm filtrelerle birlikte
+        # kullanılır; en altta ise her uçuş için ayrı ayrı (ya da hepsi
+        # birden ZIP olarak) CSV indirme imkanı sunulur.
+
+        try:
+            available_flights = get_available_flights()
+        except Exception:
+            available_flights = []
+
+        selected_flights = []
+        flights_mode = "include"
+
+        if available_flights:
+
+            if (
+                "export_selected_flights" not in st.session_state
+                and "selected_flights" in pending_url_state
+            ):
+                st.session_state["export_selected_flights"] = [
+                    flight
+                    for flight in pending_url_state["selected_flights"]
+                    if flight in available_flights
+                ]
+
+            selected_flights = st.multiselect(
+                "Uçuş(lar)",
+                options=available_flights,
+                help=(
+                    "Boş bırakılırsa tüm uçuşlar dahil edilir. Birden fazla "
+                    "uçuş seçerseniz, aşağıdaki filtrelere uyan satırlar her "
+                    "uçuş için ayrı ayrı CSV olarak indirilebilir."
+                ),
+                key="export_selected_flights",
+            )
+
+            if selected_flights:
+
+                if (
+                    "export_flights_mode_exclude" not in st.session_state
+                    and pending_url_state.get("flights_mode") == "exclude"
+                ):
+                    st.session_state["export_flights_mode_exclude"] = True
+
+                flights_mode_exclude = st.checkbox(
+                    "🔁 Seçilen uçuşları hariç tut",
+                    help=(
+                        "İşaretlenirse, örn. \"flight_1\" seçiliyken "
+                        "flight_1 HARİÇ tüm uçuşlar gösterilir."
+                    ),
+                    key="export_flights_mode_exclude",
+                )
+
+                flights_mode = (
+                    "exclude" if flights_mode_exclude else "include"
+                )
+
+            # Uçuş süresi filtresi
+            #
+            # Her uçuşun süresi min(time)/max(time) farkından hesaplanır
+            # (bkz. build_clickhouse_where -> duration_filter); bu koşulu
+            # sağlamayan uçuşların TÜM satırları elenir. Örn. "4 saatten
+            # kısa uçuşları filtrele" -> operatör "<", saat 4.
+
+            if (
+                "export_duration_enabled" not in st.session_state
+                and "duration_filter" in pending_url_state
+            ):
+                st.session_state["export_duration_enabled"] = True
+                st.session_state["export_duration_operator"] = (
+                    pending_url_state["duration_filter"]["operator"]
+                )
+                st.session_state["export_duration_hours"] = float(
+                    pending_url_state["duration_filter"]["hours"]
+                )
+                st.session_state["export_duration_hours2"] = float(
+                    pending_url_state["duration_filter"].get(
+                        "hours2", 0.0
+                    )
+                )
+
+            duration_enabled = st.checkbox(
+                "⏱️ Uçuş süresine göre filtrele",
+                help=(
+                    "Örn. 4 saatten kısa süren uçuşları filtrelemek için "
+                    "operatörü \"<\", saati 4 seçin. Süre, her uçuşun ilk "
+                    "ve son telemetri zaman damgası arasındaki farktan "
+                    "hesaplanır."
+                ),
+                key="export_duration_enabled",
+            )
+
+            duration_filter = None
+
+            if duration_enabled:
+
+                dcol1, dcol2, dcol3 = st.columns([2, 2, 2])
+
+                duration_operator_options = list(
+                    VALUE_FILTER_OPERATORS.keys()
+                ) + [RANGE_FILTER_OPERATOR]
+
+                with dcol1:
+
+                    duration_operator = st.selectbox(
+                        "Operatör",
+                        options=duration_operator_options,
+                        format_func=lambda op: (
+                            "aralıkta (min–maks)"
+                            if op == RANGE_FILTER_OPERATOR
+                            else op
+                        ),
+                        key="export_duration_operator",
+                    )
+
+                is_duration_range = (
+                    duration_operator == RANGE_FILTER_OPERATOR
+                )
+
+                with dcol2:
+
+                    duration_hours = st.number_input(
+                        "Min Saat" if is_duration_range else "Saat",
+                        min_value=0.0,
+                        value=float(
+                            st.session_state.get(
+                                "export_duration_hours", 4.0
+                            )
+                        ),
+                        step=0.5,
+                        key="export_duration_hours",
+                    )
+
+                duration_hours2 = None
+
+                if is_duration_range:
+
+                    with dcol3:
+
+                        duration_hours2 = st.number_input(
+                            "Maks Saat",
+                            min_value=0.0,
+                            value=float(
+                                st.session_state.get(
+                                    "export_duration_hours2", 8.0
+                                )
+                            ),
+                            step=0.5,
+                            key="export_duration_hours2",
+                        )
+
+                duration_filter = {
+                    "operator": duration_operator,
+                    "hours": duration_hours,
+                }
+
+                if duration_hours2 is not None:
+                    duration_filter["hours2"] = duration_hours2
+
+        else:
+
+            st.info(
+                "Tabloda 'flight_id' kolonu bulunamadı, uçuş bazlı filtre "
+                "kullanılamıyor. Pipeline'ı bu güncellemeyle tekrar "
+                "çalıştırdığınızda bu alan otomatik olarak dolacaktır."
+            )
+
+            duration_filter = None
+
+        st.divider()
+
         if (
             "export_start_time" not in st.session_state
             and "start_time" in pending_url_state
@@ -3254,50 +3876,74 @@ def render_data_export():
                 key="export_end_time",
             )
 
-        # Uçuş seçimi (flight_id)
+        if (
+            "export_time_mode_exclude" not in st.session_state
+            and pending_url_state.get("time_mode") == "exclude"
+        ):
+            st.session_state["export_time_mode_exclude"] = True
+
+        time_mode_exclude = st.checkbox(
+            "🔁 Bu tarih aralığını hariç tut (yalnızca DIŞINDAKİ satırlar)",
+            help=(
+                "İşaretlenirse, başlangıç/bitiş zamanı arasındaki satırlar "
+                "DEĞİL, bu aralığın dışında kalan (öncesi ve sonrası) "
+                "satırlar filtreye dahil edilir."
+            ),
+            key="export_time_mode_exclude",
+        )
+
+        time_mode = "exclude" if time_mode_exclude else "include"
+
+        # Saat bazlı filtre (günün saati, tarihten/uçuştan bağımsız)
         #
-        # Her uçuş bir kaynak dosyaya karşılık gelir (bkz. ingestion.py).
-        # Burada seçilen uçuşlar, aşağıdaki tüm filtrelerle birlikte
-        # kullanılır; en altta ise her uçuş için ayrı ayrı (ya da hepsi
-        # birden ZIP olarak) CSV indirme imkanı sunulur.
+        # Yukarıdaki başlangıç/bitiş zamanı belirli bir TARİH aralığını
+        # sınırlar; bu filtre ise günün belirli SAATLERİNİ (0-23) seçer --
+        # örn. "saat 7" seçilirse, aralıktaki tüm uçuşlarda saat 07:00-
+        # 07:59 arasına denk gelen satırlar (hangi güne/uçuşa ait olursa
+        # olsun) filtreye dahil edilir. toHour(time) ile eşleştirilir.
 
-        try:
-            available_flights = get_available_flights()
-        except Exception:
-            available_flights = []
+        if (
+            "export_selected_hours" not in st.session_state
+            and "selected_hours" in pending_url_state
+        ):
+            st.session_state["export_selected_hours"] = pending_url_state[
+                "selected_hours"
+            ]
 
-        selected_flights = []
+        selected_hours = st.multiselect(
+            "Saat (0-23)",
+            options=list(range(24)),
+            help=(
+                "Boş bırakılırsa tüm saatler dahil edilir. Seçilen "
+                "saat(ler), tarihten ve uçuştan bağımsız olarak günün o "
+                "saatine denk gelen satırları filtreler (örn. 7 seçilirse "
+                "tüm uçuşlarda saat 07:00-07:59 arası satırlar gösterilir)."
+            ),
+            format_func=lambda hour: f"{hour:02d}:00",
+            key="export_selected_hours",
+        )
 
-        if available_flights:
+        hours_mode = "include"
+
+        if selected_hours:
 
             if (
-                "export_selected_flights" not in st.session_state
-                and "selected_flights" in pending_url_state
+                "export_hours_mode_exclude" not in st.session_state
+                and pending_url_state.get("hours_mode") == "exclude"
             ):
-                st.session_state["export_selected_flights"] = [
-                    flight
-                    for flight in pending_url_state["selected_flights"]
-                    if flight in available_flights
-                ]
+                st.session_state["export_hours_mode_exclude"] = True
 
-            selected_flights = st.multiselect(
-                "Uçuş(lar)",
-                options=available_flights,
+            hours_mode_exclude = st.checkbox(
+                "🔁 Seçilen saatleri hariç tut",
                 help=(
-                    "Boş bırakılırsa tüm uçuşlar dahil edilir. Birden fazla "
-                    "uçuş seçerseniz, aşağıdaki filtrelere uyan satırlar her "
-                    "uçuş için ayrı ayrı CSV olarak indirilebilir."
+                    "İşaretlenirse, örn. saat 18/19/20 seçiliyken "
+                    "yalnızca 18:00-21:00 aralığının DIŞINDAKİ satırlar "
+                    "gösterilir."
                 ),
-                key="export_selected_flights",
+                key="export_hours_mode_exclude",
             )
 
-        else:
-
-            st.info(
-                "Tabloda 'flight_id' kolonu bulunamadı, uçuş bazlı filtre "
-                "kullanılamıyor. Pipeline'ı bu güncellemeyle tekrar "
-                "çalıştırdığınızda bu alan otomatik olarak dolacaktır."
-            )
+            hours_mode = "exclude" if hours_mode_exclude else "include"
 
     # NOT: Bu bölüm kasıtlı olarak st.expander() İÇİNDE DEĞİL. Folium/
     # Leaflet haritası mount olurken kapsayıcısının genişliğini/
@@ -3350,6 +3996,7 @@ def render_data_export():
             has_lat_lon = False
 
         area_polygons = []
+        area_mode = "include"
 
         if not has_lat_lon:
 
@@ -3361,11 +4008,37 @@ def render_data_export():
         else:
 
             st.caption(
-                "Haritada dikdörtgen ya da poligon çizerek yalnızca o "
-                "alan(lar)da uçmuş uçakların satırlarını filtreleyin "
-                "(sol üstteki çizim araçlarını kullanın). Birden fazla "
-                "şekil çizebilirsiniz; herhangi birinin içinde kalan "
-                "satırlar (OR) filtreye dahil edilir."
+                "Haritada dikdörtgen ya da poligon çizerek alan(lar) "
+                "belirleyin (sol üstteki çizim araçlarını kullanın). "
+                "Birden fazla şekil çizebilirsiniz; birden fazla alan "
+                "çizildiğinde OR ile birleştirilir (\"bölge A veya bölge "
+                "B\")."
+            )
+
+            if (
+                "export_area_mode" not in st.session_state
+                and "area_mode" in pending_url_state
+            ):
+                st.session_state["export_area_mode"] = pending_url_state[
+                    "area_mode"
+                ]
+
+            area_mode = st.radio(
+                "Alan modu",
+                options=["include", "exclude"],
+                format_func=lambda mode: (
+                    "🎯 Dahil et (yalnızca alan(lar)ın İÇİNDEKİ satırlar)"
+                    if mode == "include"
+                    else "🚫 Hariç tut (alan(lar)ın DIŞINDAKİ satırlar)"
+                ),
+                help=(
+                    "\"Hariç tut\" seçilirse, çizdiğiniz alan(lar)ın "
+                    "içinde kalan satırlar filtreden ÇIKARILIR — örn. "
+                    "Erzurum'u çevreleyen bir alan çizip \"Hariç tut\" "
+                    "seçerek Erzurum DIŞINDAKİ uçuşları görebilirsiniz."
+                ),
+                horizontal=True,
+                key="export_area_mode",
             )
 
             (
@@ -3399,29 +4072,18 @@ def render_data_export():
             # Paylaşılan bir bağlantı ("🔗 Bu Filtreleri Bağlantı Olarak
             # Paylaş") harita üzerinde çizilmiş alan(lar)ı da URL'ye
             # kodluyor (bkz. export_ap / _decode_export_state_from_query_
-            # params). O bağlantı açıldığında -- kullanıcı bu widget'ta
-            # DAHA HENÜZ hiçbir şey çizmemişse ve URL'deki alan daha önce
-            # "Alanı Temizle" ile reddedilmemişse -- URL'deki poligon(lar)
-            # hem AKTİF filtre olarak kullanılır hem de haritada kesikli
-            # çizgiyle önizleme olarak gösterilir. Kullanıcı haritada
-            # kendi şeklini çizdiği an bu tamamen devre dışı kalır --
-            # "url_seed_dismissed" o andan itibaren kalıcı olarak True'ya
-            # çekilir (aksi halde her rerun'da URL'deki eski alan geri
-            # gelirdi).
+            # params). O bağlantı açıldığında -- "Alanı Temizle" ile
+            # reddedilmediği sürece -- URL'deki poligon(lar) hem AKTİF
+            # filtre olarak kullanılır hem de haritada kesikli çizgiyle
+            # gösterilir.
             #
-            # existing_widget_state, bu component'in ÖNCEKİ rerun'daki
-            # (varsa) dönüş değeridir -- Streamlit `key` verilen her
-            # widget'ın son değerini session_state'te otomatik tutar; bu
-            # sayede st_folium'u çağırmadan ÖNCE (yani haritayı kurarken)
-            # kullanıcının bu widget'ta daha önce bir şey çizip
-            # çizmediğini bilebiliyoruz.
-
-            existing_widget_state = st.session_state.get(
-                f"area_filter_map_{area_map_version}"
-            )
-            existing_drawings = (
-                (existing_widget_state or {}).get("all_drawings") or []
-            )
+            # ÖNEMLİ: bağlantıyı açan kişi haritaya KENDİ ek alan(lar)ını
+            # çizerse, bunlar URL'den gelen alan(lar)ı SİLMEZ -- ikisi
+            # birlikte (OR ile) uygulanır. Eskiden herhangi bir çizim
+            # yapılması URL'deki alanı kalıcı olarak devre dışı
+            # bırakıyordu (bkz. git geçmişi); bu, bağlantıyı paylaşan
+            # kişinin filtresinin, alıcı haritaya ekstra bir bölge
+            # eklediği anda sessizce kaybolmasına yol açıyordu.
 
             url_seed_polygons = pending_url_state.get("area_polygons")
             url_seed_dismissed = st.session_state.get(
@@ -3429,11 +4091,7 @@ def render_data_export():
                 False,
             )
 
-            show_url_seed = bool(
-                url_seed_polygons
-                and not existing_drawings
-                and not url_seed_dismissed
-            )
+            seed_active = bool(url_seed_polygons and not url_seed_dismissed)
 
             area_map = folium.Map(
                 location=map_center,
@@ -3441,7 +4099,7 @@ def render_data_export():
                 tiles="CartoDB dark_matter",
             )
 
-            if show_url_seed:
+            if seed_active:
 
                 for polygon in url_seed_polygons:
 
@@ -3482,6 +4140,9 @@ def render_data_export():
                 (map_output or {}).get("all_drawings") or []
             )
 
+            skipped_degenerate_shapes = 0
+            drawn_polygons = []
+
             for drawing in drawings:
 
                 geometry = drawing.get("geometry", {})
@@ -3490,43 +4151,80 @@ def render_data_export():
 
                     ring = geometry.get("coordinates", [[]])[0]
 
-                    if len(ring) >= 3:
-                        area_polygons.append([
-                            (point[0], point[1])
-                            for point in ring
-                        ])
+                    ring_points = [
+                        (point[0], point[1])
+                        for point in ring
+                    ]
 
-            if drawings:
+                    if _polygon_has_area(ring_points):
+                        drawn_polygons.append(ring_points)
+                    else:
+                        skipped_degenerate_shapes += 1
 
-                # Kullanıcı haritada kendi şeklini çizdi -- URL'den gelen
-                # alan artık geçerli değil, bir daha geri gelmesin.
-                st.session_state["area_filter_url_seed_dismissed"] = True
+            # URL'den gelen alan(lar) (seed_active) ile haritada YENİ
+            # çizilen alan(lar) birbirini SİLMEZ, birlikte (OR ile)
+            # uygulanır -- bkz. yukarıdaki "ÖNEMLİ" notu.
+            area_polygons = (
+                list(url_seed_polygons) if seed_active else []
+            ) + drawn_polygons
+
+            # Fare sürüklenmeden (tek tıkla) çizilen sıfır boyutlu bir
+            # dikdörtgen gibi durumlarda ring geçerli bir alan oluşturmaz
+            # (bkz. _polygon_has_area) -- bu ClickHouse'a gönderilirse
+            # "Geometry has wrong topological dimension" hatasıyla sorgu
+            # tamamen patlardı; bu yüzden burada sessizce elenir ve
+            # kullanıcı bilgilendirilir.
+            if skipped_degenerate_shapes:
+                st.warning(
+                    f"⚠️ {skipped_degenerate_shapes} şekil çok küçük/"
+                    "geçersiz olduğu için yok sayıldı (haritada "
+                    "sürükleyerek gerçek boyutlu bir alan çizin)."
+                )
+
+            area_summary_suffix = (
+                "içindeki satırlar"
+                if area_mode == "include"
+                else "dışındaki satırlar"
+            )
+
+            if drawn_polygons and seed_active:
 
                 st.success(
-                    f"✅ {len(area_polygons)} alan seçildi — "
-                    "aşağıdaki filtrelerle birlikte (bölgeler OR ile "
-                    "birleştirilerek) uygulanacak."
+                    f"✅ Bağlantıdaki {len(url_seed_polygons)} alana, "
+                    f"haritada eklediğiniz {len(drawn_polygons)} alan "
+                    f"daha eklendi (toplam {len(area_polygons)}) — "
+                    f"{area_summary_suffix} aşağıdaki filtrelerle "
+                    "birlikte (bölgeler OR ile birleştirilerek) "
+                    "uygulanacak."
                 )
 
-                if st.button(
-                    "🗑️ Alanı Temizle",
-                    key="clear_area_filter_btn",
-                ):
-                    st.session_state["area_map_version"] = (
-                        area_map_version + 1
-                    )
-                    st.rerun()
+            elif drawn_polygons:
 
-            elif show_url_seed:
+                st.success(
+                    f"✅ {len(drawn_polygons)} alan seçildi — "
+                    f"{area_summary_suffix} aşağıdaki filtrelerle "
+                    "birlikte (bölgeler OR ile birleştirilerek) "
+                    "uygulanacak."
+                )
 
-                area_polygons = url_seed_polygons
+            elif seed_active:
 
                 st.info(
-                    f"🔗 {len(area_polygons)} alan paylaşılan bağlantıdan "
-                    "yüklendi (haritada kesikli çizgiyle gösteriliyor) — "
-                    "aşağıdaki filtrelerle birlikte uygulanacak. Değiştirmek "
-                    "için haritada yeni bir şekil çizin."
+                    f"🔗 {len(url_seed_polygons)} alan paylaşılan "
+                    "bağlantıdan yüklendi (haritada kesikli çizgiyle "
+                    f"gösteriliyor) — {area_summary_suffix} aşağıdaki "
+                    "filtrelerle birlikte uygulanacak. Ek bir alan daha "
+                    "eklemek için haritada yeni bir şekil çizin."
                 )
+
+            else:
+
+                st.caption(
+                    "Henüz bir alan seçilmedi — tüm konumlar dahil "
+                    "edilecek."
+                )
+
+            if area_polygons:
 
                 if st.button(
                     "🗑️ Alanı Temizle",
@@ -3537,13 +4235,6 @@ def render_data_export():
                         area_map_version + 1
                     )
                     st.rerun()
-
-            else:
-
-                st.caption(
-                    "Henüz bir alan seçilmedi — tüm konumlar dahil "
-                    "edilecek."
-                )
 
     with st.expander(
         "🎯 Class ve Değer Bazlı Filtreler",
@@ -3613,6 +4304,7 @@ def render_data_export():
                         "column": vf["column"],
                         "operator": vf["operator"],
                         "value": vf["value"],
+                        "exclude": bool(vf.get("exclude", False)),
                     }
 
                     if "value2" in vf:
@@ -3645,6 +4337,7 @@ def render_data_export():
                         "column": numeric_columns[0],
                         "operator": "<",
                         "value": 0.0,
+                        "exclude": False,
                     }
                 )
 
@@ -3656,8 +4349,8 @@ def render_data_export():
 
                 row_id = filter_row["id"]
 
-                fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(
-                    [2.5, 2, 2, 2, 1]
+                fcol1, fcol2, fcol3, fcol4, fcol5, fcol6 = st.columns(
+                    [2.2, 1.8, 1.8, 1.8, 1.2, 0.8]
                 )
 
                 with fcol1:
@@ -3730,6 +4423,23 @@ def render_data_export():
                     st.write("")
                     st.write("")
 
+                    filter_row["exclude"] = st.checkbox(
+                        "Hariç tut",
+                        value=bool(filter_row.get("exclude", False)),
+                        help=(
+                            "İşaretlenirse bu koşulu SAĞLAYAN satırlar "
+                            "değil, sağlamayan satırlar gösterilir (örn. "
+                            "\"altitude aralıkta 10-50\" + hariç tut = "
+                            "\"altitude 10-50 aralığında DEĞİL\")."
+                        ),
+                        key=f"value_filter_exclude_{row_id}",
+                    )
+
+                with fcol6:
+
+                    st.write("")
+                    st.write("")
+
                     if st.button(
                         "🗑️",
                         key=f"value_filter_remove_{row_id}",
@@ -3766,17 +4476,24 @@ def render_data_export():
 
                     if filter_row["operator"] == RANGE_FILTER_OPERATOR:
 
-                        return (
+                        text = (
                             f"{filter_row['column']} aralıkta "
                             f"[{filter_row['value']} , "
                             f"{filter_row.get('value2', 0.0)}]"
                         )
 
-                    return (
-                        f"{filter_row['column']} "
-                        f"{filter_row['operator']} "
-                        f"{filter_row['value']}"
-                    )
+                    else:
+
+                        text = (
+                            f"{filter_row['column']} "
+                            f"{filter_row['operator']} "
+                            f"{filter_row['value']}"
+                        )
+
+                    if filter_row.get("exclude"):
+                        return f"DEĞİL({text})"
+
+                    return text
 
                 filter_summary = " AND ".join(
                     _format_value_filter(filter_row)
@@ -3817,18 +4534,51 @@ def render_data_export():
                 if col in available_columns
             ]
 
+        if (
+            "export_columns_mode_exclude" not in st.session_state
+            and pending_url_state.get("columns_mode") == "exclude"
+        ):
+            st.session_state["export_columns_mode_exclude"] = True
+
+        columns_mode_exclude = st.checkbox(
+            "🔁 Seçilen kolonları hariç tut (geri kalanların tümünü göster)",
+            help=(
+                "İşaretlenmezse aşağıda seçtiğiniz kolonlar gösterilir. "
+                "İşaretlenirse seçtiğiniz kolonlar ÇIKARILIR, geri kalan "
+                "tüm kolonlar gösterilir -- çoğu kolonu isteyip yalnızca "
+                "birkaçını istemediğinizde tek tek seçmekten daha "
+                "hızlıdır."
+            ),
+            key="export_columns_mode_exclude",
+        )
+
+        columns_mode = "exclude" if columns_mode_exclude else "include"
+
         selected_columns = st.multiselect(
-            "Gösterilecek / dışa aktarılacak kolonlar",
+            "Hariç tutulacak kolonlar"
+            if columns_mode_exclude
+            else "Gösterilecek / dışa aktarılacak kolonlar",
             options=available_columns,
-            default=default_columns,
+            default=[] if columns_mode_exclude else default_columns,
             key="export_selected_columns",
         )
 
-        columns = (
-            selected_columns
-            if selected_columns
-            else None
-        )
+        if columns_mode_exclude:
+            columns = (
+                [
+                    col
+                    for col in available_columns
+                    if col not in selected_columns
+                ]
+                if selected_columns
+                else None
+            )
+        else:
+            columns = (
+                selected_columns
+                if selected_columns
+                else None
+            )
 
         # flight_id kolonu, aşağıdaki "uçuş bazlı ayrı dosyalar" bölümünün
         # doğru çalışabilmesi için (satırları uçuşa göre gruplamak amacıyla)
@@ -3856,21 +4606,42 @@ def render_data_export():
 
     active_filters = []
 
+    if time_mode == "exclude":
+        active_filters.append("tarih aralığı (hariç tut)")
+
     if selected_flights:
-        active_filters.append(f"{len(selected_flights)} uçuş")
+        flight_label = f"{len(selected_flights)} uçuş"
+        if flights_mode == "exclude":
+            flight_label += " (hariç tut)"
+        active_filters.append(flight_label)
+
+    if selected_hours:
+        hour_label = f"{len(selected_hours)} saat"
+        if hours_mode == "exclude":
+            hour_label += " (hariç tut)"
+        active_filters.append(hour_label)
 
     if selected_classes:
         active_filters.append(f"{len(selected_classes)} class")
 
     if area_polygons:
-        active_filters.append(
+        area_label = (
             f"harita alanı ({len(area_polygons)})"
             if len(area_polygons) > 1
             else "harita alanı"
         )
+        if area_mode == "exclude":
+            area_label += " (hariç tut)"
+        active_filters.append(area_label)
 
     if value_filters:
         active_filters.append(f"{len(value_filters)} değer filtresi")
+
+    if duration_filter:
+        active_filters.append("uçuş süresi")
+
+    if columns_mode_exclude and selected_columns:
+        active_filters.append(f"{len(selected_columns)} kolon (hariç tut)")
 
     if active_filters:
         st.caption("🔎 Aktif filtre: " + " · ".join(active_filters))
@@ -3892,6 +4663,13 @@ def render_data_export():
         selected_columns=selected_columns,
         value_filters=value_filters,
         area_polygons=area_polygons,
+        selected_hours=selected_hours,
+        duration_filter=duration_filter,
+        area_mode=area_mode,
+        time_mode=time_mode,
+        hours_mode=hours_mode,
+        flights_mode=flights_mode,
+        columns_mode=columns_mode,
     )
 
     # Filtreler, en son "Satır Sayısını Hesapla" / "Veriyi Getir ve
@@ -3903,8 +4681,12 @@ def render_data_export():
     filter_signature = (
         start_time,
         end_time,
+        time_mode,
         tuple(sorted(selected_classes)),
         tuple(sorted(selected_flights)),
+        flights_mode if selected_flights else None,
+        tuple(sorted(selected_hours)) if selected_hours else None,
+        hours_mode if selected_hours else None,
         tuple(columns) if columns else None,
         tuple(
             (
@@ -3912,12 +4694,21 @@ def render_data_export():
                 value_filter["operator"],
                 value_filter["value"],
                 value_filter.get("value2"),
+                bool(value_filter.get("exclude", False)),
             )
             for value_filter in value_filters
         ),
         tuple(
             tuple(polygon) for polygon in area_polygons
         ) if area_polygons else None,
+        area_mode if area_polygons else None,
+        (
+            duration_filter["operator"],
+            duration_filter["hours"],
+            duration_filter.get("hours2"),
+        )
+        if duration_filter
+        else None,
     )
 
     if st.session_state.get("export_filters_signature") != filter_signature:
@@ -3972,6 +4763,12 @@ def render_data_export():
                     value_filters=value_filters,
                     selected_flights=selected_flights,
                     area_polygons=area_polygons,
+                    selected_hours=selected_hours,
+                    duration_filter=duration_filter,
+                    area_mode=area_mode,
+                    time_mode=time_mode,
+                    hours_mode=hours_mode,
+                    flights_mode=flights_mode,
                 )
 
             st.session_state[
@@ -4029,6 +4826,12 @@ def render_data_export():
                     value_filters=value_filters,
                     selected_flights=selected_flights,
                     area_polygons=area_polygons,
+                    selected_hours=selected_hours,
+                    duration_filter=duration_filter,
+                    area_mode=area_mode,
+                    time_mode=time_mode,
+                    hours_mode=hours_mode,
+                    flights_mode=flights_mode,
                 )
 
             st.session_state[
@@ -4158,7 +4961,16 @@ FLIGHT_COLOR_PALETTE = [
 # birebir ayırt edilmeleri zorlaşabileceği için her uçuşun kimliği
 # ayrıca rota tooltip'inde ve haritanın altındaki lejantta adıyla
 # taşınır (renk asla tek başına kimlik taşımaz).
-MAX_COMPARABLE_FLIGHTS = len(FLIGHT_COLOR_PALETTE)
+#
+# MAX_COMPARABLE_FLIGHTS, kasıtlı olarak paletin boyutundan (8) BÜYÜK
+# tutulabilir -- kategorik bir palette güvenle ayırt edilebilir yeni
+# ton eklemenin pratik bir sınırı var (~8), bunun ötesi renk körlüğüne
+# karşı doğrulanamaz hale gelir. Bu yüzden 9. ve sonraki uçuşlar,
+# _flight_color'daki modulo ile paletin BAŞINDAN itibaren tekrar renk
+# alır (örn. 9. uçuş 1. uçuşla aynı rengi paylaşır) -- kimlik karışıklığı,
+# zaten her uçuşun rota tooltip'inde ve lejantta adıyla taşınmasıyla
+# sınırlı tutulur.
+MAX_COMPARABLE_FLIGHTS = 15
 
 START_POINT_COLOR = "rgb(26, 152, 80)"   # başlangıç -- yeşil (durum rengi, uçuş kimliğinden bağımsız)
 END_POINT_COLOR = "rgb(215, 48, 39)"     # bitiş -- kırmızı (durum rengi, uçuş kimliğinden bağımsız)
@@ -4267,8 +5079,11 @@ def render_flight_map():
         help=(
             "Yazarak arayabilir, listeden bir ya da birden fazla uçuş "
             f"(flight_id) seçebilirsiniz (aynı anda en fazla "
-            f"{MAX_COMPARABLE_FLIGHTS} uçuş -- daha fazlası harita "
-            "üzerinde renkleri ayırt etmeyi zorlaştırır)."
+            f"{MAX_COMPARABLE_FLIGHTS} uçuş). İlk {len(FLIGHT_COLOR_PALETTE)} "
+            "uçuş birbirinden farklı renk alır; sonrasında renkler baştan "
+            "tekrar eder -- hangi rotanın hangi uçuşa ait olduğunu rota "
+            "tooltip'inden ve haritanın altındaki lejanttan da "
+            "görebilirsiniz."
         ),
     )
 
