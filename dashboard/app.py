@@ -2615,11 +2615,51 @@ def render_alerts(
 # ============================================================
 
 DOWNLOAD_FORMAT_LABELS = {
-    "all": "📄 Tüm Veri (Tek CSV)",
+    "all": "📄 Tüm Veri (Tek Dosya)",
     "zip": "📦 Uçuş Bazlı ZIP",
     "each": "✈️ Uçuşları Tek Tek İndir",
     "merge": "🧩 Seçili Uçuşları Birleştir",
 }
+
+# Dosya TİPİ (CSV / Parquet) -- yukarıdaki DOWNLOAD_FORMAT_LABELS'tan
+# bağımsız bir eksen: format YAPIYI (tek dosya mı, uçuş başına ayrı
+# dosya mı) belirlerken, bu seçim üretilen her dosyanın biçimini
+# belirler. Parquet; sütun bazlı, sıkıştırılmış ve pandas/pyarrow ile
+# CSV'den daha hızlı okunan bir format -- büyük veri setlerini başka
+# bir analiz aracına (örn. pandas, Spark) aktarmak için tercih edilir.
+DOWNLOAD_FILE_TYPE_LABELS = {
+    "csv": "📄 CSV",
+    "parquet": "🗄️ Parquet (.parquet)",
+}
+
+
+def _download_file_extension(file_type: str) -> str:
+    return "parquet" if file_type == "parquet" else "csv"
+
+
+def _download_mime_type(file_type: str) -> str:
+    return (
+        "application/octet-stream"
+        if file_type == "parquet"
+        else "text/csv"
+    )
+
+
+def _dataframe_to_download_bytes(
+    dataframe: pd.DataFrame,
+    file_type: str,
+) -> bytes:
+    """
+    dataframe'i seçilen dosya tipine göre byte'a çevirir. CSV için
+    Excel'in Türkçe karakterleri doğru okuyabilmesi adına "utf-8-sig"
+    (BOM'lu UTF-8) kullanılır; parquet zaten ikili/kendi kendini
+    tanımlayan bir format olduğu için kodlama sorunu yaşanmaz.
+    """
+
+    if file_type == "parquet":
+        return dataframe.to_parquet(index=False)
+
+    return dataframe.to_csv(index=False).encode("utf-8-sig")
 
 
 def render_download_section(
@@ -2679,6 +2719,24 @@ def render_download_section(
         key="download_format_choice",
     )
 
+    if "download_file_type_choice" not in st.session_state:
+
+        pending_file_type = _decode_export_state_from_query_params(
+            st.query_params.to_dict()
+        ).get("download_file_type")
+
+        if pending_file_type in DOWNLOAD_FILE_TYPE_LABELS:
+            st.session_state["download_file_type_choice"] = pending_file_type
+
+    selected_file_type = st.radio(
+        "Dosya tipi",
+        options=list(DOWNLOAD_FILE_TYPE_LABELS.keys()),
+        format_func=lambda key: DOWNLOAD_FILE_TYPE_LABELS[key],
+        index=0,
+        horizontal=True,
+        key="download_file_type_choice",
+    )
+
     # --------------------------------------------------------
     # URL İLE PAYLAŞMA
     # --------------------------------------------------------
@@ -2714,6 +2772,7 @@ def render_download_section(
 
             full_share_params = dict(share_params)
             full_share_params["export_fmt"] = selected_format
+            full_share_params["export_ft"] = selected_file_type
             full_share_params["tab"] = "export"
 
             for existing_key in list(st.query_params.keys()):
@@ -2799,6 +2858,7 @@ def render_download_section(
         _render_all_data_csv_download(
             dataframe,
             time_suffix,
+            selected_file_type,
         )
 
         return
@@ -2854,6 +2914,7 @@ def render_download_section(
             flight_groups,
             time_suffix,
             dataframe_id,
+            selected_file_type,
         )
 
     elif selected_format == "each":
@@ -2862,6 +2923,7 @@ def render_download_section(
             flight_groups,
             time_suffix,
             dataframe_id,
+            selected_file_type,
         )
 
     else:
@@ -2870,28 +2932,32 @@ def render_download_section(
             flight_groups,
             time_suffix,
             dataframe_id,
+            selected_file_type,
         )
 
 
 def _render_all_data_csv_download(
     dataframe: pd.DataFrame,
     time_suffix: str,
+    file_type: str,
 ) -> None:
 
+    extension = _download_file_extension(file_type)
+
     st.caption(
-        f"CSV dosyası: {len(dataframe):,} satır, "
-        f"{len(dataframe.columns)} kolon"
+        f"{DOWNLOAD_FILE_TYPE_LABELS[file_type]} dosyası: "
+        f"{len(dataframe):,} satır, {len(dataframe.columns)} kolon"
     )
 
     # Dönüşüm yalnızca kullanıcı açıkça bu butona basınca çalışır --
     # aksi halde "Tüm Veri" formatı varsayılan seçili geldiği için sekme
     # açılır açılmaz (kullanıcı hiçbir şey yapmadan) büyük veri setinde
-    # saniyeler süren bir CSV dönüşümü otomatik başlıyordu.
+    # saniyeler süren bir dönüşüm otomatik başlıyordu.
 
-    cache_key = ("all", id(dataframe))
+    cache_key = ("all", id(dataframe), file_type)
 
     if st.button(
-        "📄 CSV Oluştur",
+        f"{DOWNLOAD_FILE_TYPE_LABELS[file_type]} Oluştur",
         type="primary",
         key="prepare_all_data_csv",
     ):
@@ -2905,15 +2971,14 @@ def _render_all_data_csv_download(
             "bu işlem biraz sürebilir..."
         ):
 
-            csv_bytes = dataframe.to_csv(
-                index=False
-            ).encode(
-                "utf-8-sig"
+            file_bytes = _dataframe_to_download_bytes(
+                dataframe,
+                file_type,
             )
 
         st.session_state["download_all_data_cache"] = {
             "key": cache_key,
-            "bytes": csv_bytes,
+            "bytes": file_bytes,
         }
 
     cache = st.session_state.get("download_all_data_cache")
@@ -2921,10 +2986,10 @@ def _render_all_data_csv_download(
     if cache and cache["key"] == cache_key:
 
         st.download_button(
-            label="⬇️ Tüm Veriyi CSV Olarak İndir",
+            label=f"⬇️ Tüm Veriyi {extension.upper()} Olarak İndir",
             data=cache["bytes"],
-            file_name=f"au_air_telemetry_{time_suffix}.csv",
-            mime="text/csv",
+            file_name=f"au_air_telemetry_{time_suffix}.{extension}",
+            mime=_download_mime_type(file_type),
             type="primary",
             key="download_all_data_csv",
         )
@@ -2940,14 +3005,43 @@ def _render_flight_zip_download(
     flight_groups: dict,
     time_suffix: str,
     dataframe_id: int,
+    file_type: str,
 ) -> None:
 
-    st.caption(
-        f"{len(flight_groups)} uçuş, toplam "
-        f"{sum(len(g) for g in flight_groups.values()):,} satır."
+    extension = _download_file_extension(file_type)
+
+    flight_options = sorted(flight_groups.keys())
+
+    selected_flights_to_zip = st.multiselect(
+        "ZIP'e dahil edilecek uçuşlar",
+        options=flight_options,
+        help=(
+            "ZIP'e dahil etmek istediğiniz uçuşları seçin (hepsini "
+            "istiyorsanız listeden tümünü seçin)."
+        ),
+        key="download_zip_selected_flights",
     )
 
-    cache_key = ("zip", dataframe_id)
+    if not selected_flights_to_zip:
+
+        st.caption(
+            "ZIP oluşturmak için yukarıdan bir ya da daha fazla uçuş seçin."
+        )
+
+        return
+
+    st.caption(
+        f"{len(selected_flights_to_zip)} uçuş, toplam "
+        f"{sum(len(flight_groups[f]) for f in selected_flights_to_zip):,} "
+        "satır."
+    )
+
+    cache_key = (
+        "zip",
+        dataframe_id,
+        tuple(sorted(selected_flights_to_zip)),
+        file_type,
+    )
 
     if st.button(
         "📦 ZIP Oluştur",
@@ -2956,7 +3050,7 @@ def _render_flight_zip_download(
     ):
 
         with st.spinner(
-            f"{len(flight_groups)} uçuş için ZIP hazırlanıyor..."
+            f"{len(selected_flights_to_zip)} uçuş için ZIP hazırlanıyor..."
         ):
 
             zip_buffer = io.BytesIO()
@@ -2967,15 +3061,16 @@ def _render_flight_zip_download(
                 compression=zipfile.ZIP_DEFLATED,
             ) as zip_file:
 
-                for flight, group_df in flight_groups.items():
+                for flight in selected_flights_to_zip:
 
-                    csv_bytes = group_df.to_csv(
-                        index=False
-                    ).encode("utf-8-sig")
+                    file_bytes = _dataframe_to_download_bytes(
+                        flight_groups[flight],
+                        file_type,
+                    )
 
                     zip_file.writestr(
-                        f"ucus_{flight}_{time_suffix}.csv",
-                        csv_bytes,
+                        f"ucus_{flight}_{time_suffix}.{extension}",
+                        file_bytes,
                     )
 
         st.session_state["download_flight_zip_cache"] = {
@@ -2989,8 +3084,8 @@ def _render_flight_zip_download(
 
         st.download_button(
             label=(
-                f"⬇️ Tüm Uçuşları ZIP Olarak İndir "
-                f"({len(flight_groups)} dosya)"
+                f"⬇️ Seçilen Uçuşları ZIP Olarak İndir "
+                f"({len(selected_flights_to_zip)} dosya)"
             ),
             data=cache["bytes"],
             file_name=f"ucuslar_{time_suffix}.zip",
@@ -3000,7 +3095,7 @@ def _render_flight_zip_download(
         )
 
         st.caption(
-            "Her uçuş için ayrı bir CSV dosyası içerir."
+            f"Her uçuş için ayrı bir {extension.upper()} dosyası içerir."
         )
 
     else:
@@ -3014,25 +3109,56 @@ def _render_flight_individual_downloads(
     flight_groups: dict,
     time_suffix: str,
     dataframe_id: int,
+    file_type: str,
 ) -> None:
 
-    cache_key = ("each", dataframe_id)
+    extension = _download_file_extension(file_type)
+
+    flight_options = sorted(flight_groups.keys())
+
+    selected_flights_to_prepare = st.multiselect(
+        "İndirilecek uçuşlar",
+        options=flight_options,
+        help=(
+            "Yalnızca burada seçtiğiniz uçuşların dosyası hazırlanır -- "
+            "gereksiz yere tüm uçuşların dosyasını oluşturmaktan kaçınmak "
+            "için yalnızca istediklerinizi seçin."
+        ),
+        key="download_each_selected_flights",
+    )
+
+    if not selected_flights_to_prepare:
+
+        st.caption(
+            "Hazırlamak için yukarıdan bir ya da daha fazla uçuş seçin."
+        )
+
+        return
+
+    cache_key = (
+        "each",
+        dataframe_id,
+        tuple(sorted(selected_flights_to_prepare)),
+        file_type,
+    )
 
     if st.button(
-        "✈️ CSV'leri Oluştur",
+        f"✈️ {extension.upper()}'leri Oluştur",
         type="primary",
         key="prepare_flight_individual_csvs",
     ):
 
         with st.spinner(
-            f"{len(flight_groups)} uçuş için CSV dosyaları hazırlanıyor..."
+            f"{len(selected_flights_to_prepare)} uçuş için "
+            f"{extension.upper()} dosyaları hazırlanıyor..."
         ):
 
             flight_csv_bytes = {
-                flight: group_df.to_csv(
-                    index=False
-                ).encode("utf-8-sig")
-                for flight, group_df in flight_groups.items()
+                flight: _dataframe_to_download_bytes(
+                    flight_groups[flight],
+                    file_type,
+                )
+                for flight in selected_flights_to_prepare
             }
 
         st.session_state["download_flight_individual_cache"] = {
@@ -3052,7 +3178,9 @@ def _render_flight_individual_downloads(
 
     flight_csv_bytes = cache["bytes"]
 
-    for flight, group_df in sorted(flight_groups.items()):
+    for flight in sorted(selected_flights_to_prepare):
+
+        group_df = flight_groups[flight]
 
         col_a, col_b = st.columns(
             [3, 1]
@@ -3067,10 +3195,10 @@ def _render_flight_individual_downloads(
         with col_b:
 
             st.download_button(
-                label="CSV indir",
+                label=f"{extension.upper()} indir",
                 data=flight_csv_bytes[flight],
-                file_name=f"ucus_{flight}_{time_suffix}.csv",
-                mime="text/csv",
+                file_name=f"ucus_{flight}_{time_suffix}.{extension}",
+                mime=_download_mime_type(file_type),
                 key=f"download_flight_{flight}",
             )
 
@@ -3079,15 +3207,18 @@ def _render_flight_merge_download(
     flight_groups: dict,
     time_suffix: str,
     dataframe_id: int,
+    file_type: str,
 ) -> None:
     """
     Filtreye uyan uçuşlar arasından kullanıcının seçtiği BİRKAÇININ
-    (hepsinin değil) satırlarını tek bir CSV'de birleştirir -- örn.
+    (hepsinin değil) satırlarını tek bir dosyada birleştirir -- örn.
     filtreye uyan 5 uçuş varken yalnızca uçuş1 ve uçuş2'yi birleştirip
     tek dosya olarak indirmek için. "Tüm Veri" formatından farkı budur:
     o format filtreye uyan TÜM uçuşları birleştirir, burası ise
     kullanıcının seçtiği bir alt kümeyi.
     """
+
+    extension = _download_file_extension(file_type)
 
     flight_options = sorted(flight_groups.keys())
 
@@ -3095,7 +3226,7 @@ def _render_flight_merge_download(
         "Birleştirilecek uçuşlar",
         options=flight_options,
         help=(
-            "Filtreye uyan uçuşlar arasından, tek bir CSV'de "
+            "Filtreye uyan uçuşlar arasından, tek bir dosyada "
             "birleştirmek istediklerinizi seçin (örn. 5 uçuş içinden "
             "yalnızca 2'sini birleştirip indirebilirsiniz)."
         ),
@@ -3124,10 +3255,11 @@ def _render_flight_merge_download(
         "merge",
         dataframe_id,
         tuple(sorted(selected_flights_to_merge)),
+        file_type,
     )
 
     if st.button(
-        "🧩 Birleştirilmiş CSV Oluştur",
+        f"🧩 Birleştirilmiş {extension.upper()} Oluştur",
         type="primary",
         key="prepare_flight_merge_csv",
     ):
@@ -3144,13 +3276,14 @@ def _render_flight_merge_download(
                 ignore_index=True,
             )
 
-            csv_bytes = merged_df.to_csv(
-                index=False
-            ).encode("utf-8-sig")
+            file_bytes = _dataframe_to_download_bytes(
+                merged_df,
+                file_type,
+            )
 
         st.session_state["download_flight_merge_cache"] = {
             "key": cache_key,
-            "bytes": csv_bytes,
+            "bytes": file_bytes,
         }
 
     cache = st.session_state.get("download_flight_merge_cache")
@@ -3166,12 +3299,15 @@ def _render_flight_merge_download(
 
         st.download_button(
             label=(
-                f"⬇️ Birleştirilmiş CSV'yi İndir "
+                f"⬇️ Birleştirilmiş {extension.upper()}'yi İndir "
                 f"({len(selected_flights_to_merge)} uçuş)"
             ),
             data=cache["bytes"],
-            file_name=f"ucuslar_birlesik_{flights_label}_{time_suffix}.csv",
-            mime="text/csv",
+            file_name=(
+                f"ucuslar_birlesik_{flights_label}_{time_suffix}."
+                f"{extension}"
+            ),
+            mime=_download_mime_type(file_type),
             type="primary",
             key="download_flight_merge_csv",
         )
@@ -3413,6 +3549,9 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
 
     if "export_fmt" in query_params:
         state["download_format"] = query_params["export_fmt"]
+
+    if "export_ft" in query_params:
+        state["download_file_type"] = query_params["export_ft"]
 
     if "export_vf" in query_params:
 
