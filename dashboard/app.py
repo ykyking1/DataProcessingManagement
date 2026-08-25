@@ -2515,10 +2515,39 @@ def render_alerts(
 
                     run_url = f"{get_ui_url()}/runs/{run_id}"
 
-                    st.link_button(
-                        "🔁 Dagster'da Aç ve Tekrar Çalıştır",
-                        run_url,
+                    alert_status = row.get(
+                        "status",
+                        "FAILURE",
                     )
+
+                    button_col, status_col = st.columns(
+                        [1, 2]
+                    )
+
+                    with button_col:
+
+                        st.link_button(
+                            "🔁 Dagster'da Aç ve Tekrar Çalıştır",
+                            run_url,
+                        )
+
+                    if alert_status == "RESOLVED":
+
+                        resolved_at = row.get(
+                            "resolved_at"
+                        )
+
+                        with status_col:
+
+                            st.success(
+                                "✅ Bu hata çözüldü, tekrar çalıştırmaya "
+                                "gerek yok"
+                                + (
+                                    f" (`{resolved_at}`)"
+                                    if resolved_at and not pd.isna(resolved_at)
+                                    else ""
+                                )
+                            )
 
     elif not alerts_df.empty:
 
