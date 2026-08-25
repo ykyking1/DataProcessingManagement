@@ -21,6 +21,7 @@ load_dotenv(
 import assets
 
 from schedules.telemetry_sensor import telemetry_sensor
+from schedules.mx_tab_sensor import mx_tab_sensor
 
 # İKİ HOOK'U DA İÇERİ AKTAR
 from alerting import alert_on_failure, clear_alert_on_success
@@ -47,13 +48,26 @@ uav_data_pipeline_job = define_asset_job(
     # başarısız ederdi. Bu asset yalnızca Dagster UI'dan elle
     # "Materialize" edilip file_path verilerek çalıştırılmalı (bkz.
     # assets.py::extended_telemetry_load).
-    selection=AssetSelection.all() - AssetSelection.assets(
-        assets.extended_telemetry_load
+    selection=AssetSelection.all()
+    - AssetSelection.assets(
+        assets.extended_telemetry_load,
+        assets.spark_processed_tab,
+        assets.spark_validated_tab,
+        assets.dvc_published_mx_tab,
     ),
     hooks={
         alert_on_failure,
         clear_alert_on_success, # YENİ EKLENEN KISIM
     },
+)
+
+mx_tab_quality_job = define_asset_job(
+    name="mx_tab_quality_job",
+    selection=AssetSelection.assets(
+        assets.spark_processed_tab,
+        assets.spark_validated_tab,
+        assets.dvc_published_mx_tab,
+    ),
 )
 
 
@@ -66,9 +80,11 @@ defs = Definitions(
 
     jobs=[
         uav_data_pipeline_job,
+        mx_tab_quality_job,
     ],
 
     sensors=[
         telemetry_sensor,
+        mx_tab_sensor,
     ],
 )

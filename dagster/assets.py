@@ -22,7 +22,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from dagster import Config, MaterializeResult, MetadataValue, asset
+from dagster import Config, Failure, MaterializeResult, MetadataValue, asset
 
 from partitions import daily_partitions
 from metadata_store import record_asset_metadata
@@ -38,6 +38,14 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 
 RAW_INTERIM_DIR = DAGSTER_DIR / "data" / "interim" / "raw"
 PROCESSED_DATA_DIR = DAGSTER_DIR / "data" / "processed"
+MX_TAB_PROCESSED_DIR = PROJECT_ROOT / "tmp" / "dagster_spark_ge" / "processed"
+MX_TAB_VALIDATION_REPORT = (
+    PROJECT_ROOT
+    / "reports"
+    / "validation"
+    / "dagster_spark_ge_validation.json"
+)
+MX_TAB_DVC_RELEASE_DIR = PROJECT_ROOT / "data" / "processed" / "mx_tab"
 
 PIPELINE_GIT_PATHS = [
     "dagster",
@@ -95,6 +103,185 @@ def _run_script(context, command: list, cwd: Path = DAGSTER_DIR) -> None:
             f"{script_name} başarısız oldu (exit code {result.returncode}).\n"
             f"{result.stderr.rstrip() if result.stderr else '(stderr boş)'}"
         )
+
+
+def _resolve_project_path(path_value: str) -> Path:
+    """Resolve relative asset config paths from the repository root."""
+
+    path = Path(path_value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _quality_report_metadata(report_path: Path, report: dict) -> dict:
+    """Build the Dagster metadata shown for a GE validation materialization."""
+
+    statistics = report.get("statistics", {})
+    return {
+        "quality_status": "passed" if report.get("success") else "failed",
+        "evaluated_expectations": statistics.get("evaluated_expectations", 0),
+        "successful_expectations": statistics.get("successful_expectations", 0),
+        "unsuccessful_expectations": statistics.get(
+            "unsuccessful_expectations", 0
+        ),
+        "success_percent": statistics.get("success_percent", 0.0),
+        "validated_feature_columns": MetadataValue.json(
+            report.get("validated_feature_columns", [])
+        ),
+        "report_path": MetadataValue.path(str(report_path)),
+        "quality_report": MetadataValue.json(report),
+    }
+
+
+# ===========================================================================
+# spark_processed_tab -> spark_validated_tab (manual integration demo)
+# ===========================================================================
+
+
+class SparkTabProcessingConfig(Config):
+    """Local inputs for the MX Spark preprocessing integration demo."""
+
+    input_path: str = "data/processed/mx_small_cleaned/mx10000_10rows_clean.tab"
+    output_path: str = str(MX_TAB_PROCESSED_DIR)
+    max_columns: int = 100_000
+    timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+    spark_master: str = "local[2]"
+    zstd_level: int = 12
+
+
+@asset(
+    group_name="mx_tab_quality",
+    compute_kind="spark",
+    description=(
+        "Processes a cleaned MX .tab/.tab.zst dataset with Spark and writes "
+        "partitioned .tab.zst output for the validation asset."
+    ),
+)
+def spark_processed_tab(context, config: SparkTabProcessingConfig):
+    input_path = _resolve_project_path(config.input_path)
+    output_path = _resolve_project_path(config.output_path)
+
+    command = [
+        sys.executable,
+        str(SCRIPTS_DIR / "preprocess_tab_spark.py"),
+        "--input",
+        str(input_path),
+        "--output",
+        str(output_path),
+        "--max-columns",
+        str(config.max_columns),
+        "--timestamp-format",
+        config.timestamp_format,
+        "--spark-master",
+        config.spark_master,
+        "--zstd-level",
+        str(config.zstd_level),
+    ]
+
+    context.log.info("Spark preprocessing started: %s", input_path)
+    _run_script(context, command, cwd=PROJECT_ROOT)
+
+    part_files = sorted(output_path.glob("part-*.tab.zst"))
+    output_size_bytes = sum(path.stat().st_size for path in part_files)
+    context.log.info(
+        "Spark preprocessing completed: %s part(s), %s bytes.",
+        len(part_files),
+        output_size_bytes,
+    )
+
+    return MaterializeResult(
+        value=str(output_path),
+        metadata={
+            "input_path": MetadataValue.path(str(input_path)),
+            "output_path": MetadataValue.path(str(output_path)),
+            "part_count": len(part_files),
+            "output_size_bytes": output_size_bytes,
+            "spark_master": config.spark_master,
+            "zstd_level": config.zstd_level,
+        },
+    )
+
+
+class SparkTabValidationConfig(Config):
+    """Great Expectations settings for processed MX tab data."""
+
+    report_path: str = str(MX_TAB_VALIDATION_REPORT)
+    expected_aircraft_type: str | None = "MX10000"
+    result_format: str = "BASIC"
+    max_columns: int = 100_000
+    timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+    spark_master: str = "local[2]"
+
+
+@asset(
+    group_name="mx_tab_quality",
+    compute_kind="great_expectations",
+    description=(
+        "Validates the Spark-processed MX dataset with Great Expectations "
+        "and exposes the JSON quality report in Dagster metadata."
+    ),
+)
+def spark_validated_tab(
+    context,
+    spark_processed_tab: str,
+    config: SparkTabValidationConfig,
+):
+    processed_path = Path(spark_processed_tab).resolve()
+    report_path = _resolve_project_path(config.report_path)
+    report_path.unlink(missing_ok=True)
+
+    command = [
+        sys.executable,
+        str(SCRIPTS_DIR / "validate_tab_spark_ge.py"),
+        "--input",
+        str(processed_path),
+        "--report",
+        str(report_path),
+        "--result-format",
+        config.result_format,
+        "--max-columns",
+        str(config.max_columns),
+        "--timestamp-format",
+        config.timestamp_format,
+        "--spark-master",
+        config.spark_master,
+    ]
+    if config.expected_aircraft_type is not None:
+        command.extend(
+            ["--expected-aircraft-type", config.expected_aircraft_type]
+        )
+
+    context.log.info("GE validation started: %s", processed_path)
+    execution_error = None
+    try:
+        _run_script(context, command, cwd=PROJECT_ROOT)
+    except RuntimeError as error:
+        execution_error = error
+
+    if not report_path.is_file():
+        if execution_error is not None:
+            raise execution_error
+        raise RuntimeError(f"Validation report was not created: {report_path}")
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    metadata = _quality_report_metadata(report_path, report)
+    statistics = report.get("statistics", {})
+    context.log.info(
+        "GE quality result: success=%s, passed=%s/%s.",
+        report.get("success"),
+        statistics.get("successful_expectations", 0),
+        statistics.get("evaluated_expectations", 0),
+    )
+
+    if execution_error is not None or not report.get("success", False):
+        raise Failure(
+            description=f"GE validation failed. Report: {report_path}",
+            metadata=metadata,
+        ) from execution_error
+
+    return MaterializeResult(
+        value=str(report_path),
+        metadata=metadata,
+    )
 
 
 # ===========================================================================
@@ -590,4 +777,78 @@ def dvc_published_telemetry(context, processed_telemetry: list):
             "raw_batches": batch_id,
             "git_commit_created": False,
         }
+    )
+
+
+@asset(
+    group_name="publishing",
+    compute_kind="dvc",
+    description=(
+        "Stages successfully validated MX output at a stable data path, "
+        "updates its DVC pointer, and logs the proposed Git commit metadata."
+    ),
+)
+def dvc_published_mx_tab(
+    context,
+    spark_processed_tab: str,
+    spark_validated_tab: str,
+):
+    """Update the MX DVC pointer without Git commit, Git push, or dvc push."""
+
+    source_path = Path(spark_processed_tab).resolve()
+    validation_report_path = Path(spark_validated_tab).resolve()
+    release_path = MX_TAB_DVC_RELEASE_DIR.resolve()
+    pointer_path = release_path.with_name(f"{release_path.name}.dvc")
+    pipeline_git_sha = _get_pipeline_git_sha()
+    pipeline_version = _get_pipeline_version(pipeline_git_sha)
+    raw_batch = source_path.parent.name
+
+    command = [
+        sys.executable,
+        str(SCRIPTS_DIR / "publish_validated_data.py"),
+        "--data-path",
+        str(source_path),
+        "--release-path",
+        str(release_path),
+        "--pipeline-version",
+        pipeline_version,
+        "--pipeline-git-sha",
+        pipeline_git_sha,
+        "--raw-batches",
+        raw_batch,
+    ]
+
+    context.log.info(
+        "DVC release started for validated MX batch %s.", raw_batch
+    )
+    _run_script(context, command, cwd=PROJECT_ROOT)
+
+    if not pointer_path.is_file():
+        raise RuntimeError(f"DVC pointer was not created: {pointer_path}")
+
+    relative_release_path = release_path.relative_to(PROJECT_ROOT)
+    relative_pointer_path = pointer_path.relative_to(PROJECT_ROOT)
+    context.log.info(
+        "DVC pointer updated. Review it and create the Git commit manually: %s",
+        relative_pointer_path.as_posix(),
+    )
+
+    return MaterializeResult(
+        value=str(pointer_path),
+        metadata={
+            "source_path": MetadataValue.path(str(source_path)),
+            "release_path": MetadataValue.path(str(release_path)),
+            "dvc_pointer": MetadataValue.path(str(pointer_path)),
+            "validation_report": MetadataValue.path(
+                str(validation_report_path)
+            ),
+            "pipeline_version": pipeline_version,
+            "pipeline_git_sha": pipeline_git_sha,
+            "raw_batch": raw_batch,
+            "dvc_target": relative_release_path.as_posix(),
+            "dvc_pointer_git_path": relative_pointer_path.as_posix(),
+            "dvc_pushed": False,
+            "git_commit_created": False,
+            "git_push_performed": False,
+        },
     )
