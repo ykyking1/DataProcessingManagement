@@ -4,6 +4,16 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.3.0 (2026-08-25)
+
+
+### Features
+
+- **pipeline**: Add reproducible Spark validation stages ([`103bdf7`](https://github.com/ykyking1/DataProcessingManagement/commit/103bdf73f92c35b1e5fb64a439f33bc572d77576))
+
+
+
+
 ## pipeline-v0.2.0 (2026-08-24)
 
 
