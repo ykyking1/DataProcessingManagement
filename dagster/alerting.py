@@ -227,6 +227,28 @@ def clear_alert_on_success(context: HookContext):
     if not ALERT_FILE.exists():
         return
 
+    # Bu run, daha önce başarısız olmuş bir run'ın "re-execute"i ise
+    # (dashboard'daki "Dagster'da Aç ve Tekrar Çalıştır" linkiyle),
+    # parent_run_id zinciri o başarısız run'lara kadar uzanır. Sadece
+    # bu zincirdeki run_id'lere ait FAILURE alertlerini çözülmüş say.
+    # Bağımsız (re-execute olmayan) yeni bir başarılı run, aynı
+    # job/step'e ait BAŞKA alertleri otomatik çözmemeli — onlar ayrı
+    # olaylardır ve kendi re-execute'larıyla çözülmelidir.
+    ancestor_run_ids = set()
+
+    try:
+        current_run = context.instance.get_run_by_id(context.run_id)
+
+        while current_run is not None and current_run.parent_run_id:
+            ancestor_run_ids.add(current_run.parent_run_id)
+            current_run = context.instance.get_run_by_id(current_run.parent_run_id)
+
+    except Exception as exc:
+        context.log.error(f"Run soy ağacı okunurken hata oluştu: {exc}")
+
+    if not ancestor_run_ids:
+        return
+
     try:
         existing_alerts = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
         if not isinstance(existing_alerts, list):
@@ -235,10 +257,11 @@ def clear_alert_on_success(context: HookContext):
         is_updated = False
 
         for alert in existing_alerts:
-            if (alert.get("job_name") == job_name and 
-                alert.get("step_name") == step_name and 
-                alert.get("status") == "FAILURE"):
-                
+            if (alert.get("job_name") == job_name and
+                alert.get("step_name") == step_name and
+                alert.get("status") == "FAILURE" and
+                alert.get("run_id") in ancestor_run_ids):
+
                 alert["status"] = "RESOLVED"
                 alert["resolved_at"] = datetime.now(timezone.utc).isoformat()
                 is_updated = True

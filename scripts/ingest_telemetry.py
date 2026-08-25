@@ -8,8 +8,9 @@ import pandas as pd
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "AU-AIR telemetri verisini kaynaktan (CSV veya Parquet) okur, "
-            "günlük partition'a göre filtreler ve flight_id kolonunu ekler."
+            "AU-AIR telemetri verisini kaynaktan (CSV, TAB veya Parquet) "
+            "okur, günlük partition'a göre filtreler ve flight_id "
+            "kolonunu ekler."
         )
     )
     parser.add_argument("--file-path", required=True, type=Path)
@@ -20,8 +21,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# "dataset.tab.gz" gibi bileşik uzantılarda Path.suffix yalnızca SON
+# parçayı (".gz") görür -- bu eşleme, sıkıştırılmış varyantları asıl
+# format uzantısına indirger ki aşağıdaki dispatch mantığı .tab.gz'yi
+# de .tab gibi tanısın. Sıkıştırmanın kendisi (gzip açma) ayrıca
+# belirtilmese bile pandas'ın read_csv'si dosya adındaki ".gz"yi
+# otomatik algılayıp açtığı için burada sadece FORMAT belirleniyor.
+COMPRESSED_SUFFIX_ALIASES = {
+    ".tab.gz": ".tab",
+    ".csv.gz": ".csv",
+}
+
+
+def _resolve_format_suffix(path: Path) -> str:
+
+    name_lower = path.name.lower()
+
+    for compound_suffix, format_suffix in COMPRESSED_SUFFIX_ALIASES.items():
+        if name_lower.endswith(compound_suffix):
+            return format_suffix
+
+    return path.suffix.lower()
+
+
 def read_source(path: Path) -> pd.DataFrame:
-    suffix = path.suffix.lower()
+    suffix = _resolve_format_suffix(path)
 
     if suffix == ".csv":
         # Ayracı otomatik algıla (sep=None + engine="python").
@@ -38,9 +62,31 @@ def read_source(path: Path) -> pd.DataFrame:
     if suffix == ".parquet":
         return pd.read_parquet(path)
 
+    if suffix == ".tab":
+        # .tab da CSV gibi ayraçlı düz metin, farkı tab (\t) karakteriyle
+        # ayrılması. Bilinen bir kaynak sorunu: bazı .tab dosyalarının her
+        # satırının SONUNDA fazladan bir tab karakteri var (bkz.
+        # scripts/clean_tab_trailing_tab.py) -- bu, pandas'ın satır
+        # sonundaki "hayali" boş alanı gerçek bir sütun sanmasına yol açar
+        # (isimsiz/boş başlıklı bir sütun olarak görünür). Böyle bir sütun
+        # varsa burada otomatik olarak atılır; sorun yoksa bu adım no-op'tur.
+        df = pd.read_csv(path, sep="\t", engine="python")
+        df.columns = df.columns.str.strip()
+
+        trailing_empty_columns = [
+            column
+            for column in df.columns
+            if column == "" or str(column).startswith("Unnamed:")
+        ]
+
+        if trailing_empty_columns:
+            df = df.drop(columns=trailing_empty_columns)
+
+        return df
+
     raise ValueError(
         f"Desteklenmeyen dosya formatı: '{suffix}' ({path}). "
-        f"Yalnızca .csv ve .parquet destekleniyor."
+        f"Yalnızca .csv, .tab ve .parquet destekleniyor."
     )
 
 
@@ -63,7 +109,14 @@ def main() -> None:
 
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
 
-    flight_id = args.flight_id.strip() or path.stem
+    # path.stem yalnızca SON uzantıyı atar -- "dataset.tab.gz" için
+    # varsayılan flight_id "dataset.tab" gibi yanlış bir değere düşmesin
+    # diye ".gz" varsa önce o soyulur.
+    default_flight_id = path.stem
+    if path.suffix.lower() == ".gz":
+        default_flight_id = Path(default_flight_id).stem
+
+    flight_id = args.flight_id.strip() or default_flight_id
     df["flight_id"] = flight_id
 
     day_start = pd.Timestamp(args.partition_date)

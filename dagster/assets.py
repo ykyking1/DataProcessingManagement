@@ -376,6 +376,82 @@ def clickhouse_telemetry(context, processed_telemetry: list):
 
 
 # ===========================================================================
+# extended_telemetry_load
+# ===========================================================================
+#
+# AU-AIR'in sabit 17 sütunluk şemasına (raw_uav_telemetry -> processed_
+# telemetry -> clickhouse_telemetry zinciri) uymayan, çok daha geniş
+# şemalı (binlerce sütunlu) kaynak dosyalar için ayrı bir asset. Bu
+# dosyalar genelde birden fazla uçuşu/tarihi tek dosyada birleştirdiği
+# için günlük partition modeline uymuyor -- bu yüzden partitions_def
+# YOK; Dagster UI'dan "Materialize" ile elle, işlenecek dosyanın yolu
+# config olarak verilerek tetiklenir. scripts/load_extended_telemetry.py
+# şemayı dosyanın kendisinden çıkarıp ayrı bir ClickHouse tablosuna
+# (varsayılan: telemetry_extended) yazar -- mevcut `telemetry` tablosuna
+# dokunmaz.
+
+class ExtendedTelemetryConfig(Config):
+
+    file_path: str
+    """İşlenecek geniş şemalı dosyanın tam yolu (.tab/.tab.gz/.csv/.csv.gz)."""
+
+    table_name: str = "telemetry_extended"
+    """Verinin yazılacağı ClickHouse tablosu."""
+
+    chunk_rows: int = 50_000
+    """Her INSERT'te ClickHouse'a gönderilecek satır sayısı."""
+
+
+@asset(
+    group_name="extended",
+    compute_kind="clickhouse",
+    description=(
+        "AU-AIR'in sabit şemasına uymayan, geniş şemalı (binlerce "
+        "sütunlu) bir telemetri dosyasını -- şemasını dosyadan çıkararak "
+        "-- ayrı bir ClickHouse tablosuna yükler."
+    ),
+)
+def extended_telemetry_load(context, config: ExtendedTelemetryConfig):
+
+    with _temp_metadata_path() as metadata_path:
+
+        command = [
+            sys.executable,
+            str(SCRIPTS_DIR / "load_extended_telemetry.py"),
+            "--file-path", config.file_path,
+            "--table-name", config.table_name,
+            "--chunk-rows", str(config.chunk_rows),
+            "--metadata-out", str(metadata_path),
+        ]
+
+        context.log.info(
+            f"load_extended_telemetry.py çalıştırılıyor (dosya="
+            f"{config.file_path}, tablo={config.table_name})."
+        )
+        _run_script(context, command)
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    context.log.info(
+        f"ClickHouse'a {metadata['row_count']} satır yazıldı "
+        f"(tablo={metadata['table']}, {metadata['elapsed_seconds']}sn)."
+    )
+
+    return MaterializeResult(
+        metadata={
+            "source_file": metadata["source_file"],
+            "table": metadata["table"],
+            "row_count": metadata["row_count"],
+            "column_count": metadata["column_count"],
+            "chunk_count": metadata["chunk_count"],
+            "elapsed_seconds": metadata["elapsed_seconds"],
+            "time_column_source": metadata["time_column_source"],
+            "schema": MetadataValue.json(metadata["schema"]),
+        }
+    )
+
+
+# ===========================================================================
 # dvc_published_telemetry
 # ===========================================================================
 
