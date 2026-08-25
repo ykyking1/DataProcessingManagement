@@ -1,0 +1,4 @@
+dvc==3.67.1
+pyspark==4.1.1
+great_expectations==1.20.0
+zstandard==0.25.0

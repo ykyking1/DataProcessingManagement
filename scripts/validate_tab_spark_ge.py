@@ -7,6 +7,7 @@ Great Expectations validation result that an orchestrator can log or publish.
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,10 +15,32 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import great_expectations as gx
 
-from scripts.preprocess_tab_spark import (
-    AIRCRAFT_TYPE_COLUMN,
-    TIMESTAMP_COLUMN,
-)
+try:
+    from scripts.preprocess_tab_spark import (
+        AIRCRAFT_TYPE_COLUMN,
+        DEFAULT_MAX_COLUMNS,
+        DEFAULT_SPARK_MASTER,
+        DEFAULT_TIMESTAMP_FORMAT,
+        TIMESTAMP_COLUMN,
+        create_spark_session,
+        preprocess_tab_dataframe,
+        read_tab_dataframe,
+        spark_readable_tab_input,
+    )
+except ModuleNotFoundError:
+    # Direct execution (python scripts/validate_tab_spark_ge.py) places the
+    # scripts directory, rather than the project root, on sys.path.
+    from preprocess_tab_spark import (
+        AIRCRAFT_TYPE_COLUMN,
+        DEFAULT_MAX_COLUMNS,
+        DEFAULT_SPARK_MASTER,
+        DEFAULT_TIMESTAMP_FORMAT,
+        TIMESTAMP_COLUMN,
+        create_spark_session,
+        preprocess_tab_dataframe,
+        read_tab_dataframe,
+        spark_readable_tab_input,
+    )
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame
@@ -174,3 +197,59 @@ def validate_tab_dataframe(
     else:
         output["report_path"] = None
     return output
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate processed tab-separated ZSTD parts with GE on Spark."
+    )
+    parser.add_argument("--input", required=True, help="Processed directory or URI")
+    parser.add_argument("--report", required=True, type=Path)
+    parser.add_argument("--expected-aircraft-type")
+    parser.add_argument("--feature-column", action="append", dest="feature_columns")
+    parser.add_argument("--result-format", default="BASIC")
+    parser.add_argument("--max-columns", type=int, default=DEFAULT_MAX_COLUMNS)
+    parser.add_argument(
+        "--timestamp-format",
+        default=DEFAULT_TIMESTAMP_FORMAT,
+    )
+    parser.add_argument("--spark-master", default=DEFAULT_SPARK_MASTER)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    spark = create_spark_session(
+        app_name="dvc-tab-validation",
+        master=args.spark_master,
+    )
+    try:
+        with spark_readable_tab_input(args.input) as readable_input:
+            source = read_tab_dataframe(
+                spark,
+                readable_input,
+                max_columns=args.max_columns,
+            )
+            processed = preprocess_tab_dataframe(
+                source,
+                timestamp_format=args.timestamp_format,
+            )
+            validation = validate_tab_dataframe(
+                processed,
+                expected_aircraft_type=args.expected_aircraft_type,
+                feature_columns=args.feature_columns,
+                result_format=args.result_format,
+                report_path=args.report,
+            )
+        print(
+            f"Validation {'passed' if validation['success'] else 'failed'}: "
+            f"{validation['statistics']}"
+        )
+        if not validation["success"]:
+            raise SystemExit(1)
+    finally:
+        spark.stop()
+
+
+if __name__ == "__main__":
+    main()

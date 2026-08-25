@@ -1,0 +1,50 @@
+stages:
+  preprocess_tab:
+    cmd: >-
+      python scripts/preprocess_tab_spark.py
+      --input ${tab_pipeline.input}
+      --output ${tab_pipeline.processed_output}
+      --max-columns ${tab_pipeline.max_columns}
+      --timestamp-format ${tab_pipeline.timestamp_format}
+      --spark-master ${tab_pipeline.spark_master}
+      --zstd-level ${tab_pipeline.zstd_level}
+    deps:
+      - scripts/preprocess_tab_spark.py
+      - requirements-repro.txt
+      - ${tab_pipeline.input}
+    params:
+      - tab_pipeline.input
+      - tab_pipeline.processed_output
+      - tab_pipeline.max_columns
+      - tab_pipeline.timestamp_format
+      - tab_pipeline.spark_master
+      - tab_pipeline.zstd_level
+    outs:
+      - ${tab_pipeline.processed_output}
+
+  validate_tab:
+    cmd: >-
+      python scripts/validate_tab_spark_ge.py
+      --input ${tab_pipeline.processed_output}
+      --report ${tab_pipeline.validation_report}
+      --expected-aircraft-type ${tab_pipeline.expected_aircraft_type}
+      --result-format ${tab_pipeline.result_format}
+      --max-columns ${tab_pipeline.max_columns}
+      --timestamp-format ${tab_pipeline.timestamp_format}
+      --spark-master ${tab_pipeline.spark_master}
+    deps:
+      - scripts/preprocess_tab_spark.py
+      - scripts/validate_tab_spark_ge.py
+      - requirements-repro.txt
+      - ${tab_pipeline.processed_output}
+    params:
+      - tab_pipeline.processed_output
+      - tab_pipeline.validation_report
+      - tab_pipeline.expected_aircraft_type
+      - tab_pipeline.result_format
+      - tab_pipeline.max_columns
+      - tab_pipeline.timestamp_format
+      - tab_pipeline.spark_master
+    metrics:
+      - ${tab_pipeline.validation_report}:
+          cache: false

@@ -1,0 +1,74 @@
+schema: '2.0'
+stages:
+  preprocess_tab:
+    cmd: python scripts/preprocess_tab_spark.py --input 
+      data/processed/mx_small_cleaned/mx10000_10rows_clean.tab --output 
+      tmp/dvc_repro/processed --max-columns 100000 --timestamp-format 
+      yyyy-MM-dd'T'HH:mm:ss.SSSXXX --spark-master local[2] --zstd-level 12
+    deps:
+    - path: data/processed/mx_small_cleaned/mx10000_10rows_clean.tab
+      hash: md5
+      md5: 1c8678e32ee3709697f6625e2223d659
+      size: 1040146
+    - path: requirements-repro.txt
+      hash: md5
+      md5: 8b157b713d8190db5741951ce816f609
+      size: 72
+    - path: scripts/preprocess_tab_spark.py
+      hash: md5
+      md5: 59567f41347835e6020f5671fa414ef5
+      size: 12874
+    params:
+      params.yaml:
+        tab_pipeline.input: 
+          data/processed/mx_small_cleaned/mx10000_10rows_clean.tab
+        tab_pipeline.max_columns: 100000
+        tab_pipeline.processed_output: tmp/dvc_repro/processed
+        tab_pipeline.spark_master: local[2]
+        tab_pipeline.timestamp_format: yyyy-MM-dd'T'HH:mm:ss.SSSXXX
+        tab_pipeline.zstd_level: 12
+    outs:
+    - path: tmp/dvc_repro/processed
+      hash: md5
+      md5: ec66b1354ab50b459fdaad90f3c09fd5.dir
+      size: 335548
+      nfiles: 1
+  validate_tab:
+    cmd: python scripts/validate_tab_spark_ge.py --input tmp/dvc_repro/processed
+      --report reports/validation/dvc_repro_validation.json 
+      --expected-aircraft-type MX10000 --result-format BASIC --max-columns 
+      100000 --timestamp-format yyyy-MM-dd'T'HH:mm:ss.SSSXXX --spark-master 
+      local[2]
+    deps:
+    - path: requirements-repro.txt
+      hash: md5
+      md5: 8b157b713d8190db5741951ce816f609
+      size: 72
+    - path: scripts/preprocess_tab_spark.py
+      hash: md5
+      md5: 59567f41347835e6020f5671fa414ef5
+      size: 12874
+    - path: scripts/validate_tab_spark_ge.py
+      hash: md5
+      md5: 49b311a76bb7e673ee8d0db3b8898df6
+      size: 8868
+    - path: tmp/dvc_repro/processed
+      hash: md5
+      md5: ec66b1354ab50b459fdaad90f3c09fd5.dir
+      size: 335548
+      nfiles: 1
+    params:
+      params.yaml:
+        tab_pipeline.expected_aircraft_type: MX10000
+        tab_pipeline.max_columns: 100000
+        tab_pipeline.processed_output: tmp/dvc_repro/processed
+        tab_pipeline.result_format: BASIC
+        tab_pipeline.spark_master: local[2]
+        tab_pipeline.timestamp_format: yyyy-MM-dd'T'HH:mm:ss.SSSXXX
+        tab_pipeline.validation_report: 
+          reports/validation/dvc_repro_validation.json
+    outs:
+    - path: reports/validation/dvc_repro_validation.json
+      hash: md5
+      md5: eec89518f664b093e6023c39a0b510eb
+      size: 6950
