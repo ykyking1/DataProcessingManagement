@@ -4,6 +4,16 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.2.0 (2026-08-24)
+
+
+### Features
+
+- **pipeline**: Add Spark preprocessing and GE validation ([`8d0e9a3`](https://github.com/ykyking1/DataProcessingManagement/commit/8d0e9a31f6812c1b41e2e042be5bc38f84831cdb))
+
+
+
+
 ## pipeline-v0.1.0 (2026-08-20)
 
 
