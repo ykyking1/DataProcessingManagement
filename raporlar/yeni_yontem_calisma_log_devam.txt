@@ -1,0 +1,20 @@
+[atlanildi, zaten tamamlanmis] 10k_1000
+[atlanildi, zaten tamamlanmis] 10k_5000
+[atlanildi, zaten tamamlanmis] 10k_50000
+[atlanildi, zaten tamamlanmis] 10k_100000
+[atlanildi, zaten tamamlanmis] 20k_1000
+[atlanildi, zaten tamamlanmis] 20k_5000
+[atlanildi, zaten tamamlanmis] 20k_50000
+[atlanildi, zaten tamamlanmis] 20k_100000
+[atlanildi, zaten tamamlanmis] 30k_1000
+[atlanildi, zaten tamamlanmis] 30k_5000
+[atlanildi, zaten tamamlanmis] 30k_50000
+[atlanildi, zaten tamamlanmis] 30k_100000
+[atlanildi, zaten tamamlanmis] 40k_1000
+[atlanildi, zaten tamamlanmis] 40k_5000
+[atlanildi, zaten tamamlanmis] 40k_50000
+Toplam 20 dosya, 5 tanesi islenecek (Faz 1: N=6 paralel sikistirma).
+
+=== FAZ 1: sikistirma + MinIO yukleme (N=6 paralel) ===
+  [FAZ1 tamam] 50k_1000: sikistir=17.1sn yukle_minio=0.54sn
+  [FAZ1 tamam] 50k_5000: sikistir=71.3sn yukle_minio=0.88sn

@@ -21,7 +21,12 @@ CREATE TABLE conversion_manifest (
 
     -- Pipeline durumu
     status                  TEXT NOT NULL DEFAULT 'pending',
-        -- pending | processing | done | verification_failed | needs_review
+        -- pending | processing | done | error | verification_failed | needs_review
+        -- 'error': deneme sirasinda bir istisna/hata olustu (bkz.
+        --   error_detail) -- ornegin ClickHouse bellek limiti asimi.
+        --   Satir SILINMEZ, bir sonraki basarili denemede 'done'a
+        --   guncellenir. Bkz. scripts/pipeline_grid_to_clickhouse.py
+        --   mark_processing()/mark_error() (plan Bolum 41.3).
     attempt_count           INT NOT NULL DEFAULT 0,
     max_attempts            INT NOT NULL DEFAULT 3,
 
@@ -96,3 +101,72 @@ CREATE UNIQUE INDEX idx_manifest_tab_file ON conversion_manifest (tab_file_name)
 -- FROM conversion_manifest
 -- WHERE status = 'done'
 --   AND (row_count_tab != row_count_parquet OR row_count_parquet != row_count_clickhouse);
+
+-- ============================================================
+-- conversion_manifest_history -- DENEME GEÇMİŞİ (2026-08-24 eklendi, plan Bölüm 44)
+-- ============================================================
+-- conversion_manifest'in kendisi "dosya başına TEK satır, her yeniden
+-- işlemede üzerine yazılır" (ON CONFLICT (tab_file_name) DO UPDATE)
+-- şeklinde tasarlandı -- "bu dosyanın ClickHouse'daki GÜNCEL hali ne"
+-- sorusuna cevap verir, ama önceki denemelerin süre/boyut değerlerini
+-- SAKLAMAZ. Kullanıcının fark ettiği boşluk: eski/yeni yöntem
+-- karşılaştırması gibi durumlarda önceki değerler kaybolur (elle CSV'ye
+-- alınmadıkça). Bu tablo HER DENEMEYİ kendi satırında tutan, asla
+-- üzerine yazılmayan bir geçmiş/log katmanı -- conversion_manifest'e
+-- PARALEL çalışır, onun yerini almaz.
+--
+-- Anahtar: (tab_file_name, attempt_no) -- attempt_no,
+-- conversion_manifest.attempt_count ile AYNI sayaç değeri, o yüzden her
+-- yeni deneme otomatik olarak YENİ bir satır açar (üzerine yazma değil).
+CREATE TABLE conversion_manifest_history (
+    id                      BIGSERIAL PRIMARY KEY,
+
+    tab_file_name           TEXT NOT NULL,
+    attempt_no              INT NOT NULL,       -- conversion_manifest.attempt_count ile eslesir
+    aircraft_type            TEXT,
+    is_subset                BOOLEAN,
+    subset_row_count         BIGINT,
+
+    status                  TEXT NOT NULL,      -- processing | done | error | verification_failed
+
+    row_count_tab           BIGINT,
+    row_count_clickhouse    BIGINT,
+    column_count              INT,
+    had_trailing_tab_issue    BOOLEAN,
+
+    tab_zst_object_key      TEXT,
+    tab_zst_size_bytes      BIGINT,
+    original_size_bytes      BIGINT,
+
+    compression_algorithm    TEXT,
+    compression_level        INT,
+
+    compress_duration_seconds         DOUBLE PRECISION,
+    minio_upload_duration_seconds     DOUBLE PRECISION,
+    clickhouse_load_duration_seconds  DOUBLE PRECISION,
+
+    clickhouse_table_name    TEXT,
+    clickhouse_disk_bytes    BIGINT,
+    clickhouse_loaded_at    TIMESTAMPTZ,
+
+    error_detail             TEXT,
+
+    started_at               TIMESTAMPTZ NOT NULL DEFAULT now(),  -- mark_processing zamani
+    finished_at              TIMESTAMPTZ            -- basari/hata zamani; NULL ise hala surmekte/yarida kesildi
+);
+
+-- Ayni dosyanin ayni denemesi iki kere satir acmasin (script bir daha
+-- calistirilirsa, ayni attempt_no'ya rastlarsa guncelle -- normalde
+-- olmamali ama guvenlik icin)
+CREATE UNIQUE INDEX idx_history_file_attempt ON conversion_manifest_history (tab_file_name, attempt_no);
+
+-- "Bu dosyanin tum gecmisi" sorgusu icin
+CREATE INDEX idx_history_tab_file ON conversion_manifest_history (tab_file_name);
+
+-- Örnek: bir dosyanın tüm deneme geçmişini süre trendiyle görmek
+--
+-- SELECT attempt_no, status, compress_duration_seconds,
+--        clickhouse_load_duration_seconds, started_at, finished_at
+-- FROM conversion_manifest_history
+-- WHERE tab_file_name = 'synthetic_50k_100000.tab'
+-- ORDER BY attempt_no;

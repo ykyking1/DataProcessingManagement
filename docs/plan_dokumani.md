@@ -3272,3 +3272,421 @@ modu da destekliyor, `python3 pipeline_grid_to_clickhouse.py 20 50000`
 gibi). En büyük dosyanın bölünerek yüklenmesi için kullanılan yardımcı
 script'ler script'e dahil edilmedi (elle/özel durum olarak uygulandı),
 gerekirse tekrar yazılmalı.
+
+## 41.3 Postgres manifest'te gözlemlenebilirlik boşluğu bulundu ve düzeltildi -- başarısız denemeler hiç kayda geçmiyordu
+
+Kullanıcı "yarıda kesilen işlemlerimiz neden Postgres'te görünmüyor,
+hepsinin statusu done" diye sordu -- haklı bir gözlemdi. Bölüm 41.1'de
+`20k_50000` ve `50k_100000` birkaç kez başarısız oldu (bellek limiti
+hataları), ama Postgres'e SADECE son/başarılı deneme kaydedildi --
+önceki başarısız denemelerin HİÇBİR izi yoktu.
+
+**Kök neden**: `process_file()` fonksiyonu Postgres'e sadece işlemin
+en SONUNDA (başarı durumunda) bir `INSERT ... ON CONFLICT DO UPDATE`
+yapıyordu. Bir dosya `ch.execute(insert_sql)` sırasında exception
+fırlatınca, bu satıra hiç ulaşılmıyordu -- yani o deneme için Postgres'te
+sıfır iz kalıyordu. Şemadaki `status` alanının zaten `processing` ve
+`attempt_count`/`error_detail` gibi tam bunun için tasarlanmış
+alanları vardı ama script bunları hiç kullanmıyordu.
+
+**Düzeltme**: `scripts/pipeline_grid_to_clickhouse.py` ve
+`scripts/pipeline_tab_to_clickhouse.py`'ye iki yardımcı fonksiyon
+eklendi:
+- `mark_processing(tab_file_name, aircraft_type)` -- her deneme
+  BAŞLAMADAN önce çağrılır, `status='processing'` yazar,
+  `attempt_count`'u bir artırır (satır yoksa oluşturur).
+- `mark_error(tab_file_name, error_detail)` -- bir exception
+  yakalanınca çağrılır, satırı SİLMEDEN `status='error'` yapar,
+  `error_detail`'e hata mesajını yazar.
+
+Ana işlem adımları artık `try/except` içine alınmış durumda; hata
+olursa `mark_error` çağrılıp exception yeniden fırlatılıyor (üst
+döngü hâlâ durabiliyor), başarı durumunda mevcut UPSERT çalışıp
+`status='done'` ve `error_detail=NULL` yazıyor (önceki denemeden
+kalma hata mesajı temizleniyor).
+
+**Doğrulama**: hem başarı yolu (`10k_1000` yeniden çalıştırıldı,
+`status='done'`, `attempt_count=1`, `error_detail` boş çıktı) hem hata
+yolu (kasıtlı olarak var olmayan bir dosyaya erişim denendi,
+`status='error'`, `error_detail` dolu çıktı) izole test edilip
+doğrulandı.
+
+`docs/postgres_manifest_schema.sql`'deki `status` alanı yorumuna
+`error` değeri eklendi (`pending | processing | done | error |
+verification_failed | needs_review`).
+
+**Ders**: bir "gözlem/audit" katmanı tasarlarken sadece MUTLU YOLU
+(happy path) kaydetmek yetmiyor -- başarısızlıkların da izini bırakmak,
+katmanın asıl değerinin büyük kısmı. Bu boşluk, kullanıcının doğrudan
+sorması sayesinde fark edildi, kendiliğinden fark edilmemişti.
+
+## 42. Sıkıştırma adımı için worker sayısı ve parça (chunk) boyutu optimizasyonu
+
+Kullanıcı, Bölüm 26'nın (MinIO→ClickHouse yükleme) N=2 worker kararıyla
+sıkıştırma adımını karıştırdığını fark edip düzeltti; ardından
+sıkıştırma adımı için hiç test edilmemiş olan worker sayısı ve
+"batch boyutu" (netleştirildi: dosya-içi okuma/sıkıştırma parça
+boyutu, `CHUNK` sabiti) parametrelerini bulmamızı istedi.
+
+**Ortam notu -- oturum ortasında disk acil durumu yaşandı**: testler
+sürerken host'un C: sürücüsü tamamen doldu (0 byte boş, 476GB'lık
+diskin tamamı kullanılmıştı). Kök neden: Docker'ın WSL2 VHDX dosyası
+(154GB) bu oturum boyunca defalarca büyük dosya oluşturup silme
+döngüsünden dolayı "geri alınmamış" (thin-provisioning'in guest'te
+silinen bloklari host'a otomatik iade etmemesi) bloklarla şişmişti.
+`diskpart`/`Optimize-VHD` ile sıkıştırma admin yetkisi gerektirdiği
+için (bu makinede yok), WSL'in kendi "seyrek VHD" özelliği de
+(`--set-sparse`) olası veri bozulması riski nedeniyle varsayılan
+kapalıydı ve zorlamak (`--allow-unsafe`) riskli görüldüğü için
+kullanılmadı. **Gerçek çözüm**: kullanıcının onayıyla, git/DVC ile
+TAKİP EDİLMEYEN (`.gitignore`'da, tek kopya) `testdata/dataset_01-06.tab`
+dosyaları (~65GB) silindi -- disk 0GB'tan 63,7GB boşa çıktı, kriz
+çözüldü. Docker Desktop'ın yeniden ayağa kalkması biraz sorunlu oldu
+(WSL distro'su "Stopped" durumda takılı kaldı, zorla kill+restart
+gerekti) ama sonunda tüm container/volume/veri (grid dosyaları,
+Postgres kayıtları) sağlam çıktı. **Ders**: uzun süren, çok sayıda
+büyük dosya oluşturup silme içeren oturumlarda, Docker Desktop'ın WSL2
+VHDX'i host diskinde sürekli büyüyüp küçülmüyor -- periyodik olarak
+host disk alanı kontrol edilmeli, admin yetkisi olmayan ortamlarda
+`diskpart`/`Optimize-VHD` kullanılamayacağı unutulmamalı.
+
+### 42.1 Worker sayısı (paralel dosya sıkıştırma) -- N=6 tatlı nokta, N=20 gereksiz
+
+10 dosyalık sabit bir iş yükü (5.000 ve 50.000 satırlık tier'ler, 5
+sütun-tier'i, toplam 22GB) `ProcessPoolExecutor` ile farklı worker
+sayılarında (N=1,2,4,6,10,16) paralel sıkıştırıldı (ZSTD seviye 12,
+32MB okuma parçası sabit):
+
+| N | Süre | Hızlanma | Verimlilik |
+|---|---|---|---|
+| 1 | 1.250,9sn | 1,00x | %100 |
+| 2 | 825,5sn | 1,52x | %76 |
+| 4 | 673,6sn | 1,86x | %46 |
+| **6** | **631,1sn** | **1,98x** | %33 |
+| 10 | 648,1sn | 1,93x | %19 |
+| 16 | 625,6sn | 2,00x | %12 |
+
+**Bulgu**: N=6'dan sonra pratikte hiçbir kazanç yok -- N=6 zaten
+asimptotik maksimumun (2,00x) %99'una ulaşıyor, N=10/16'ya çıkmak
+sadece verimliliği düşürüyor (hatta N=10, N=6'dan bile hafif daha
+YAVAŞ çıktı -- muhtemelen ölçüm gürültüsü/zamanlama örtüşmesi).
+**Sebep**: dosya-bazlı paralellikte, EN BÜYÜK TEK dosyanın (bu
+işyükünde `50k_50000.tab`, tek başına ~384sn sürüyor) sıkıştırma
+süresi daha fazla worker eklense bile bölünemiyor -- toplam süre bu
+tek dosyanın süresine yakınsıyor (asimptot ~625sn, tek dosyanın
+384sn'sinden farklı olsa da aynı mantık: iş yükü homojen değil,
+en büyük görev alt sınırı belirliyor).
+
+**Sonuç -- kullanıcının "20 worker" hatırlaması YANLIŞTI, ama
+"N=6-20 aralığı" analojisinin ALT UCU (N=6) doğruydu**: sıkıştırma
+için N=6 önerilir, N=20 (tab→parquet'teki farklı bağlamdan hatırlanan
+sayı) bu iş için hem gereksiz hem hafif kötü.
+
+### 42.2 Parça (chunk) boyutu -- mevcut 32MB varsayılan ideal değil, 64-128MB daha iyi
+
+Temsili orta-büyük bir dosyada (`30k_50000.tab`, 4GB) tek worker'la,
+farklı okuma-parçası boyutlarıyla (ZSTD seviye 12 sabit) sıkıştırma
+tekrarlandı:
+
+| Parça boyutu | Süre | Fark (en hızlıya göre) |
+|---|---|---|
+| 4MB | 256,3sn | +15,9% |
+| 16MB | 241,1sn | +9,0% |
+| 32MB (mevcut varsayılan) | 240,2sn | +8,6% |
+| 64MB | 225,8sn | +2,1% |
+| **128MB** | **221,2sn** | **en hızlı** |
+
+**Bulgu**: daha büyük parça boyutu tutarlı şekilde daha hızlı (I/O
+sistem çağrısı sayısı azalıyor, ZSTD'nin stream_writer'ı her
+`.write()` çağrısında bir miktar sabit yük taşıyor), ama 64MB'tan
+sonra kazanç küçülüyor (%2,1'den daha hızlıya sadece %2 daha).
+**Mevcut varsayılanımız (32MB) ideal değildi** -- 128MB'a geçmek
+~%8-9 hız kazandırır, 64MB de neredeyse aynı kazancı (%6,5) daha az
+bellek riskiyle verir.
+
+### Nihai öneri (sıkıştırma adımı için)
+
+**N=6 paralel worker + 64-128MB okuma parçası boyutu.**
+
+## 43. Bulgular pipeline'a işlendi + diğer adımların hızlandırma potansiyeli araştırıldı (2026-08-24)
+
+### 43.1 `scripts/pipeline_grid_to_clickhouse.py` iki faza bölündü: paralel sıkıştırma + sıralı ClickHouse yükleme
+
+Script yeniden yapılandırıldı:
+
+- **FAZ 1 (paralel, N=6, `ProcessPoolExecutor`)**: her dosya için
+  sıkıştırma (ZSTD 12, 64MB okuma parçası -- Bölüm 42.2 bulgusu) ve
+  MinIO'ya yükleme. Worker fonksiyonu (`compress_and_upload`) kendi
+  Minio client'ını kuruyor ve Postgres'e HİÇ dokunmuyor -- DB
+  bağlantısı sadece ana process'te.
+- **FAZ 2 (sıralı, ana process'te)**: her dosya için ClickHouse hedef
+  tablosunu oluşturma (UInt8+T64/Float64/LowCardinality tiplemesi
+  aynen korundu), `s3()` ile yükleme, satır sayısı doğrulama, Postgres
+  `conversion_manifest` kaydı, tabloyu silme. SIRALI kalmak ZORUNDA --
+  Bölüm 41.1'in "aynı/büyüyen tabloya art arda yükleme bellek
+  baskısı" bulgusu nedeniyle paralelleştirilemez.
+- `mark_processing()` her dosya FAZ 1'e girmeden ÖNCE ana process'te
+  çağrılıyor (attempt_count artıyor); FAZ 1 veya FAZ 2'de hata olursa
+  `mark_error()` hangi fazda başarısız olduğunu (`[Faz1-sikistirma]`
+  / `[Faz2-ClickHouse]` öneki) `error_detail`'e yazıyor.
+- Tek-dosya CLI modu (`pipeline_grid_to_clickhouse.py 20 50000`)
+  korundu -- host'tan dosya dosya çağırma alışkanlığı için hâlâ
+  çalışıyor, sadece paralellik olmadan aynı iki fonksiyonu sırayla
+  çağırıyor.
+
+**Doğrulama**: tüm 20 dosya zaten 'done' iken script çalıştırıldı,
+temiz şekilde hepsini atladı (0 hata). Ardından iki küçük dosya
+(`10k_1000`, `20k_1000`) Postgres'te elle 'pending'e çekilip
+uçtan uca yeniden işletildi -- FAZ 1 paralel tamamlandı
+(sıkıştır=2,2sn/3,8sn), FAZ 2 sıralı yüklendi (satır sayıları
+eşleşti, `status='done'`), Postgres'e tüm yeni alanlar (
+`compress_duration_seconds`, `minio_upload_duration_seconds`,
+`clickhouse_load_duration_seconds`, `clickhouse_disk_bytes` vb.)
+doğru yazıldı. `scripts/pipeline_tab_to_clickhouse.py` tek-dosyalık
+kalıyor (loop yok), bu yüzden N=6 paralelliği oraya taşımanın anlamı
+yok -- CHUNK zaten 64MB'a çekilmişti (Bölüm 42.2), o script için
+başka değişiklik gerekmiyor.
+
+### 43.2 `max_download_threads` 10k+ sütun ölçeğinde YENİDEN test edildi -- Bölüm 26.3'ün bulgusu bu ölçekte GEÇERSİZ, kazanç yok
+
+Bölüm 32'nin açık takip maddesi kapatıldı: Bölüm 26.3'teki
+"`max_download_threads`'i artırmak (4->8/20) net kazanç sağlıyor"
+bulgusu ~1.000 sütunluk eski (parquet dönemi) şemada, ÇOK SAYIDA
+KÜÇÜK DOSYA aynı hedef tabloya art arda yüklenirken ölçülmüştü. Şimdi
+temsili orta-büyük TEK bir grid dosyasında (`30k_50000.tab`, 30.002
+sütun x 50.000 satır), diğer her şey sabit tutularak
+(`max_threads=2`, `max_insert_threads=1` -- pipeline'daki bellek
+güvenliği ayarlarıyla aynı) SADECE `max_download_threads` tarandı,
+her değer TAMAMEN AYRI/geçici tabloya yüklenip hemen silindi
+(`scripts/download_threads_sweep.py`, yeni, repoya eklendi):
+
+| `max_download_threads` | Süre | Hızlanma |
+|---|---|---|
+| 4 (varsayılan) | 61,1sn | 1,00x |
+| 8 | 60,7sn | 1,01x |
+| 12 | 65,6sn | 0,93x |
+| 16 | 68,1sn | 0,90x |
+| 20 | 62,6sn | 0,98x |
+
+**Bulgu**: ölçüm gürültüsü içinde, ANLAMLI bir kazanç YOK (hepsi
+±%10 bandında, bazıları hatta hafif YAVAŞLADI). Tüm denemeler
+başarılı oldu, çökme/bellek hatası yaşanmadı.
+
+**Neden Bölüm 26.3 ile çelişiyor**: o testte ÇOK SAYIDA AYRI dosya
+aynı anda indiriliyordu -- `max_download_threads` orada birden fazla
+S3 nesnesinin PARALEL İNDİRİLMESİNİ hızlandırıyordu. Burada TEK BÜYÜK
+dosya var; download-thread sayısını artırmak tek dosyanın okuma
+parçalarını paralelleştirebilir ama asıl darboğaz artık indirme değil
+-- 30.000 sütunlu her satırı ayrıştırıp INSERT etmek (parse/insert
+CPU maliyeti), ki bu adım kasıtlı olarak `max_threads=2` /
+`max_insert_threads=1` ile bellek güvenliği için SINIRLANMIŞ durumda
+(Bölüm 37/41.1). İndirme paralelliğini artırmak ayrıştırma darboğazını
+hızlandırmıyor.
+
+**Sonuç -- thread ayarında ek bir "ucuz" hızlanma kaynağı YOK.**
+Gerçek kazanç ancak `max_threads`/`max_insert_threads`'i artırmakla
+gelir, ama bu tam da Bölüm 41.1'in "(total) memory limit exceeded"
+çökmelerine yol açtığı ayarlar -- bilinçli olarak dokunulmadı.
+
+### 43.3 DÜZELTME -- kullanıcı haklı çıktı: N=2 esazamanlı ClickHouse YÜKLEME (ayrı dosya/ayrı tablo) gerçek kazanç veriyor
+
+Bölüm 43.2'de sadece `max_download_threads` (tek sorgu içi thread
+sayısı) test edilmişti, Bölüm 26.2'nin asıl bulgusu olan **"N=2
+eşzamanlı WORKER" (2 AYRI dosyanın 2 AYRI/bağımsız hedef tabloya AYNI
+ANDA yüklenmesi)** kısmı atlanmıştı -- kullanıcı bunu fark edip sordu.
+Bu, Bölüm 41.1'in "AYNI/büyüyen tek tabloya art arda INSERT" bulgusuyla
+KARIŞTIRILMAMALI -- kavramsal olarak farklı bir senaryo: burada her
+dosya kendi ayrı/geçici tablosuna yükleniyor.
+
+10.000+ sütun ölçeğinde (`scripts/ch_load_concurrency_sweep.py`,
+yeni) test edildi -- N=1 sıralı taban ile karşılaştırıldı:
+
+| N (eşzamanlı dosya) | Test dosyaları | N=1 toplam | N-eşzamanlı toplam | Hızlanma |
+|---|---|---|---|---|
+| 2 | 10k_50000, 20k_50000 | 65,1sn | 50,2sn | **1,30x** |
+| 3 | +30k_50000 | 148,4sn | 105,9sn | **1,40x (en iyi)** |
+| 4 | +40k_50000 | 257,0sn | 205,3sn | 1,25x (gerilemeye başladı) |
+
+**Bulgu**: gerçek ve ölçülebilir bir kazanç VAR (Bölüm 26.2'nin eski
+~1.000 sütun ölçeğindeki bulgusuyla aynı YÖN, ama büyüklük daha
+mütevazı: eski ölçekte N=2 neredeyse serbestti, burada dosya başına
+süre de ~%15-90 uzuyor çünkü paylaşılan CPU/host kaynağı için
+rekabet var -- net kazanç yine de wall-time'da kalıyor). N=3 en iyi
+nokta gibi göründü ama N=4'te gerileme başladı (Bölüm 26.1'in eski
+N=3 çöküş örüntüsüyle aynı tema, burada tam çökme değil ama net
+gerileme). Bellek her adımda güvenli kaldı (`docker stats`: en fazla
+~3,2GB/11,68GB, hiç limite yaklaşmadı) -- bu testler 10k-40k sütun x
+50k satır aralığındaydı, **en büyük dosya tier'i (50k sütun, bilinen
+bellek sınırına en yakın olan) hiç test edilmedi.**
+
+**Karar: `scripts/pipeline_grid_to_clickhouse.py`'nin Faz 2'si N=2
+eşzamanlı (temkinli, N=3'ün gösterdiği ekstra kazanç için host
+kaynağını daha fazla zorlamamak adına) olacak şekilde güncellendi,
+AMA sadece toplam hücre sayısı (sütun×satır) `CH_LOAD_SAFE_CELL_LIMIT`
+(2 milyar, test edilen üst sınır) altındaki dosyalar için** -- bunun
+üzerindeki dosyalar (test kapsamı dışı, bilinen bellek riskine yakın)
+YALNIZ/izole (N=1) işlenmeye devam ediyor. Dosyalar sırayla taranıp
+güvenli-bölgede art arda 2'li gruplara, büyük dosyalarda ise kendi
+başına tek elemanlı gruplara ayrılıyor; her grup ya `ThreadPoolExecutor`
+ile eşzamanlı ya da doğrudan sırayla işleniyor. Her thread kendi
+ClickHouse `Client`'ını kuruyor (paylaşılan bağlantı thread-safe değil),
+Postgres yazımı `threading.Lock()` ile serileştirildi (aynı `pg_conn`
+nesnesinin eşzamanlı kullanımı güvenli değil). İki farklı senaryoyla
+(2'li eşzamanlı batch + tek elemanlı solo batch) uçtan uca doğrulandı,
+Postgres kayıtları doğru yazıldı.
+
+**Ders (tekrar)**: kullanıcının "sanki 2 worker kazanç sağlıyordu"
+hatırlaması DOĞRUYDU -- Bölüm 43.2'de ben sadece thread-sayısı
+parametresini test edip "ek hızlanma yok" sonucuna vardığımda, asıl
+soru edilen "eşzamanlı worker" senaryosunu (farklı bir mekanizma)
+atlamıştım. Aynı cümledeki iki farklı kavramı (thread sayısı vs.
+eşzamanlı worker sayısı) birbirine karıştırmamak gerekiyor.
+
+## 45. Gerçek 20 dosyalık grid'e uygulandı: N=6 sıkıştırma + N=2 kısmi-paralel ClickHouse yükleme uçtan uca doğrulandı, 1 dosyada YENİ ve önemli bir bulgu ortaya çıktı (2026-08-25)
+
+Bölüm 42/43'ün bulguları (`pipeline_grid_to_clickhouse.py`) gerçek 20
+dosyalık grid'in TAMAMI yeniden işlenerek doğrulandı. Eski (tamamen
+sıralı, N=1+N=1) yöntemin süreleri yeniden işlemeden ÖNCE
+`raporlar/eski_yontem_snapshot.csv`'ye donduruldu (Postgres
+`conversion_manifest`'in "dosya başına tek satır, üzerine yazılır"
+tasarımı gereği -- bkz. 44).
+
+**Sonuç (19/20 dosya, duvar-saati bazlı, gerçek ölçüm)**:
+
+| Aşama | Eski (N=1 sıralı) | Yeni (N=6 / N=2) | Hızlanma |
+|---|---|---|---|
+| Sıkıştırma (Faz 1, 20 dosyanın tamamı) | 62,3dk | **31,1dk** | **2,00x** (Bölüm 42.1'i doğruladı) |
+| ClickHouse yükleme (Faz 2, 19 dosya) | 16,1dk | 15,2dk | 1,06x (mütevazı -- bu 19 dosyanın 6'sı 2 milyar hücre eşiğini aşıp izole kaldı) |
+| **TOPLAM (19 dosya)** | **65,1dk** | **46,3dk** | **1,41x** |
+
+### 45.1 KRİTİK YENİ BULGU -- 50.002 sütunlu dosyada bellek maliyeti SATIR sayısından değil SÜTUN sayısının kendisinden kaynaklanıyor
+
+`synthetic_50k_100000.tab` (50.002 sütun x 100.000 satır, 5 milyar
+hücre) tekrar tekrar ClickHouse'un bellek tavanına çarptı -- fresh
+restart sonrası bile. Bölüm 41.2'nin tarihsel "ikiye böl" çözümü
+(satır bazlı, 50.000+50.000) tekrarlanınca da AYNI hatayla çöktü.
+**4'e bölme (25.000 satır/parça, 1,25 milyar hücre) DENENDİ, o da AYNI
+mutlak RSS seviyesinde (~8,7-9,5GB) çöktü.**
+
+**Belirleyici gözlem**: tam dosya (100k satır), yarı (50k satır),
+çeyrek (25k satır) -- HEPSİ neredeyse AYNI mutlak bellek seviyesinde
+çöktü, satır sayısından BAĞIMSIZ. **Bu, maliyetin SATIR hacminden
+değil 50.002 SÜTUNUN kendisinden (ClickHouse'un TSV parser'ının
+`TabSeparatedFormatReader`/`SerializationNumber::deserializeText`
+üzerinden sütun başına taşıdığı sabit tampon maliyeti) kaynaklandığını
+gösteriyor.** Satır-bazlı bölme (ne kadar küçük parçalara bölünürse
+bölünsün) bu problemi ÇÖZEMEZ -- sütun sayısı sabit kaldığı sürece
+aynı duvara çarpılır. Bölüm 41.2'nin "ikiye bölmek işe yaradı" bulgusu
+muhtemelen o zamanki host'un DAHA FAZLA boş belleğe sahip olmasından
+kaynaklanıyordu, bölme stratejisinin kendisinden değil.
+
+**Ayrı operasyonel bulgu**: bu oturumda host makine (Windows) ciddi
+bellek darlığı yaşadı -- tam makine reboot'u sonrasında bile
+16,48GB'nin sadece ~1,8GB'i boştu (`Get-CimInstance Win32_OperatingSystem`
+ile ölçüldü). WSL2'ye ayrılan 11,7GB'lık VM, host bu kadar sıkışıkken
+kendisi de baskı altında kalıyor -- bu, DAHA ÖNCE aynı oturumda
+sorunsuz yüklenen aynı-boyutlu bir dosyanın (`50k_50000`, 2,5 milyar
+hücre) SONRADAN aynı ölçekte (`50k_100000`'in yarısı) başarısız
+olmasını açıklıyor.
+
+**Karar (kullanıcı onayıyla)**: sütun-bazlı bölme (çok daha karmaşık/
+riskli, veri iki eksende bölünüp doğru şekilde birleştirilmesi
+gerekir) ya da host belleğinin boşaltılması şimdilik denenmedi --
+**19/20 ile devam edildi, bu dosya bilinen bir kısıt olarak
+`error_detail`'e detaylıca not edilip bırakıldı.** Gerçek üretimde
+50.000+ sütunlu dosyalar bekleniyor olacaksa (uçak tipine göre
+değişen sütun sayısı notuyla tutarlı bir risk), bu limit ciddiye
+alınmalı -- ya ClickHouse'a ayrılan bellek ciddi şekilde artırılmalı
+(muhtemelen konteyner/host bazında, sadece ayar değil) ya da
+sütun-bazlı bölme/farklı bir yükleme stratejisi (örn. sütunları
+gruplar halinde ayrı tablolara yükleyip JOIN etmek) tasarlanmalı.
+
+### 45.2 KARAR -- Faz 2'deki N=2 eşzamanlı ClickHouse yükleme kaldırıldı, sıralıya geri dönüldü
+
+Bölüm 45'in tam-grid ölçümü netleşince kullanıcı doğru bir gözlem
+yaptı: **ClickHouse yükleme adımındaki N=2 eşzamanlılığın (Bölüm 43.3)
+gerçek kazancı (~1,06x) neredeyse yok denecek kadar mütevazıydı** --
+oysa getirdiği ek karmaşıklık (thread-safety, `pg_lock` ile Postgres
+yazımının serileştirilmesi, hücre-eşiği bazlı batch mantığı, birden
+fazla büyük tablonun aynı anda var olma riski) küçük değildi. Sebep:
+19 dosyanın 6'sı zaten güvenlik gereği izole/tek-başına kalıyordu
+(2 milyar hücre eşiğinin üstünde), geri kalan küçük dosyalarda da
+paralellik kazancı ölçüm gürültüsü seviyesindeydi.
+
+**Karar: `scripts/pipeline_grid_to_clickhouse.py`'nin Faz 2'si tekrar
+TAMAMEN SIRALI yapıldı** -- `CH_LOAD_WORKERS`, `CH_LOAD_SAFE_CELL_LIMIT`,
+`pg_lock`, `ThreadPoolExecutor`, batch mantığı ve `_load_one_tag`
+kaldırıldı; `load_and_record()` artık düz bir for-loop içinde,
+paylaşılan tek bir ClickHouse `Client` ile çağrılıyor (Bölüm 41.3'ün
+orijinal sade yapısına, Bölüm 44'ün `conversion_manifest_history`
+entegrasyonu korunarak geri dönüldü). Faz 1'deki N=6 paralel sıkıştırma
+(gerçek ve büyük kazanç -- 2,00x) DOKUNULMADAN kaldı; bu tamamen
+sadeleştirme, sadece marjinal kazancı olan Faz 2 paralelliği için
+yapıldı. Basit sıralı akış, hem daha az kod/risk taşıyor hem de
+50k_100000 gibi bilinen bellek-riskli dosyalarda birden fazla büyük
+tablonun aynı anda ClickHouse'da bulunma ihtimalini tamamen ortadan
+kaldırıyor. Değişiklik sonrası tek-dosya modu ile iki küçük dosyada
+(`10k_1000`, `20k_1000`) uçtan uca doğrulandı, sorunsuz.
+
+## 46. 50.002 sütunda güvenli satır/hücre sınırı bulundu -- reaktif bölmeden proaktif eşiğe (2026-08-25)
+
+Kullanıcı doğru bir soru sordu: "50k_100000'ı bölmemiz gerekti, buna
+hata vermeden önce karar verip bölemez miyiz? En fazla ne sığdırabiliyoruz,
+kaçtan sonra bölmemiz lazım, bu sütun mu satır mı?" Cevap için
+`scripts/probe_max_rows_at_50k_cols.py` ile 50.002 sütunluk dosyanın
+İLK N satırını fiziksel olarak ayırıp tek başına yükleyen bir bisection
+(ikili arama) yapıldı, her denemeden önce ClickHouse fresh restart
+edildi.
+
+**Yöntemsel önemli bir keşif önce yapıldı**: kullanıcının önerisiyle
+`wsl --shutdown` denendi -- host boş RAM'i **1,9GB'den 8,99GB'a** çıktı
+(!), ama Docker Desktop/container'lar yeniden başlar başlamaz boş RAM
+hemen tekrar ~1,9GB'a düştü. Kök neden: `.wslconfig`'de `memory=12GB`
+sabit ayrılmış, host toplamı sadece 16,48GB -- bu bir "sızıntı" değil,
+YAPISAL bir ayar. ClickHouse'a kalan gerçek pay bu 12GB bütçenin
+içinden ~9,3-9,5GB (diğer container'lar + Docker overhead düşülünce),
+tam olarak çökme sınırlarıyla örtüşüyor. Yani "host bellek darlığı"
+geçici değil, bu makinenin kalıcı/yapısal bir kısıtı.
+
+**Bisection sonucu (her adımda fresh ClickHouse restart, tek dosya, izole)**:
+
+| Satır | Hücre | Sonuç |
+|---|---|---|
+| 1.000 | 50M | Başarılı |
+| 5.000 | 250M | Başarılı |
+| 15.000 | 750M | Başarılı |
+| **20.000** | **1,00 milyar** | **Başarılı (en yüksek doğrulanan)** |
+| 25.000 | 1,25 milyar | Çöktü |
+| 50.000 | 2,50 milyar | Çöktü (İLK denemede bir kez başarılıydı, tekrar denenince çöktü -- güvenilmez sınırda) |
+| 56.250 / 62.500 / 75.000 / 100.000 | 2,8-5,0 milyar | Hepsi çöktü |
+
+**Güvenli sınır: 50.002 sütunda ~20.000-25.000 satır arası (yakl. 1
+milyar hücre).**
+
+### 46.1 Kesin cevap -- SÜTUN belirleyici, hücre sayısı değil
+
+Aynı toplam hücre sayısını farklı sütun/satır kombinasyonlarıyla
+karşılaştırınca (gerçek grid verisinden, Bölüm 45'in tablosu):
+
+| Sütun sayısı | Güvenle taşıdığı en yüksek hücre (bu grid'de test edilen) |
+|---|---|
+| 10.002 | 1,0 milyar+ (100.000 satırda bile sorunsuz) |
+| 20.002 | 2,0 milyar+ |
+| 30.002 | 3,0 milyar+ |
+| 40.002 | 4,0 milyar+ |
+| **50.002** | **~1,0 milyarda tavan (bu bisection'da bulundu)** |
+
+**40.002 sütun 4 milyar hücreyi taşırken, 50.002 sütun 1,25 milyar
+hücrede bile çöküyor** -- 40k'dan 50k sütuna geçişte düzgün/doğrusal
+bir düşüş değil, keskin bir UÇURUM var. Bu, Bölüm 45.1'in "süper-doğrusal
+büyüme" gözlemini kesin sayılarla doğruluyor: ClickHouse'un TSV
+parser'ının (`TabSeparatedFormatReader`/`SerializationNumber::deserializeText`)
+sütun başına sabit tampon maliyeti, sütun sayısı arttıkça hızlanarak
+büyüyor -- SATIR sayısının payı ikincil.
+
+**Sonuç: "kaçtan sonra bölmemiz lazım" sorusunun cevabı SÜTUN SAYISINA
+göre değişir, tek bir hücre-sayısı eşiği YOK.** ~40.000 sütuna kadar
+hücre bazlı kaba bir sınır (örn. 4 milyar) işe yarar gibi görünüyor,
+ama 50.000 sütun civarında bu sınır ~1 milyara düşüyor -- ara sütun
+sayılarında (örn. 45.000) tam eğri test edilmedi, bu oturumda zaman
+kısıtı nedeniyle yapılmadı.
