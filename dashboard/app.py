@@ -5895,8 +5895,15 @@ def main():
     # düşülür -- bkz. aşağıdaki "AUTO REFRESH" bölümü.
     render_started_at = time.time()
 
-    st.title(
+    # Başlığa tıklanınca "Pipeline Metrikleri" (ana) sekmesine geçilir --
+    # bkz. aşağıdaki "?goto=runs" query param kontrolü.
+    st.markdown(
+        '<a href="?goto=runs" target="_self" '
+        'style="text-decoration: none; color: inherit;">'
+        '<h1 style="margin: 0;">'
         "İHA Veri Platformu — Pipeline Metrikleri & Katalog"
+        "</h1></a>",
+        unsafe_allow_html=True,
     )
 
     st.caption(
@@ -5904,41 +5911,6 @@ def main():
         "Katalog verisi Dagster asset materialization metadata'sından, "
         "telemetri verisi ise ClickHouse üzerinden okunmaktadır."
     )
-
-    # ========================================================
-    # SIDEBAR (sadece bağlantı bilgisi)
-    # ========================================================
-    #
-    # Çalıştırma kontrolleri (run sayısı, otomatik yenileme, "Şimdi
-    # yenile") artık aşağıdaki yan sekme panelinde -- bkz. "SEKME
-    # SEÇİMİ + KONTROLLER". Sidebar sadece salt-okunur bağlantı
-    # bilgisini gösterir.
-
-    with st.sidebar:
-
-        st.header(
-            "Ayarlar"
-        )
-
-        st.caption(
-            f"Dagster GraphQL: "
-            f"{get_graphql_url()}"
-        )
-
-        st.caption(
-            f"ClickHouse: "
-            f"{get_clickhouse_host()}:{get_clickhouse_port()}"
-        )
-
-        st.caption(
-            f"ClickHouse tablosu: "
-            f"{get_clickhouse_database()}.{get_clickhouse_table()}"
-        )
-
-        st.caption(
-            f"Parquet yedeği: "
-            f"{get_processed_files_glob()}"
-        )
 
     # ========================================================
     # SEKME SEÇİMİ + KONTROLLER (yan panel)
@@ -5965,6 +5937,15 @@ def main():
     # -- bunlar runs_df'i (aşağıda) ve otomatik yenilemeyi etkilediği
     # için değerleri (run_limit, refresh_seconds) content_col'daki
     # sekme içerikleri render edilmeden ÖNCE burada okunmalı.
+
+    # Başlığa tıklanınca eklenen "?goto=runs" -- mevcut sekme ne olursa
+    # olsun (aşağıdaki "active_main_tab" session_state'te zaten bir
+    # değer olsa bile) doğrudan "Pipeline Metrikleri" sekmesine geçilir.
+    if st.query_params.get("goto") == "runs":
+
+        st.session_state["active_main_tab"] = MAIN_TAB_RUNS
+
+        del st.query_params["goto"]
 
     if "active_main_tab" not in st.session_state:
 
