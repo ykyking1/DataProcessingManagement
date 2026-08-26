@@ -1,0 +1,177 @@
+id,tab_file_name,attempt_no,aircraft_type,is_subset,subset_row_count,status,row_count_tab,row_count_clickhouse,column_count,had_trailing_tab_issue,tab_zst_object_key,tab_zst_size_bytes,original_size_bytes,compression_algorithm,compression_level,compress_duration_seconds,minio_upload_duration_seconds,clickhouse_load_duration_seconds,clickhouse_table_name,clickhouse_disk_bytes,clickhouse_loaded_at,error_detail,started_at,finished_at
+1,synthetic_40k_100000.tab,2,AIRCRAFT_40K,,,processing,,,,,,,,,,,,,,,,,2026-08-24 14:50:33.336431+00,
+2,synthetic_50k_1000.tab,2,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-24 14:50:33.350354+00,
+3,synthetic_50k_5000.tab,2,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-24 14:50:33.353906+00,
+4,synthetic_50k_50000.tab,2,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-24 14:50:33.358246+00,
+5,synthetic_50k_100000.tab,2,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-24 14:50:33.361723+00,
+6,synthetic_40k_100000.tab,3,AIRCRAFT_40K,f,,done,100000,100000,40002,f,grid/synthetic_40k_100000.tab.zst,2907619137,11452936018,zstd,12,934.1393685340881,10.424033880233765,242.40755939483643,synthetic_40k_100000,4795388068,2026-08-25 05:40:11.751869+00,,2026-08-25 05:17:05.989733+00,2026-08-25 05:40:11.751869+00
+7,synthetic_50k_1000.tab,3,AIRCRAFT_50K,f,,done,1000,1000,50002,f,grid/synthetic_50k_1000.tab.zst,35799735,143468780,zstd,12,18.739814281463623,0.24095439910888672,19.055939435958862,synthetic_50k_1000,67199761,2026-08-25 05:40:46.851299+00,,2026-08-25 05:17:06.002064+00,2026-08-25 05:40:46.851299+00
+8,synthetic_50k_5000.tab,3,AIRCRAFT_50K,f,,done,5000,5000,50002,f,grid/synthetic_50k_5000.tab.zst,178346801,716075346,zstd,12,78.70335030555725,0.8608160018920898,32.8843035697937,synthetic_50k_5000,322333528,2026-08-25 05:41:00.657398+00,,2026-08-25 05:17:06.0042+00,2026-08-25 05:41:00.657398+00
+9,synthetic_50k_50000.tab,3,AIRCRAFT_50K,f,,done,50000,50000,50002,f,grid/synthetic_50k_50000.tab.zst,1783035630,7157979924,zstd,12,611.6181693077087,7.76803731918335,185.60133981704712,synthetic_50k_50000,3219467426,2026-08-25 05:44:09.013648+00,,2026-08-25 05:17:06.006439+00,2026-08-25 05:44:09.013648+00
+10,synthetic_50k_100000.tab,3,AIRCRAFT_50K,,,error,,,,,,,,,,,,,,,,"[Faz2-ClickHouse] ServerException: Code: 241.
+DB::Exception: (total) memory limit exceeded: would use 9.58 GiB (attempt to allocate chunk of 10.00 MiB), current RSS: 8.79 GiB, maximum: 9.33 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker. Untracked memory across all threads: -14.95 MiB: (in file/uri telemetry/grid/synthetic_50k_100000.tab.zst): While executing TabSeparatedRowInputFormat: While executing ReadFromObjectStorage. Stack trace:
+
+0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x00000000165f672a
+1. DB::Exception::Exception(String&&, int, String, bool) @ 0x0000000010226112
+2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x0000000010225986
+3. DB::Exception::Exception<char const*, char const*, String, String, String, String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<char const*>::type, std::type_identity<char const*>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, char const*&&, char const*&&, String&&, String&&, String&&, String&&, String&&, String&&, String&&) @ 0x000000001668d403
+4. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x0000000016689fb2
+5. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+6. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+7. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+8. CurrentMemoryTracker::allocImpl(long, bool) @ 0x00000000165bec05
+9. Allocator<false, false>::alloc(unsigned long, unsigned long) @ 0x00000000165b92a7
+10. DB::Memory<Allocator<false, false>>::alloc(unsigned long) @ 0x000000000c73dacc
+11. DB::ParallelReadBuffer::addReaderToPool() @ 0x00000000167d2820
+12. DB::ParallelReadBuffer::nextImpl() @ 0x00000000167d3e19
+13. DB::ReadBuffer::next() @ 0x00000000167a857d
+14. DB::ZstdInflatingReadBuffer::nextImpl() @ 0x00000000167d050f
+15. DB::ReadBuffer::next() @ 0x00000000167a857d
+16. DB::PeekableReadBuffer::nextImpl() @ 0x00000000167c9043
+17. DB::ReadBuffer::next() @ 0x00000000167a857d
+18. DB::RowInputFormatWithNamesAndTypes<DB::TabSeparatedFormatReader>::readRow(std::vector<COW<DB::IColumn>::mutable_ptr<DB::IColumn>, std::allocator<COW<DB::IColumn>::mutable_ptr<DB::IColumn>>>&, DB::RowReadExtension&) @ 0x000000001d60092f
+19. DB::IRowInputFormat::read() @ 0x000000001d5cd03b
+20. DB::IInputFormat::generate() @ 0x000000001d541c56
+21. DB::ISource::tryGenerate() @ 0x000000001d50a029
+22. DB::ISource::work() @ 0x000000001d509b81
+23. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+24. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+25. DB::PipelineExecutor::executeStep(std::atomic<bool>*) @ 0x000000001d520533
+26. DB::PullingPipelineExecutor::pull(DB::Chunk&) @ 0x000000001d53c51b
+27. DB::StorageObjectStorageSource::generate() @ 0x0000000019733d4f
+28. DB::ISource::tryGenerate() @ 0x000000001d50a029
+29. DB::ISource::work() @ 0x000000001d509b81
+30. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+31. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+",2026-08-25 05:17:06.008229+00,2026-08-25 05:47:45.616567+00
+11,synthetic_50k_100000.tab,4,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 05:50:12.751586+00,
+12,synthetic_50k_100000.tab,5,AIRCRAFT_50K,,,error,,,,,,,,,,,,,,,,"ServerException: Code: 241.
+DB::Exception: (total) memory limit exceeded: would use 9.32 GiB (attempt to allocate chunk of 4.01 MiB), current RSS: 8.68 GiB, maximum: 9.32 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker. Untracked memory across all threads: -7.66 MiB: (in file/uri telemetry/grid/synthetic_50k_100000_partA.tab.zst): While executing TabSeparatedRowInputFormat: While executing ReadFromObjectStorage. Stack trace:
+
+0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x00000000165f672a
+1. DB::Exception::Exception(String&&, int, String, bool) @ 0x0000000010226112
+2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x0000000010225986
+3. DB::Exception::Exception<char const*, char const*, String, String, String, String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<char const*>::type, std::type_identity<char const*>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, char const*&&, char const*&&, String&&, String&&, String&&, String&&, String&&, String&&, String&&) @ 0x000000001668d403
+4. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x0000000016689fb2
+5. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+6. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+7. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+8. CurrentMemoryTracker::allocImpl(long, bool) @ 0x00000000165bec05
+9. Allocator<false, false>::realloc(void*, unsigned long, unsigned long, unsigned long) @ 0x00000000165b9797
+10. void DB::PODArrayBase<1ul, 4096ul, Allocator<false, false>, 63ul, 64ul>::reserveForNextSize<>() @ 0x0000000010285285
+11. DB::SerializationNumber<char8_t>::deserializeText(DB::IColumn&, DB::ReadBuffer&, DB::FormatSettings const&, bool) const @ 0x000000000dae3fc1
+12. DB::TabSeparatedFormatReader::readField(DB::IColumn&, std::shared_ptr<DB::IDataType const> const&, std::shared_ptr<DB::ISerialization const> const&, bool, String const&) @ 0x000000001d7dc3da
+13. DB::RowInputFormatWithNamesAndTypes<DB::TabSeparatedFormatReader>::readRow(std::vector<COW<DB::IColumn>::mutable_ptr<DB::IColumn>, std::allocator<COW<DB::IColumn>::mutable_ptr<DB::IColumn>>>&, DB::RowReadExtension&) @ 0x000000001d600a42
+14. DB::IRowInputFormat::read() @ 0x000000001d5cd03b
+15. DB::IInputFormat::generate() @ 0x000000001d541c56
+16. DB::ISource::tryGenerate() @ 0x000000001d50a029
+17. DB::ISource::work() @ 0x000000001d509b81
+18. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+19. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+20. DB::PipelineExecutor::executeStep(std::atomic<bool>*) @ 0x000000001d520533
+21. DB::PullingPipelineExecutor::pull(DB::Chunk&) @ 0x000000001d53c51b
+22. DB::StorageObjectStorageSource::generate() @ 0x0000000019733d4f
+23. DB::ISource::tryGenerate() @ 0x000000001d50a029
+24. DB::ISource::work() @ 0x000000001d509b81
+25. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+26. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+27. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::PipelineExecutor::spawnThreads(std::shared_ptr<DB::IAcquiredSlot>)::$_0>(std::__function::__policy_storage const*) @ 0x000000001d52549a
+28. ThreadPoolImpl<ThreadFromGlobalPoolImpl<false, true>>::ThreadFromThreadPool::worker() @ 0x000000001681e583
+29. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<startThreadFromGlobalPool(std::shared_ptr<ThreadFromGlobalPoolState>, std::function<void ()>, unsigned long, unsigned long, bool, bool)::$_0>(std::__function::__policy_storage const*) @ 0x000",2026-08-25 05:54:55.780742+00,2026-08-25 06:05:51.97497+00
+13,synthetic_50k_100000.tab,6,AIRCRAFT_50K,,,error,,,,,,,,,,,,,,,,"ServerException: Code: 241.
+DB::Exception: (total) memory limit exceeded: would use 9.52 GiB (attempt to allocate chunk of 4.06 MiB), current RSS: 8.77 GiB, maximum: 9.51 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker. Untracked memory across all threads: -3.00 MiB: (in file/uri telemetry/grid/synthetic_50k_100000_partA.tab.zst): While executing TabSeparatedRowInputFormat: While executing ReadFromObjectStorage. Stack trace:
+
+0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x00000000165f672a
+1. DB::Exception::Exception(String&&, int, String, bool) @ 0x0000000010226112
+2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x0000000010225986
+3. DB::Exception::Exception<char const*, char const*, String, String, String, String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<char const*>::type, std::type_identity<char const*>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, char const*&&, char const*&&, String&&, String&&, String&&, String&&, String&&, String&&, String&&) @ 0x000000001668d403
+4. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x0000000016689fb2
+5. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+6. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+7. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+8. CurrentMemoryTracker::allocImpl(long, bool) @ 0x00000000165bec05
+9. Allocator<false, false>::realloc(void*, unsigned long, unsigned long, unsigned long) @ 0x00000000165b9797
+10. void DB::PODArrayBase<8ul, 4096ul, Allocator<false, false>, 63ul, 64ul>::reserveForNextSize<>() @ 0x00000000102356c5
+11. DB::SerializationNumber<double>::deserializeText(DB::IColumn&, DB::ReadBuffer&, DB::FormatSettings const&, bool) const @ 0x000000000daf1fdc
+12. DB::TabSeparatedFormatReader::readField(DB::IColumn&, std::shared_ptr<DB::IDataType const> const&, std::shared_ptr<DB::ISerialization const> const&, bool, String const&) @ 0x000000001d7dc3da
+13. DB::RowInputFormatWithNamesAndTypes<DB::TabSeparatedFormatReader>::readRow(std::vector<COW<DB::IColumn>::mutable_ptr<DB::IColumn>, std::allocator<COW<DB::IColumn>::mutable_ptr<DB::IColumn>>>&, DB::RowReadExtension&) @ 0x000000001d600a42
+14. DB::IRowInputFormat::read() @ 0x000000001d5cd03b
+15. DB::IInputFormat::generate() @ 0x000000001d541c56
+16. DB::ISource::tryGenerate() @ 0x000000001d50a029
+17. DB::ISource::work() @ 0x000000001d509b81
+18. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+19. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+20. DB::PipelineExecutor::executeStep(std::atomic<bool>*) @ 0x000000001d520533
+21. DB::PullingPipelineExecutor::pull(DB::Chunk&) @ 0x000000001d53c51b
+22. DB::StorageObjectStorageSource::generate() @ 0x0000000019733d4f
+23. DB::ISource::tryGenerate() @ 0x000000001d50a029
+24. DB::ISource::work() @ 0x000000001d509b81
+25. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+26. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+27. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::PipelineExecutor::spawnThreads(std::shared_ptr<DB::IAcquiredSlot>)::$_0>(std::__function::__policy_storage const*) @ 0x000000001d52549a
+28. ThreadPoolImpl<ThreadFromGlobalPoolImpl<false, true>>::ThreadFromThreadPool::worker() @ 0x000000001681e583
+29. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<startThreadFromGlobalPool(std::shared_ptr<ThreadFromGlobalPoolState>, std::function<void ()>, unsigned long, unsigned long, bool, bool)::$_0>(std::__function::__policy_storage const*) @ 0x0000",2026-08-25 06:09:24.642143+00,2026-08-25 06:11:53.120179+00
+14,synthetic_50k_100000.tab,7,AIRCRAFT_50K,,,error,,,,,,,,,,,,,,,,"ServerException: Code: 241.
+DB::Exception: (total) memory limit exceeded: would use 9.37 GiB (attempt to allocate chunk of 4.01 MiB), current RSS: 8.94 GiB, maximum: 9.37 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker. Untracked memory across all threads: -4.75 MiB: (in file/uri telemetry/grid/synthetic_50k_100000_q1.tab.zst): While executing TabSeparatedRowInputFormat: While executing ReadFromObjectStorage. Stack trace:
+
+0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x00000000165f672a
+1. DB::Exception::Exception(String&&, int, String, bool) @ 0x0000000010226112
+2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x0000000010225986
+3. DB::Exception::Exception<char const*, char const*, String, String, String, String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<char const*>::type, std::type_identity<char const*>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, char const*&&, char const*&&, String&&, String&&, String&&, String&&, String&&, String&&, String&&) @ 0x000000001668d403
+4. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x0000000016689fb2
+5. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+6. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+7. MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) @ 0x000000001668949f
+8. CurrentMemoryTracker::allocImpl(long, bool) @ 0x00000000165bec05
+9. Allocator<false, false>::realloc(void*, unsigned long, unsigned long, unsigned long) @ 0x00000000165b9797
+10. void DB::PODArrayBase<1ul, 4096ul, Allocator<false, false>, 63ul, 64ul>::reserveForNextSize<>() @ 0x0000000010285285
+11. DB::SerializationNumber<char8_t>::deserializeText(DB::IColumn&, DB::ReadBuffer&, DB::FormatSettings const&, bool) const @ 0x000000000dae3fc1
+12. DB::TabSeparatedFormatReader::readField(DB::IColumn&, std::shared_ptr<DB::IDataType const> const&, std::shared_ptr<DB::ISerialization const> const&, bool, String const&) @ 0x000000001d7dc3da
+13. DB::RowInputFormatWithNamesAndTypes<DB::TabSeparatedFormatReader>::readRow(std::vector<COW<DB::IColumn>::mutable_ptr<DB::IColumn>, std::allocator<COW<DB::IColumn>::mutable_ptr<DB::IColumn>>>&, DB::RowReadExtension&) @ 0x000000001d600a42
+14. DB::IRowInputFormat::read() @ 0x000000001d5cd03b
+15. DB::IInputFormat::generate() @ 0x000000001d541c56
+16. DB::ISource::tryGenerate() @ 0x000000001d50a029
+17. DB::ISource::work() @ 0x000000001d509b81
+18. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+19. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+20. DB::PipelineExecutor::executeStep(std::atomic<bool>*) @ 0x000000001d520533
+21. DB::PullingPipelineExecutor::pull(DB::Chunk&) @ 0x000000001d53c51b
+22. DB::StorageObjectStorageSource::generate() @ 0x0000000019733d4f
+23. DB::ISource::tryGenerate() @ 0x000000001d50a029
+24. DB::ISource::work() @ 0x000000001d509b81
+25. DB::ExecutionThreadContext::executeTask() @ 0x000000001d5317ec
+26. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001d5218da
+27. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::PipelineExecutor::spawnThreads(std::shared_ptr<DB::IAcquiredSlot>)::$_0>(std::__function::__policy_storage const*) @ 0x000000001d52549a
+28. ThreadPoolImpl<ThreadFromGlobalPoolImpl<false, true>>::ThreadFromThreadPool::worker() @ 0x000000001681e583
+29. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<startThreadFromGlobalPool(std::shared_ptr<ThreadFromGlobalPoolState>, std::function<void ()>, unsigned long, unsigned long, bool, bool)::$_0>(std::__function::__policy_storage const*) @ 0x000000",2026-08-25 06:20:56.34018+00,2026-08-25 06:29:15.406424+00
+15,synthetic_10k_1000.tab,6,AIRCRAFT_10K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 06:45:16.63081+00,
+16,synthetic_20k_1000.tab,4,AIRCRAFT_20K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 06:45:16.648612+00,
+17,synthetic_50k_100000.tab,8,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 06:45:16.652519+00,
+18,synthetic_10k_1000.tab,7,AIRCRAFT_10K,f,,done,1000,1000,10002,f,grid/synthetic_10k_1000.tab.zst,7426052,28701380,zstd,12,1.7482588291168213,0.050642967224121094,1.282707929611206,synthetic_10k_1000,9055662,2026-08-25 06:49:31.515183+00,,2026-08-25 06:49:27.928814+00,2026-08-25 06:49:31.515183+00
+19,synthetic_20k_1000.tab,5,AIRCRAFT_20K,f,,done,1000,1000,20002,f,grid/synthetic_20k_1000.tab.zst,14789591,57387210,zstd,12,3.5484328269958496,0.06930756568908691,3.840210199356079,synthetic_20k_1000,20659075,2026-08-25 06:49:53.240302+00,,2026-08-25 06:49:45.166308+00,2026-08-25 06:49:53.240302+00
+20,synthetic_10k_1000.tab,8,AIRCRAFT_10K,f,,done,1000,1000,10002,f,grid/synthetic_10k_1000.tab.zst,7426052,28701380,zstd,12,1.6941311359405518,0.05475187301635742,1.1256628036499023,synthetic_10k_1000,9055662,2026-08-25 08:20:50.005597+00,,2026-08-25 08:20:46.804087+00,2026-08-25 08:20:50.005597+00
+21,synthetic_50k_100000.tab,9,AIRCRAFT_50K,f,,done,100000,100000,50002,f,grid/synthetic_50k_100000_p1.tab.zst + grid/synthetic_50k_100000_p2.tab.zst + grid/synthetic_50k_100000_p3.tab.zst + grid/synthetic_50k_100000_p4.tab.zst + grid/synthetic_50k_100000_p5.tab.zst + grid/synthetic_50k_100000_p6.tab.zst,3566904949,14315669424,zstd,12,936.7990727424622,41.21504735946655,650.9064362049103,synthetic_50k_100000_p1 + synthetic_50k_100000_p2 + synthetic_50k_100000_p3 + synthetic_50k_100000_p4 + synthetic_50k_100000_p5 + synthetic_50k_100000_p6,6452317300,2026-08-25 08:50:58.790784+00,,2026-08-25 08:21:13.284421+00,2026-08-25 08:50:58.790784+00
+22,synthetic_10k_1000.tab,9,AIRCRAFT_10K,f,,done,1000,1000,10002,f,grid/synthetic_10k_1000.tab.zst,7315530,28701380,zstd,12,0.9239509105682373,0.31569528579711914,1.405876874923706,synthetic_10k_1000,9055662,2026-08-25 12:07:47.093598+00,,2026-08-25 12:07:42.807283+00,2026-08-25 12:07:47.093598+00
+23,synthetic_10k_1000.tab,10,AIRCRAFT_10K,f,,done,1000,1000,10002,f,grid/synthetic_10k_1000.tab.zst,7315530,28701380,zstd,12,3.8207099437713623,0.19673490524291992,1.09515380859375,synthetic_10k_1000,9055662,2026-08-25 12:08:08.714575+00,,2026-08-25 12:08:02.87706+00,2026-08-25 12:08:08.714575+00
+24,synthetic_20k_1000.tab,6,AIRCRAFT_20K,f,,done,1000,1000,20002,f,grid/synthetic_20k_1000.tab.zst,14335097,57387210,zstd,12,4.083783388137817,0.2030048370361328,2.85844349861145,synthetic_20k_1000,20659075,2026-08-25 12:08:12.121424+00,,2026-08-25 12:08:02.890982+00,2026-08-25 12:08:12.121424+00
+25,synthetic_30k_1000.tab,3,AIRCRAFT_30K,f,,done,1000,1000,30002,f,grid/synthetic_30k_1000.tab.zst,21292542,86078306,zstd,12,4.246014356613159,0.15386652946472168,5.655259609222412,synthetic_30k_1000,32769167,2026-08-25 12:08:19.400917+00,,2026-08-25 12:08:02.89301+00,2026-08-25 12:08:19.400917+00
+26,synthetic_10k_1000.tab,11,AIRCRAFT_10K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.599297+00,
+27,synthetic_10k_5000.tab,2,AIRCRAFT_10K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.614499+00,
+28,synthetic_10k_50000.tab,2,AIRCRAFT_10K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.618021+00,
+29,synthetic_10k_100000.tab,2,AIRCRAFT_10K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.621029+00,
+30,synthetic_20k_1000.tab,7,AIRCRAFT_20K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.624437+00,
+31,synthetic_20k_5000.tab,2,AIRCRAFT_20K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.6507+00,
+32,synthetic_20k_50000.tab,2,AIRCRAFT_20K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.675042+00,
+33,synthetic_20k_100000.tab,2,AIRCRAFT_20K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.709936+00,
+34,synthetic_30k_1000.tab,4,AIRCRAFT_30K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.714559+00,
+35,synthetic_30k_5000.tab,2,AIRCRAFT_30K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.718791+00,
+36,synthetic_30k_50000.tab,2,AIRCRAFT_30K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.752534+00,
+37,synthetic_30k_100000.tab,2,AIRCRAFT_30K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.75764+00,
+38,synthetic_40k_1000.tab,2,AIRCRAFT_40K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.772507+00,
+39,synthetic_40k_5000.tab,2,AIRCRAFT_40K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.802444+00,
+40,synthetic_40k_50000.tab,2,AIRCRAFT_40K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.831486+00,
+41,synthetic_40k_100000.tab,4,AIRCRAFT_40K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.864665+00,
+42,synthetic_50k_1000.tab,4,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.869727+00,
+43,synthetic_50k_5000.tab,4,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.873275+00,
+44,synthetic_50k_50000.tab,4,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.876178+00,
+45,synthetic_50k_100000.tab,10,AIRCRAFT_50K,,,processing,,,,,,,,,,,,,,,,,2026-08-25 12:17:41.896232+00,

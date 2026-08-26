@@ -3690,3 +3690,208 @@ hücre bazlı kaba bir sınır (örn. 4 milyar) işe yarar gibi görünüyor,
 ama 50.000 sütun civarında bu sınır ~1 milyara düşüyor -- ara sütun
 sayılarında (örn. 45.000) tam eğri test edilmedi, bu oturumda zaman
 kısıtı nedeniyle yapılmadı.
+
+### 46.2 Bulgu pipeline'a işlendi -- OTOMATİK proaktif bölme, 50k_100000 artık tam başarılı (20/20)
+
+Kullanıcı onayıyla `scripts/pipeline_grid_to_clickhouse.py`'ye
+`CH_LOAD_SAFE_CELL_LIMIT = 1_000_000_000` (1 milyar hücre, bisection'ın
+bulduğu ~1 milyar güvenli sınırından, marjlı) eklendi. **Faz 1**
+(`compress_and_upload`) artık her dosyanın toplam hücre sayısını
+(`sütun x satır`) kontrol ediyor; eşiği aşarsa kaynak `.tab` dosyası
+`n_parts = ceil(hücre / limit)` parçaya FİZİKSEL olarak bölünüyor
+(satır bazlı, header her parçada tekrarlanıyor), her parça AYRI
+sıkıştırılıp AYRI MinIO objesi olarak yükleniyor -- LIMIT/OFFSET ile
+tek büyük objeden "parça okumak" (Bölüm 45.1'de denenip başarısız
+olmuştu) KULLANILMIYOR. **Faz 2** (`load_and_record`) parça sayısına
+göre 1 ya da N tabloya yükleyip doğruluyor, hepsini toplayıp TEK bir
+Postgres kaydı (`conversion_manifest` + `conversion_manifest_history`)
+yazıyor -- `clickhouse_table_name`/`tab_zst_object_key` alanlarında
+parçaların hepsi `+` ile birleştirilmiş halde görünüyor.
+
+**Gerçek test**: `synthetic_50k_100000.tab` (50.002 sütun x 100.000
+satır, 5,0002 milyar hücre) `ceil(5,0002 milyar / 1 milyar) = 6`
+parçaya bölündü (~16.667 satır/parça, ~833M hücre/parça -- doğrulanmış
+güvenli sınırın altında). Sonuç: **tüm 6 parça başarıyla yüklendi,
+toplam 100.000/100.000 satır eşleşti, `status='done'`.** Artık grid'in
+**20/20 dosyası** başarıyla işlenmiş durumda -- Bölüm 45'in "19/20,
+1 dosya bilinen kısıt" durumu ÇÖZÜLDÜ.
+
+**Önemli**: her parça hâlâ SIRALI işleniyor (Bölüm 45.2'nin kararıyla
+tutarlı -- eşzamanlı yüklemenin getirisi bu ölçekte kanıtlanmadı,
+riski gereksiz büyütür). Parça başına ilerleme logu eklendi
+(`[FAZ1 tag] parca i/n tamam`, `[FAZ2 tag] parca i/n yuklendi`) --
+önceden bölünmüş dosyalarda Faz 1/Faz 2 boyunca hiç çıktı yoktu, uzun
+sessiz bekleme kafa karıştırıcıydı.
+
+### 46.3 `max_threads`/`max_insert_threads` de tarandı -- artık güvenli boyuttaki parçalarda bile kazanç yok
+
+Kullanıcı "ClickHouse'un kendi thread ayarlarını denedik mi" diye
+sordu -- gözden geçirilince `max_threads`/`max_insert_threads`'in
+Bolum 37/41.1'den beri SADECE "bellek güvenliği için düşük tut"
+varsayımıyla 2/1'de sabit tutulduğu, hiç izole test edilmediği
+görüldü (`max_download_threads` Bölüm 43.2'de test edilmişti,
+`max_insert_threads` sadece ~1.000 sütun ölçeğinde -- Bölüm 28.1,
+artırmak KÖTÜLEŞTİRMİŞTİ). Artık proaktif bölme sayesinde her parça
+güvenli boyutta (833M hücre) olduğu için bu güvenli marj içinde
+`scripts/thread_settings_sweep.py` ile tarandı (zaten MinIO'da duran
+bir parça objesi kullanılarak, her denemeden önce fresh restart):
+
+| `max_threads` | Süre | `max_insert_threads` | Süre |
+|---|---|---|---|
+| 2 (mevcut) | 81,8sn | 1 (mevcut) | 86,3sn |
+| 4 | 80,8sn | 2 | 86,4sn |
+| 8 | 76,3sn | 4 | 87,2sn |
+| 16 | 83,6sn | 8 | 77,3sn |
+
+**Sonuç: anlamlı kazanç YOK** -- hepsi 76-88sn bandında (~%14 spread,
+ölçüm gürültüsü seviyesinde), hiçbir deger digerinden belirgin daha
+hızlı değil. Olumlu yan: hiçbiri çökmedi (eski ~1.000-sütun ölçeğindeki
+Bölüm 28.1'in "artırmak kötüleştiriyor" bulgusunun tersi bir kötüleşme
+de yok, ama iyileşme de yok). **Karar: `max_threads=2`/`max_insert_threads=1`
+değiştirilmedi** -- bu, `max_download_threads`'in Bölüm 43.2'deki
+bulgusuyla aynı temayı doğruluyor: geniş şema ölçeğinde ClickHouse
+yükleme adımında artık ucuz/risksiz bir ek hızlanma kaynağı kalmadı,
+darboğaz büyük ihtimalle sütun sayısının kendisinin getirdiği
+parse/serileştirme maliyetinde (thread sayısından bağımsız).
+
+### 46.4 Sütun sayısına göre worker sayısı ayarlamak -- gerekçesiz, sıkıştırma hızı sütundan değil veri hacminden etkileniyor
+
+Kullanıcı sordu: "N=6 tüm sütun sayıları birlikte test edilmişti,
+sütuna göre ayarlasak daha iyi olur muydu?" Önce Postgres'teki mevcut
+sürelerle bakıldı, "geniş sütunlu dosyalar daha hızlı sıkışıyor gibi"
+göründü (ör. 50k sütun x 100k satır 16,3MB/s iken 10k sütun x 1k satır
+5,9MB/s) -- AMA bu KİRLİ bir karşılaştırmaydı: dosyalar farklı
+çalıştırmalarda (bazıları N=6'nın tam rekabeti altında, bazıları daha
+az dosya kaldığı için rekabetsiz/yarı-rekabetsiz) işlenmişti.
+
+**Temiz test** (`GRID_DIR`'de zaten duran 5 dosya, SABİT 5.000 satır,
+TEK worker/rekabetsiz, sırayla): sonuç MB/s neredeyse DÜZ çıktı:
+
+| Sütun | MB/s |
+|---|---|
+| 10.002 | 12,28 |
+| 20.002 | 13,64 |
+| 30.002 | 13,84 |
+| 40.002 | 14,15 |
+| 50.002 | 14,02 |
+
+10k->20k arası küçük bir sıçrama var (muhtemelen sabit başlatma
+maliyetinin küçük dosyada orantısal payı), 20k'dan 50k'ya kadar
+tamamen düz (~%3 spread, gürültü seviyesinde).
+
+**Sonuç: sütun sayısına göre worker ayarlamanın gerekçesi YOK.** ZSTD
+sıkıştırma adımı dosyayı ham byte akışı olarak işliyor -- sütunları
+parse etmiyor. Hızı belirleyen sütun sayısı değil, VERİ HACMİ (byte)
+ve İÇERİK KOMPOZİSYONU (float/binary oranı); grid'in tüm sütun
+tier'lerinde bu oran sabit olduğu için gerçek bir fark yok. Az önceki
+"geniş = hızlı" görüntüsü ölçüm artefaktıydı (rekabet farkı), veri
+değil. Bölüm 42.1'in "en büyük dosyanın süresi alt sınır oluşturuyor"
+bulgusu zaten dosya BOYUTUNA (byte) göre işliyor, sütun sayısına göre
+değil (Bölüm 46.5'e bakınız, mentörün önerisi orada test edildi) -- **N=6 kararı hangi sütun tier'i olursa olsun geçerliliğini
+koruyor, tier-bazlı worker ayarına gerek yok.**
+
+### 46.5 Mentörün "process x thread" fikri denendi -- TEK dosyada güçlü kazanç, KARIŞIK çok-dosyalı iş yükünde işe yaramadı
+
+Kullanıcı mentörünün MinIO->ClickHouse geçişinde "5 belgeyi 300'er
+satır parçalara bölüp her parçaya 4 worker atadığını" hatırladı,
+sonra bunun "her worker'a 4 çekirdek" anlamına gelebileceğini fark
+etti -- yani process-bazlı paralellik değil, ZSTD'nin KENDİ dahili
+çoklu-thread desteği (`ZstdCompressor(threads=N)`, `zstandard`
+kütüphanesinde mevcut). Bu ana kadar HİÇ test edilmemişti (sadece
+`ProcessPoolExecutor` ile N ayrı tek-thread'li process denenmişti).
+
+**Adım 1 -- TEK büyük dosyada (30k_50000.tab, 4,3GB) izole test**:
+gerçek ve güçlü kazanç bulundu:
+
+| threads | Süre | Hızlanma |
+|---|---|---|
+| 1 | 243,5sn | 1,00x |
+| 4 | 117,0sn | 2,08x |
+| 8 | 96,6sn | 2,52x (en iyi) |
+| 16 | 118,0sn | 2,06x |
+| 20 | 144,2sn | 1,69x (aşırı thread, gerileme) |
+
+**Adım 2 -- process-paralelliği (N farklı dosya) ile ZSTD'nin dahili
+thread'ini (K, tek dosya içinde) BİRLEŞTİRMEK**, Bölüm 42.1'in AYNI
+10-dosyalık/22GB karışık iş yükünde (`scripts/combined_process_thread_sweep.py`),
+toplam ~20 çekirdeği aşmayacak N×K kombinasyonlarıyla:
+
+| N×K | Toplam çekirdek | Süre |
+|---|---|---|
+| 2×8 | 16 | 685,2sn |
+| 3×6 | 18 | 684,0sn |
+| 4×5 | 20 | 716,1sn (en kötü) |
+| 6×3 | 18 | 609,6sn |
+| 6×1 (mevcut) | 6 | 592,9sn (en iyi, doğrulandı) |
+
+**Sonuç: karışık boyutlu çok-dosyalı iş yükünde MEVCUT N=6/thread=1
+hâlâ en iyisi** -- N'yi düşürüp K'yı artırmak, aynı anda işlenen dosya
+sayısını azaltarak zamanlamayı kötüleştiriyor (küçük dosyalar
+büyüklerin arkasında sıraya giriyor). Mentörün fikri YANLIŞ değildi
+ama BU senaryoya (çok sayıda farklı boyutlu dosyanın BİRLİKTE
+işlenmesi) uymuyor.
+
+**Ama fikir tamamen elenmedi**: `threads=8`'in tek-dosya kazancı
+(2,52x) gerçek ve güçlü. Kullanışlı olacağı yer -- BİRDEN FAZLA dosya
+aynı anda YARIŞMADIĞINDA: tek-dosya CLI modu
+(`pipeline_grid_to_clickhouse.py <n> <rows>`), ya da Bölüm 46.2'nin
+proaktif bölmesinde işin SON parçası kalıp diğer worker'lar boşta
+beklerken. Mentörün senaryosu muhtemelen böyle bir durumdu (aynı anda
+az sayıda/sırayla işlenen belgeler). **Henüz pipeline'a işlenmedi,
+kullanıcıya soruldu.**
+
+### 46.6 Bölüm 46.5'in bulgusu pipeline'a işlendi -- tek-dosya modunda threads=8, dolu havuzda threads=1
+
+Kullanıcı onayıyla `pipeline_grid_to_clickhouse.py`'ye uygulandı:
+- **Tek-dosya CLI modu**: hiçbir dosya rekabet etmediği için her zaman
+  `zstd_threads=ZSTD_MAX_INTERNAL_THREADS` (8) kullanılıyor.
+- **Çok-dosya modu**: Faz 1 başlamadan önce `len(pending) <=
+  COMPRESS_WORKERS` kontrol ediliyor -- doğruysa (havuzda kuyruklama
+  OLMAYACAĞI garanti, her worker kendi dosyasını alır) her worker'a
+  `min(8, CPU_CORES // len(pending))` thread veriliyor; yanlışsa
+  (normal/dolu havuz -- Bölüm 46.5'in ana bulgusunun geçerli olduğu
+  durum) `zstd_threads=1` kalıyor. **Not**: bu hesap Faz 1 başlamadan
+  ÖNCE bir kez yapılıyor, havuz zaman içinde boşaldıkça (dosyalar tek
+  tek bitip worker'lar boşa çıktıkça) YENİDEN hesaplanmıyor -- tam
+  dinamik "son parça" adaptasyonu (`ProcessPoolExecutor`'ın basit
+  submit-hepsi-birden modeliyle) belirgin ek karmaşıklık gerektirirdi,
+  kapsam dışı bırakıldı.
+
+Doğrulama: tek-dosya modunda (`10k_1000`) ve 3-dosyalı modda (`<=6`
+bekleyen, `zstd_threads=6` doğru hesaplandı ve loglandı) uçtan uca
+test edildi, hepsi başarılı.
+
+### 46.7 Mentörün fikri ClickHouse YÜKLEME aşaması için de test edildi -- çok küçük parçalarda sabit maliyet baskın çıkıyor
+
+Bölüm 46.5-46.6'da mentörün fikri yanlışlıkla SIKIŞTIRMA aşamasına
+uygulanmıştı; kullanıcı "minio clickhouse geçişi için" dediğini
+netleştirdi -- yani mentör bu yöntemi ClickHouse YÜKLEME aşamasında
+kullanmıştı (5 belge, 300'er satırlık parçalar, parça başına 4
+worker). Bu, Bölüm 43.3'ün N=2 eşzamanlı yükleme testinden İKİ noktada
+farklı: çok daha küçük parça (300 satır vs ~16-20k), daha fazla worker
+(4 vs 2).
+
+**Test** (`scripts/small_chunk_concurrent_load_test.py`,
+`synthetic_10k_5000.tab`, 5.000 satır, 10.002 sütun): dosya 300'er
+satırlık 17 parçaya bölünüp N=4 eşzamanlı (`ThreadPoolExecutor`)
+ClickHouse'a yüklendi, TEK parça/sıralı baseline ile karşılaştırıldı:
+
+| Yöntem | Süre |
+|---|---|
+| Baseline (tek parça, sıralı) | 2,5sn |
+| Küçük parça (300 satır, N=4) -- sadece yükleme | 9,9sn (4x yavaş) |
+| Küçük parça -- hazırlık (bölme+sıkıştır+yükle) dahil toplam | 19,5sn (7,8x yavaş) |
+
+**Sonuç: bu ölçekte İŞE YARAMADI, belirgin şekilde kötüleştirdi.** 17
+parçaya bölmek, her biri için `CREATE TABLE`/bağlantı/S3 nesne getirme
+gibi SABİT maliyetleri 17 kez ödetiyor -- bu sabit maliyetler, 300
+satır gibi küçük bir parçada yapılan gerçek işten daha pahalı hale
+geliyor. N=4 eşzamanlılık bile bunu telafi edemedi.
+
+**Yorum**: mentörün senaryosu muhtemelen çok farklı bir ölçekteydi
+(300 satır orada "küçük bir dilim" iken bizim test dosyamızda neredeyse
+dosyanın tamamı) ya da farklı bir darboğazı (örn. streaming/gerçek
+zamanlı alım, ağ gecikmesi baskın senaryo) çözüyordu. **Bizim
+ölçeğimizde (Bölüm 46.2'nin proaktif bölmesi zaten ~16-20k satırlık
+"yeterince büyük" parçalar kullanıyor) bu yöntem uygun değil, pipeline'a
+işlenmedi.**

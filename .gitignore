@@ -13,3 +13,4 @@ reports
 /dagster/tmp/
 /dagster/.tmp_dagster_home_*/
 .venv
+/local_data/

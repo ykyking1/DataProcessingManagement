@@ -95,6 +95,8 @@ BUCKET = "telemetry"
 ZSTD_LEVEL = 12
 CHUNK = 64 * 1024 * 1024  # Bolum 42.2: 32MB->64MB ~%6,5 hizlanma, 128MB'a kiyasla daha az bellek riski
 COMPRESS_WORKERS = 6  # Bolum 42.1: N=6 tatli nokta, N=10/16 fayda saglamiyor
+CPU_CORES = os.cpu_count() or 20
+ZSTD_MAX_INTERNAL_THREADS = 8  # Bolum 46.5: tek-dosya izole testte tatli nokta, 16/20 gerilemeye basliyor
 CH_LOAD_SAFE_CELL_LIMIT = 1_000_000_000  # Bolum 46: 50k sutunda ~20-25k satirda (1-1,25 milyar hucre) tavan bulundu; guvenli marj icin 1 milyar
 
 COLUMN_TIERS = [10, 20, 30, 40, 50]  # bin
@@ -182,11 +184,20 @@ def mark_error(pg_conn, tab_file_name, attempt_no, error_detail):
     cur.close()
 
 
-def _compress_one_file(src_path, out_zst):
+def _compress_one_file(src_path, out_zst, zstd_threads=1):
     """Tek bir dosyayi ZSTD ile sikistirir (64MB okuma parcasi, Bolum 42.2),
-    (sure, cikti_boyutu) dondurur."""
+    (sure, cikti_boyutu) dondurur.
+
+    Bolum 46.5: `zstd_threads` ZSTD'nin KENDI dahili coklu-thread
+    destegini kullanir (process-bazli paralellikten FARKLI bir mekanizma
+    -- TEK dosyayi birden fazla cekirdekle sikistirir). Tek basina
+    (rekabetsiz) test edildiginde threads=8 ~2,5x kazanc verdi, ama
+    N=6 process havuzuyla BIRLIKTE (her worker de threads>1 kullanirsa)
+    karisik cok-dosyali is yukunde kazanci YOK EDIYOR (cekirdek
+    asiri-abonelik) -- o yuzden SADECE havuzda kuyruklama olmayacagi
+    GARANTI oldugunda (bkz. cagiran taraftaki hesaplama) kullanilmali."""
     t0 = time.time()
-    cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL)
+    cctx = zstd.ZstdCompressor(level=ZSTD_LEVEL, threads=zstd_threads)
     with open(src_path, "rb") as fin, open(out_zst, "wb") as fout:
         compressor = cctx.stream_writer(fout)
         while True:
@@ -239,7 +250,7 @@ def _split_file_by_rows(src_tab, tag, rows_per_part, total_rows):
     return parts
 
 
-def compress_and_upload(n_cols_k, n_rows):
+def compress_and_upload(n_cols_k, n_rows, zstd_threads=1):
     """FAZ 1 -- ProcessPoolExecutor worker'i icinde calisir. DB baglantisi
     kullanmaz (process havuzunda paylasilan soket guvenli degil), sadece
     dosya IO + MinIO.
@@ -249,7 +260,12 @@ def compress_and_upload(n_cols_k, n_rows):
     fiziksel parcalara bolunur -- her parca ayri sikistirilip AYRI MinIO
     objesi olarak yuklenir. Donen `parts` listesi 1 (normal, bolunmemis)
     ya da N eleman (bolunmus) icerebilir; load_and_record() bu iki durumu
-    da isliyor."""
+    da isliyor.
+
+    `zstd_threads` (Bolum 46.5): ZSTD'nin dahili coklu-thread destegi --
+    SADECE havuzda kuyruklama olmayacagi (bekleyen dosya sayisi <=
+    worker sayisi) garanti oldugunda >1 verilmeli, cagiran taraf bunu
+    hesaplar (bkz. asagida coklu-dosya modu)."""
     tag = f"{n_cols_k}k_{n_rows}"
     src_tab = f"{GRID_DIR}/synthetic_{tag}.tab"
     manifest_path = f"{GRID_DIR}/synthetic_{tag}_columns.json"
@@ -269,7 +285,7 @@ def compress_and_upload(n_cols_k, n_rows):
     if n_parts == 1:
         out_zst = f"{GRID_DIR}/synthetic_{tag}.tab.zst"
         object_key = f"grid/synthetic_{tag}.tab.zst"
-        compress_time, zst_size = _compress_one_file(src_tab, out_zst)
+        compress_time, zst_size = _compress_one_file(src_tab, out_zst, zstd_threads)
         upload_time = _upload_one_file(out_zst, object_key)
         os.remove(out_zst)
         parts.append({
@@ -279,12 +295,15 @@ def compress_and_upload(n_cols_k, n_rows):
         })
     else:
         rows_per_part = math.ceil(row_count_tab / n_parts)
+        print(f"  [FAZ1 {tag}] {total_cells/1e9:.2f} milyar hucre > "
+              f"{CH_LOAD_SAFE_CELL_LIMIT/1e9:.1f} milyar sinir -- {n_parts} parcaya "
+              f"bolunuyor (Bolum 46)", flush=True)
         for i, (part_path, part_rows) in enumerate(
             _split_file_by_rows(src_tab, tag, rows_per_part, row_count_tab), start=1
         ):
             out_zst = part_path + ".zst"
             object_key = f"grid/synthetic_{tag}_p{i}.tab.zst"
-            compress_time, zst_size = _compress_one_file(part_path, out_zst)
+            compress_time, zst_size = _compress_one_file(part_path, out_zst, zstd_threads)
             upload_time = _upload_one_file(out_zst, object_key)
             os.remove(out_zst)
             os.remove(part_path)
@@ -293,6 +312,8 @@ def compress_and_upload(n_cols_k, n_rows):
                 "compress_time": compress_time, "upload_time": upload_time,
                 "row_count": part_rows,
             })
+            print(f"  [FAZ1 {tag}] parca {i}/{n_parts} tamam: {part_rows} satir, "
+                  f"sikistir={compress_time:.1f}sn yukle_minio={upload_time:.2f}sn", flush=True)
 
     return {
         "tag": tag,
@@ -375,6 +396,9 @@ def load_and_record(ch, pg_conn, cr):
         # ClickHouse tablosunu SIL -- her parcadan sonra hemen, birden fazla
         # buyuk tablonun AYNI ANDA var olmasi bellek basincini artiriyor (Bolum 41.1)
         ch.execute(f"DROP TABLE IF EXISTS {table_name}", settings=SETTINGS)
+        if multi:
+            print(f"  [FAZ2 {tag}] parca {i}/{len(parts)} yuklendi: {part_row_count} satir, "
+                  f"yukle_ch={time.time()-t0:.1f}sn", flush=True)
 
     object_key_combined = " + ".join(p["object_key"] for p in parts)
     table_name_combined = " + ".join(table_names)
@@ -520,7 +544,10 @@ if len(sys.argv) == 3:
     ch = make_ch_client()
     attempt_no = mark_processing(pg, tab_file_name, aircraft_label(n_cols_k))
     try:
-        cr = compress_and_upload(n_cols_k, n_rows)
+        # Bolum 46.5: tek-dosya modunda BASKA hicbir dosya rekabet etmiyor --
+        # ZSTD'nin dahili coklu-thread'i (tek dosyada ~2,5x kazanc) guvenle
+        # kullanilabilir.
+        cr = compress_and_upload(n_cols_k, n_rows, zstd_threads=ZSTD_MAX_INTERNAL_THREADS)
         cr["attempt_no"] = attempt_no
         load_and_record(ch, pg, cr)
     except Exception as e:
@@ -553,8 +580,20 @@ print(f"Toplam {len(COLUMN_TIERS)*len(ROW_COUNTS)} dosya, {len(pending)} tanesi 
       f"(Faz 1: N={COMPRESS_WORKERS} paralel sikistirma).", flush=True)
 grand_t0 = time.time()
 
+# Bolum 46.5: bekleyen dosya sayisi worker sayisindan AZ/ESITSE, havuzda
+# HICBIR kuyruklama olmayacagi GARANTI -- her worker kendi dosyasini alir,
+# digerlerini beklemez, boylece bos kalacak fazladan cekirdekleri ZSTD'nin
+# dahili thread'ine ayirmak guvenli. Bekleyen > worker sayisiysa (normal/
+# dolu havuz durumu) Bolum 46.5'in ana bulgusu geciyor: N=6/thread=1 karisik
+# is yukunde daha iyi, thread=1 kaliyor.
+if len(pending) <= COMPRESS_WORKERS and len(pending) > 0:
+    zstd_threads_per_worker = max(1, min(ZSTD_MAX_INTERNAL_THREADS, CPU_CORES // len(pending)))
+else:
+    zstd_threads_per_worker = 1
+
 print(flush=True)
-print(f"=== FAZ 1: sikistirma + MinIO yukleme (N={COMPRESS_WORKERS} paralel) ===", flush=True)
+print(f"=== FAZ 1: sikistirma + MinIO yukleme (N={COMPRESS_WORKERS} paralel, "
+      f"dosya basina zstd_threads={zstd_threads_per_worker}) ===", flush=True)
 compress_results = {}
 attempt_nos = {}  # tag -> bu calistirmadaki attempt_no (conversion_manifest_history icin, Bolum 44)
 with ProcessPoolExecutor(max_workers=COMPRESS_WORKERS) as pool:
@@ -562,7 +601,7 @@ with ProcessPoolExecutor(max_workers=COMPRESS_WORKERS) as pool:
     for n_cols_k, n_rows in pending:
         tag = f"{n_cols_k}k_{n_rows}"
         attempt_nos[tag] = mark_processing(pg, f"synthetic_{tag}.tab", aircraft_label(n_cols_k))
-        futures[pool.submit(compress_and_upload, n_cols_k, n_rows)] = tag
+        futures[pool.submit(compress_and_upload, n_cols_k, n_rows, zstd_threads_per_worker)] = tag
     for future in as_completed(futures):
         tag = futures[future]
         try:

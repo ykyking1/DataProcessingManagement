@@ -1,0 +1,66 @@
+N=2 process x K=8 thread (toplam ~16 cekirdek talebi)
+SONUC N=2 K=8: toplam_sure=685.2sn throughput=32.9MB/sn
+  synthetic_40k_50000.tab: 343.6sn
+  synthetic_50k_50000.tab: 288.3sn
+  synthetic_30k_50000.tab: 255.2sn
+  synthetic_20k_50000.tab: 181.2sn
+  synthetic_10k_50000.tab: 87.6sn
+  synthetic_50k_5000.tab: 44.1sn
+  synthetic_40k_5000.tab: 35.6sn
+  synthetic_30k_5000.tab: 24.2sn
+  synthetic_20k_5000.tab: 17.8sn
+  synthetic_10k_5000.tab: 10.5sn
+---
+N=3 process x K=6 thread (toplam ~18 cekirdek talebi)
+SONUC N=3 K=6: toplam_sure=684.0sn throughput=32.9MB/sn
+  synthetic_40k_50000.tab: 441.1sn
+  synthetic_30k_50000.tab: 414.5sn
+  synthetic_50k_50000.tab: 341.0sn
+  synthetic_20k_50000.tab: 279.0sn
+  synthetic_10k_50000.tab: 140.5sn
+  synthetic_50k_5000.tab: 61.5sn
+  synthetic_40k_5000.tab: 47.6sn
+  synthetic_30k_5000.tab: 37.5sn
+  synthetic_20k_5000.tab: 24.5sn
+  synthetic_10k_5000.tab: 15.7sn
+---
+N=6 process x K=3 thread (toplam ~18 cekirdek talebi)
+SONUC N=6 K=3: toplam_sure=609.6sn throughput=37.0MB/sn
+  synthetic_50k_50000.tab: 506.1sn
+  synthetic_40k_50000.tab: 490.5sn
+  synthetic_30k_50000.tab: 455.5sn
+  synthetic_20k_50000.tab: 351.8sn
+  synthetic_10k_50000.tab: 247.2sn
+  synthetic_50k_5000.tab: 123.4sn
+  synthetic_40k_5000.tab: 103.2sn
+  synthetic_30k_5000.tab: 83.1sn
+  synthetic_20k_5000.tab: 56.2sn
+  synthetic_10k_5000.tab: 29.3sn
+---
+N=4 process x K=5 thread (toplam ~20 cekirdek talebi)
+SONUC N=4 K=5: toplam_sure=716.1sn throughput=31.5MB/sn
+  synthetic_40k_50000.tab: 547.0sn
+  synthetic_30k_50000.tab: 510.2sn
+  synthetic_50k_50000.tab: 465.9sn
+  synthetic_20k_50000.tab: 395.6sn
+  synthetic_10k_50000.tab: 206.2sn
+  synthetic_50k_5000.tab: 97.3sn
+  synthetic_40k_5000.tab: 73.3sn
+  synthetic_30k_5000.tab: 57.9sn
+  synthetic_20k_5000.tab: 43.5sn
+  synthetic_10k_5000.tab: 24.1sn
+---
+N=6 process x K=1 thread (toplam ~6 cekirdek talebi)
+SONUC N=6 K=1: toplam_sure=592.9sn throughput=38.0MB/sn
+  synthetic_50k_50000.tab: 521.6sn
+  synthetic_40k_50000.tab: 458.4sn
+  synthetic_30k_50000.tab: 395.9sn
+  synthetic_20k_50000.tab: 296.2sn
+  synthetic_10k_50000.tab: 176.0sn
+  synthetic_50k_5000.tab: 94.2sn
+  synthetic_40k_5000.tab: 71.2sn
+  synthetic_30k_5000.tab: 53.7sn
+  synthetic_20k_5000.tab: 36.5sn
+  synthetic_10k_5000.tab: 18.2sn
+---
+COMBINED_SWEEP_TAMAMLANDI
