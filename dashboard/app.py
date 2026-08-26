@@ -59,12 +59,13 @@ Dashboard bölümleri:
        - Kolon seçimi
        - Satır sayısı
        - Veri önizleme
-       - CSV dışa aktarma
+       - CSV / Parquet / TAB / MAT dışa aktarma
 """
 
 import io
 import json
 import os
+import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -75,10 +76,12 @@ import folium
 import pandas as pd
 import psycopg2
 import requests
+import scipy.io
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from folium.plugins import Draw
+from jinja2 import Template
 from streamlit_autorefresh import st_autorefresh
 from streamlit_folium import st_folium
 
@@ -684,6 +687,82 @@ def _polygon_has_area(polygon) -> bool:
     return abs(signed_area_x2) > 1e-12
 
 
+class _SeedIntoDrawLayer(folium.MacroElement):
+    """
+    Paylaşılan bağlantıdan gelen alan(lar)ı, Leaflet.draw'ın KENDİ
+    düzenlenebilir katmanına (`drawnItems`) enjekte eder -- böylece
+    kullanıcı bu alan(lar)ı haritanın kendi çöp kutusu/düzenleme
+    aracıyla, tıpkı kendi çizdiği bir şekil gibi seçip silebilir.
+
+    Önceden bu alan(lar) düz bir `folium.Polygon` katmanı olarak
+    haritaya EKLENİYORDU ama `Draw` eklentisinin yönettiği katmanın
+    DIŞINDA kalıyordu -- bu yüzden haritanın silme aracı onları hiç
+    "görmüyordu" (tıklama "Click on a feature to remove" durumunda
+    hiçbir şeye denk gelmiyordu). streamlit-folium, `Draw`'ın oluşturduğu
+    `drawnItems_...` değişkenini regex ile global `drawnItems`'a
+    yeniden adlandırır (bkz. streamlit_folium._get_map_string); bu
+    script o global değişkene enjekte eder, Draw'ın kendi script'inden
+    SONRA çalışacak şekilde (render sırası `Draw(...).add_to(map)`
+    çağrısından SONRA bu sınıfın eklenmesine bağlıdır).
+    """
+
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        (function() {
+            var seedFeatures = {{ this.geojson_features }};
+            var seedStyle = {
+                color: "#eda100",
+                weight: 2,
+                dashArray: "6,4",
+                fillOpacity: 0.15
+            };
+            var attemptsLeft = 40;
+            function trySeed() {
+                if (typeof drawnItems !== "undefined" && drawnItems.addLayer) {
+                    seedFeatures.forEach(function(feature) {
+                        L.geoJSON(
+                            feature,
+                            {style: function() { return seedStyle; }}
+                        ).eachLayer(function(layer) {
+                            drawnItems.addLayer(layer);
+                        });
+                    });
+                } else if (attemptsLeft > 0) {
+                    attemptsLeft -= 1;
+                    setTimeout(trySeed, 50);
+                }
+            }
+            trySeed();
+        })();
+        {% endmacro %}
+        """
+    )
+
+    def __init__(self, polygons):
+
+        super().__init__()
+
+        self._name = "SeedIntoDrawLayer"
+
+        features = [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[lon, lat] for lon, lat in polygon]
+                        + [[polygon[0][0], polygon[0][1]]]
+                    ],
+                },
+            }
+            for polygon in polygons
+        ]
+
+        self.geojson_features = json.dumps(features)
+
+
 def build_clickhouse_where(
     start_time=None,
     end_time=None,
@@ -735,8 +814,13 @@ def build_clickhouse_where(
     Array(Tuple(...))'a dönüştürülür.
     area_mode: "include" (varsayılan) çizilen alan(lar)IN İÇİNDEKİ
     satırları tutar; "exclude" bunun tersini yapar -- çizilen alan(lar)IN
-    HİÇBİRİNİN içinde olmayan satırları tutar (örn. "Erzurum dışındaki
-    uçuşlar" için Erzurum'u çevreleyen bir alan çizip "exclude" seçilir).
+    HİÇBİRİNE hiç GİRMEMİŞ uçuşların TÜM satırlarını tutar (örn. "Erzurum
+    dışındaki uçuşlar" için Erzurum'u çevreleyen bir alan çizip "exclude"
+    seçilir). Bu, satır bazında bir NOT ile değil, flight_id bazında bir
+    alt sorguyla yapılır -- aksi halde bölgeye giren bir uçuşun poligon
+    dışındaki satırları sonuçta kalır ve o uçuş yanlışlıkla "bölgeye hiç
+    girmemiş" gibi görünür (flight_id kolonu yoksa eski satır bazlı NOT'a
+    geri düşülür).
 
     Her filtre AND ile birleştirilir (örn. "altitude < 23 AND box_w >= 50").
     Kolon adı ve operatör beyaz listeye (whitelist) karşı doğrulanır,
@@ -913,14 +997,30 @@ def build_clickhouse_where(
             # Birden fazla poligon OR ile birleştirilir (bölge A veya
             # bölge B içinde kalan satırlar eşleşir); tüm poligon
             # koşulları da tek bir AND'lenebilir grup olması için
-            # parantez içine alınır. area_mode="exclude" ise bu grubun
-            # tamamı NOT ile tersine çevrilir -- yani "hiçbir alanın
-            # içinde olmayan" satırlar tutulur (örn. "Erzurum dışındaki
-            # uçuşlar").
+            # parantez içine alınır.
             area_group = "(" + " OR ".join(area_conditions) + ")"
 
             if area_mode == "exclude":
-                area_group = "NOT " + area_group
+
+                if "flight_id" in available_columns:
+
+                    # Satır bazında "NOT (...)" burada YANLIŞ olur: bir
+                    # uçuş poligona girmiş olsa bile, o uçuşun poligon
+                    # DIŞINDAKİ satırları hâlâ NOT koşulunu sağlar ve
+                    # sonuçta kalır -- yani bölgeye giren bir uçuş
+                    # yanlışlıkla "bölgeye hiç girmemiş" gibi görünür.
+                    # Bunun yerine, poligon(lar)a hiç girmemiş
+                    # flight_id'ler flight_id bazında bulunup TÜM
+                    # satırları o uçuşlar üzerinden tutulur.
+                    area_group = (
+                        "flight_id NOT IN (SELECT DISTINCT flight_id "
+                        f"FROM {get_clickhouse_source()} WHERE "
+                        f"{area_group})"
+                    )
+
+                else:
+
+                    area_group = "NOT " + area_group
 
             conditions.append(area_group)
 
@@ -2531,23 +2631,148 @@ def render_alerts(
                             run_url,
                         )
 
-                    if alert_status == "RESOLVED":
+                    # -----------------------------------------------
+                    # Otomatik düzeltme durumu
+                    # -----------------------------------------------
+                    #
+                    # Yeniden çalıştırma denemeleri artık burada
+                    # (kullanıcı bir butona basınca) DEĞİL, hata
+                    # oluştuğu anda Dagster'ın kendisinde --
+                    # dagster/alerting.py::alert_on_failure hook'u
+                    # içinde -- otomatik olarak yapılıyor (en fazla 3
+                    # deneme, "re-execute from failure"). Burada
+                    # sadece o otomatik sürecin alerts.json'a yazdığı
+                    # sonuç okunup gösteriliyor; kullanıcının hiçbir
+                    # işlem yapmasına gerek yok.
 
-                        resolved_at = row.get(
-                            "resolved_at"
-                        )
+                    auto_fix_resolved_attempt = row.get(
+                        "auto_fix_resolved_attempt"
+                    )
+                    auto_fix_exhausted = row.get(
+                        "auto_fix_exhausted"
+                    )
 
-                        with status_col:
+                    with status_col:
 
-                            st.success(
-                                "✅ Bu hata çözüldü, tekrar çalıştırmaya "
-                                "gerek yok"
-                                + (
-                                    f" (`{resolved_at}`)"
-                                    if resolved_at and not pd.isna(resolved_at)
-                                    else ""
-                                )
+                        if alert_status == "RESOLVED":
+
+                            resolved_at = row.get(
+                                "resolved_at"
                             )
+
+                            resolved_at_suffix = (
+                                f" (`{resolved_at}`)"
+                                if resolved_at and not pd.isna(resolved_at)
+                                else ""
+                            )
+
+                            if (
+                                auto_fix_resolved_attempt is not None
+                                and not pd.isna(auto_fix_resolved_attempt)
+                            ):
+
+                                # Sistem, hatayı KENDİ otomatik
+                                # denemeleriyle çözdü (bkz. dagster/
+                                # alerting.py::_auto_fix_failure).
+
+                                st.success(
+                                    "✅ Çözüldü: **otomatik denemeler "
+                                    "ile çözüldü** — sistem "
+                                    f"{int(auto_fix_resolved_attempt)}. "
+                                    "denemede sorunu kendisi giderdi, "
+                                    "herhangi bir işlem yapmanıza "
+                                    "gerek yok."
+                                    + resolved_at_suffix
+                                )
+
+                            elif (
+                                auto_fix_exhausted is not None
+                                and not pd.isna(auto_fix_exhausted)
+                                and bool(auto_fix_exhausted)
+                            ):
+
+                                # Sistemin 3 otomatik denemesi de
+                                # başarısız olmuştu, ama alert artık
+                                # RESOLVED -- yani sorun otomatik
+                                # denemelerle DEĞİL, daha sonra başka
+                                # bir şekilde (ör. Dagster'da elle
+                                # "Re-execute from failure") çözülmüş.
+
+                                st.success(
+                                    "✅ Çözüldü: **elle (manuel) "
+                                    "çözüldü** — sistemin 3 otomatik "
+                                    "denemesi başarısız olmuştu, sorun "
+                                    "daha sonra Dagster üzerinden elle "
+                                    "yeniden çalıştırılarak giderildi."
+                                    + resolved_at_suffix
+                                )
+
+                            else:
+
+                                # Ne otomatik düzeltme kaydı ne de
+                                # tükenme kaydı var -- otomatik
+                                # düzeltme devreye girmeden (ör. çok
+                                # kısa sürede) elle çözülmüş olmalı.
+
+                                st.success(
+                                    "✅ Çözüldü: **elle (manuel) "
+                                    "çözüldü** — otomatik düzeltme "
+                                    "sistemi devreye girmeden, tekrar "
+                                    "çalıştırmaya gerek yok."
+                                    + resolved_at_suffix
+                                )
+
+                        elif (
+                            auto_fix_exhausted is not None
+                            and not pd.isna(auto_fix_exhausted)
+                            and bool(auto_fix_exhausted)
+                        ):
+
+                            attempts = row.get(
+                                "auto_fix_attempts",
+                                3,
+                            )
+
+                            attempts = (
+                                int(attempts)
+                                if attempts and not pd.isna(attempts)
+                                else 3
+                            )
+
+                            st.error(
+                                f"❌ Sistem hatayı otomatik olarak "
+                                f"{attempts} kere art arda yeniden "
+                                "çalıştırmayı denedi, hepsi başarısız "
+                                "oldu. Yukarıdaki linkten Dagster'ı "
+                                "açıp elle inceleyebilirsiniz."
+                            )
+
+                        else:
+
+                            current_attempt = row.get(
+                                "auto_fix_current_attempt"
+                            )
+
+                            if (
+                                current_attempt is not None
+                                and not pd.isna(current_attempt)
+                            ):
+
+                                st.info(
+                                    "🤖 Sistem bu hatayı otomatik "
+                                    f"olarak düzeltmeye çalışıyor — "
+                                    f"deneme {int(current_attempt)}/3. "
+                                    "Sonuç burada görünecek."
+                                )
+
+                            else:
+
+                                st.info(
+                                    "🤖 Sistem bu hatayı otomatik "
+                                    "olarak düzeltmeye çalışıyor (en "
+                                    "fazla 3 deneme). Sonuç burada "
+                                    "görünecek."
+                                )
 
     elif not alerts_df.empty:
 
@@ -2650,28 +2875,116 @@ DOWNLOAD_FORMAT_LABELS = {
     "merge": "🧩 Seçili Uçuşları Birleştir",
 }
 
-# Dosya TİPİ (CSV / Parquet) -- yukarıdaki DOWNLOAD_FORMAT_LABELS'tan
-# bağımsız bir eksen: format YAPIYI (tek dosya mı, uçuş başına ayrı
-# dosya mı) belirlerken, bu seçim üretilen her dosyanın biçimini
-# belirler. Parquet; sütun bazlı, sıkıştırılmış ve pandas/pyarrow ile
-# CSV'den daha hızlı okunan bir format -- büyük veri setlerini başka
-# bir analiz aracına (örn. pandas, Spark) aktarmak için tercih edilir.
+# Dosya TİPİ (CSV / Parquet / TAB / MAT) -- yukarıdaki
+# DOWNLOAD_FORMAT_LABELS'tan bağımsız bir eksen: format YAPIYI (tek
+# dosya mı, uçuş başına ayrı dosya mı) belirlerken, bu seçim üretilen
+# her dosyanın biçimini belirler. Parquet; sütun bazlı, sıkıştırılmış
+# ve pandas/pyarrow ile CSV'den daha hızlı okunan bir format -- büyük
+# veri setlerini başka bir analiz aracına (örn. pandas, Spark)
+# aktarmak için tercih edilir. TAB, CSV ile aynı ama virgül yerine
+# TAB karakteriyle ayrılmış düz metin (bazı analiz araçları/eski
+# yazılımlar bunu bekler). MAT, scipy.io.savemat ile üretilen ve
+# MATLAB/Octave'da doğrudan `load()` ile açılabilen ikili bir format
+# (bkz. _dataframe_to_mat_bytes).
 DOWNLOAD_FILE_TYPE_LABELS = {
     "csv": "📄 CSV",
     "parquet": "🗄️ Parquet (.parquet)",
+    "tab": "📋 Tab Ayraçlı (.tab)",
+    "mat": "🔬 MATLAB (.mat)",
+}
+
+DOWNLOAD_FILE_EXTENSIONS = {
+    "parquet": "parquet",
+    "tab": "tab",
+    "mat": "mat",
+}
+
+DOWNLOAD_MIME_TYPES = {
+    "parquet": "application/octet-stream",
+    "tab": "text/tab-separated-values",
+    "mat": "application/octet-stream",
 }
 
 
 def _download_file_extension(file_type: str) -> str:
-    return "parquet" if file_type == "parquet" else "csv"
+    return DOWNLOAD_FILE_EXTENSIONS.get(file_type, "csv")
 
 
 def _download_mime_type(file_type: str) -> str:
-    return (
-        "application/octet-stream"
-        if file_type == "parquet"
-        else "text/csv"
+    return DOWNLOAD_MIME_TYPES.get(file_type, "text/csv")
+
+
+def _sanitize_mat_field_name(name: str, taken: set) -> str:
+    """
+    MATLAB değişken/struct alan adları yalnızca harf, rakam ve alt
+    tireden oluşabilir ve bir harfle başlamalıdır. Kolon adları
+    (özellikle "Kolon Seçimi" ile serbestçe seçilebildiği için) bu
+    kurala uymayabilir -- scipy.io.savemat bunu kendiliğinden
+    doğrulamaz ve geçersiz bir anahtarla üretilen .mat dosyası
+    MATLAB/Octave'da açılamayabilir. Bu fonksiyon adı güvenli hale
+    getirir ve çakışmaları ("box_x!" ile "box_x?" gibi ikisi de
+    "box_x"a sadeleşen adları) sırayla numaralandırarak (_2, _3, ...)
+    çözer.
+    """
+
+    safe = "".join(
+        ch if ch.isalnum() or ch == "_" else "_"
+        for ch in str(name)
     )
+
+    if not safe or not (safe[0].isalpha() or safe[0] == "_"):
+        safe = f"col_{safe}"
+
+    candidate = safe
+    suffix = 2
+
+    while candidate in taken:
+        candidate = f"{safe}_{suffix}"
+        suffix += 1
+
+    taken.add(candidate)
+
+    return candidate
+
+
+def _dataframe_to_mat_bytes(dataframe: pd.DataFrame) -> bytes:
+    """
+    dataframe'i MATLAB/Octave'un scipy.io.loadmat ile okuyabileceği bir
+    .mat dosyasına çevirir. Her kolon, .mat içinde aynı isimde ayrı bir
+    değişken/struct alanı olur. MATLAB tarih/saat ya da pandas'a özgü
+    tipleri tanımadığı için datetime kolonları ISO 8601 metne, diğer
+    metin/object kolonları da düz string dizisine çevrilir; sayısal
+    kolonlar olduğu gibi (numpy array) aktarılır.
+    """
+
+    mat_dict = {}
+    taken_names = set()
+
+    for column in dataframe.columns:
+
+        series = dataframe[column]
+        field_name = _sanitize_mat_field_name(column, taken_names)
+
+        if pd.api.types.is_datetime64_any_dtype(series):
+            values = series.astype(str).to_numpy()
+        elif pd.api.types.is_object_dtype(series) or isinstance(
+            series.dtype, pd.StringDtype
+        ):
+            values = series.astype(str).to_numpy()
+        else:
+            values = series.to_numpy()
+
+        mat_dict[field_name] = values
+
+    buffer = io.BytesIO()
+
+    scipy.io.savemat(
+        buffer,
+        mat_dict,
+        do_compression=True,
+    )
+
+    return buffer.getvalue()
 
 
 def _dataframe_to_download_bytes(
@@ -2679,14 +2992,23 @@ def _dataframe_to_download_bytes(
     file_type: str,
 ) -> bytes:
     """
-    dataframe'i seçilen dosya tipine göre byte'a çevirir. CSV için
+    dataframe'i seçilen dosya tipine göre byte'a çevirir. CSV/TAB için
     Excel'in Türkçe karakterleri doğru okuyabilmesi adına "utf-8-sig"
-    (BOM'lu UTF-8) kullanılır; parquet zaten ikili/kendi kendini
-    tanımlayan bir format olduğu için kodlama sorunu yaşanmaz.
+    (BOM'lu UTF-8) kullanılır; parquet ve mat zaten ikili/kendi
+    kendini tanımlayan formatlar olduğu için kodlama sorunu yaşanmaz.
     """
 
     if file_type == "parquet":
         return dataframe.to_parquet(index=False)
+
+    if file_type == "mat":
+        return _dataframe_to_mat_bytes(dataframe)
+
+    if file_type == "tab":
+        return dataframe.to_csv(
+            index=False,
+            sep="\t",
+        ).encode("utf-8-sig")
 
     return dataframe.to_csv(index=False).encode("utf-8-sig")
 
@@ -3903,6 +4225,15 @@ def render_data_export():
             # sağlamayan uçuşların TÜM satırları elenir. Örn. "4 saatten
             # kısa uçuşları filtrele" -> operatör "<", saat 4.
 
+            def _hours_to_h_m(hours_value: float) -> tuple:
+
+                total_minutes = round(float(hours_value) * 60)
+
+                return (
+                    total_minutes // 60,
+                    total_minutes % 60,
+                )
+
             if (
                 "export_duration_enabled" not in st.session_state
                 and "duration_filter" in pending_url_state
@@ -3911,22 +4242,28 @@ def render_data_export():
                 st.session_state["export_duration_operator"] = (
                     pending_url_state["duration_filter"]["operator"]
                 )
-                st.session_state["export_duration_hours"] = float(
+
+                _h, _m = _hours_to_h_m(
                     pending_url_state["duration_filter"]["hours"]
                 )
-                st.session_state["export_duration_hours2"] = float(
+                st.session_state["export_duration_hours_h"] = _h
+                st.session_state["export_duration_hours_m"] = _m
+
+                _h2, _m2 = _hours_to_h_m(
                     pending_url_state["duration_filter"].get(
                         "hours2", 0.0
                     )
                 )
+                st.session_state["export_duration_hours2_h"] = _h2
+                st.session_state["export_duration_hours2_m"] = _m2
 
             duration_enabled = st.checkbox(
                 "⏱️ Uçuş süresine göre filtrele",
                 help=(
-                    "Örn. 4 saatten kısa süren uçuşları filtrelemek için "
-                    "operatörü \"<\", saati 4 seçin. Süre, her uçuşun ilk "
-                    "ve son telemetri zaman damgası arasındaki farktan "
-                    "hesaplanır."
+                    "Örn. 4 saat 30 dakikadan kısa süren uçuşları "
+                    "filtrelemek için operatörü \"<\", saati 4, dakikayı "
+                    "30 seçin. Süre, her uçuşun ilk ve son telemetri "
+                    "zaman damgası arasındaki farktan hesaplanır."
                 ),
                 key="export_duration_enabled",
             )
@@ -3935,7 +4272,7 @@ def render_data_export():
 
             if duration_enabled:
 
-                dcol1, dcol2, dcol3 = st.columns([2, 2, 2])
+                dcol1, dcol2, dcol3 = st.columns([2, 3, 3])
 
                 duration_operator_options = list(
                     VALUE_FILTER_OPERATORS.keys()
@@ -3960,17 +4297,42 @@ def render_data_export():
 
                 with dcol2:
 
-                    duration_hours = st.number_input(
-                        "Min Saat" if is_duration_range else "Saat",
-                        min_value=0.0,
-                        value=float(
-                            st.session_state.get(
-                                "export_duration_hours", 4.0
-                            )
-                        ),
-                        step=0.5,
-                        key="export_duration_hours",
+                    st.caption(
+                        "Min Süre" if is_duration_range else "Süre"
                     )
+
+                    dh1, dm1 = st.columns(2)
+
+                    with dh1:
+
+                        duration_hours_h = st.number_input(
+                            "Saat",
+                            min_value=0,
+                            value=int(
+                                st.session_state.get(
+                                    "export_duration_hours_h", 4
+                                )
+                            ),
+                            step=1,
+                            key="export_duration_hours_h",
+                        )
+
+                    with dm1:
+
+                        duration_hours_m = st.number_input(
+                            "Dakika",
+                            min_value=0,
+                            max_value=59,
+                            value=int(
+                                st.session_state.get(
+                                    "export_duration_hours_m", 0
+                                )
+                            ),
+                            step=1,
+                            key="export_duration_hours_m",
+                        )
+
+                duration_hours = duration_hours_h + duration_hours_m / 60.0
 
                 duration_hours2 = None
 
@@ -3978,16 +4340,41 @@ def render_data_export():
 
                     with dcol3:
 
-                        duration_hours2 = st.number_input(
-                            "Maks Saat",
-                            min_value=0.0,
-                            value=float(
-                                st.session_state.get(
-                                    "export_duration_hours2", 8.0
-                                )
-                            ),
-                            step=0.5,
-                            key="export_duration_hours2",
+                        st.caption("Maks Süre")
+
+                        dh2, dm2 = st.columns(2)
+
+                        with dh2:
+
+                            duration_hours2_h = st.number_input(
+                                "Saat",
+                                min_value=0,
+                                value=int(
+                                    st.session_state.get(
+                                        "export_duration_hours2_h", 8
+                                    )
+                                ),
+                                step=1,
+                                key="export_duration_hours2_h",
+                            )
+
+                        with dm2:
+
+                            duration_hours2_m = st.number_input(
+                                "Dakika",
+                                min_value=0,
+                                max_value=59,
+                                value=int(
+                                    st.session_state.get(
+                                        "export_duration_hours2_m", 0
+                                    )
+                                ),
+                                step=1,
+                                key="export_duration_hours2_m",
+                            )
+
+                        duration_hours2 = (
+                            duration_hours2_h + duration_hours2_m / 60.0
                         )
 
                 duration_filter = {
@@ -4267,22 +4654,6 @@ def render_data_export():
                 tiles="CartoDB dark_matter",
             )
 
-            if seed_active:
-
-                for polygon in url_seed_polygons:
-
-                    folium.Polygon(
-                        locations=[
-                            (lat, lon) for lon, lat in polygon
-                        ],
-                        color="#eda100",
-                        weight=2,
-                        dash_array="6,4",
-                        fill=True,
-                        fill_opacity=0.15,
-                        tooltip="Paylaşılan bağlantıdan yüklenen alan",
-                    ).add_to(area_map)
-
             Draw(
                 export=False,
                 draw_options={
@@ -4296,6 +4667,21 @@ def render_data_export():
                 edit_options={"edit": True},
             ).add_to(area_map)
 
+            if seed_active:
+
+                # Paylaşılan alan(lar), Draw eklentisinin KENDİ
+                # düzenlenebilir katmanına (_SeedIntoDrawLayer) enjekte
+                # edilir -- böylece kullanıcı bu alan(lar)ı haritanın
+                # kendi düzenleme/silme aracıyla, tıpkı kendi çizdiği bir
+                # şekil gibi seçip silebilir (eskiden ayrı, düzenlenemez
+                # bir katman olarak eklendiği için harita üzerindeki
+                # silme aracı bunları hiç "görmüyordu"). `Draw(...)
+                # .add_to(...)`dan SONRA eklenmesi ŞART -- enjeksiyon
+                # script'i, Draw'ın `drawnItems` katmanını henüz
+                # tanımlamadığı bir ana denk gelirse kısa bir süre
+                # (polling ile) bekler.
+                _SeedIntoDrawLayer(url_seed_polygons).add_to(area_map)
+
             map_output = st_folium(
                 area_map,
                 key=f"area_filter_map_{area_map_version}",
@@ -4304,14 +4690,12 @@ def render_data_export():
                 returned_objects=["all_drawings"],
             )
 
-            drawings = (
-                (map_output or {}).get("all_drawings") or []
-            )
+            raw_drawings = (map_output or {}).get("all_drawings")
 
             skipped_degenerate_shapes = 0
             drawn_polygons = []
 
-            for drawing in drawings:
+            for drawing in (raw_drawings or []):
 
                 geometry = drawing.get("geometry", {})
 
@@ -4329,12 +4713,24 @@ def render_data_export():
                     else:
                         skipped_degenerate_shapes += 1
 
-            # URL'den gelen alan(lar) (seed_active) ile haritada YENİ
-            # çizilen alan(lar) birbirini SİLMEZ, birlikte (OR ile)
-            # uygulanır -- bkz. yukarıdaki "ÖNEMLİ" notu.
-            area_polygons = (
-                list(url_seed_polygons) if seed_active else []
-            ) + drawn_polygons
+            # `returned_objects=["all_drawings"]` verildiği için
+            # streamlit-folium, yalnızca GERÇEK bir çizim olayı (şekil
+            # çizme/düzenleme/SİLME) tetiklendiğinde bileşen değerini
+            # günceller (bkz. streamlit-folium frontend kaynağı) --
+            # tarayıcıda henüz böyle bir olay olmadıysa `raw_drawings`
+            # None kalır. Bu durumda haritanın `drawnItems` katmanına
+            # enjekte edilen paylaşılan alan(lar) GÖRSEL OLARAK oradadır
+            # ama tarayıcı henüz bunu Python'a BİLDİRMEMİŞTİR -- bu
+            # yüzden filtre için doğrudan URL'deki değer kullanılır.
+            # `raw_drawings` bir kez GERÇEK bir liste hâline geldiğinde
+            # (boş liste dahil, örn. paylaşılan alan haritadan
+            # silindiğinde) artık TEK doğru kaynak odur -- haritanın
+            # `drawnItems` katmanının O ANKİ gerçek içeriğini (silinen
+            # paylaşılan alan(lar) dahil) yansıtır.
+            if raw_drawings is None:
+                area_polygons = list(url_seed_polygons) if seed_active else []
+            else:
+                area_polygons = drawn_polygons
 
             # Fare sürüklenmeden (tek tıkla) çizilen sıfır boyutlu bir
             # dikdörtgen gibi durumlarda ring geçerli bir alan oluşturmaz
@@ -4355,34 +4751,26 @@ def render_data_export():
                 else "dışındaki satırlar"
             )
 
-            if drawn_polygons and seed_active:
-
-                st.success(
-                    f"✅ Bağlantıdaki {len(url_seed_polygons)} alana, "
-                    f"haritada eklediğiniz {len(drawn_polygons)} alan "
-                    f"daha eklendi (toplam {len(area_polygons)}) — "
-                    f"{area_summary_suffix} aşağıdaki filtrelerle "
-                    "birlikte (bölgeler OR ile birleştirilerek) "
-                    "uygulanacak."
-                )
-
-            elif drawn_polygons:
-
-                st.success(
-                    f"✅ {len(drawn_polygons)} alan seçildi — "
-                    f"{area_summary_suffix} aşağıdaki filtrelerle "
-                    "birlikte (bölgeler OR ile birleştirilerek) "
-                    "uygulanacak."
-                )
-
-            elif seed_active:
+            if raw_drawings is None and seed_active:
 
                 st.info(
                     f"🔗 {len(url_seed_polygons)} alan paylaşılan "
                     "bağlantıdan yüklendi (haritada kesikli çizgiyle "
                     f"gösteriliyor) — {area_summary_suffix} aşağıdaki "
-                    "filtrelerle birlikte uygulanacak. Ek bir alan daha "
-                    "eklemek için haritada yeni bir şekil çizin."
+                    "filtrelerle birlikte uygulanacak. Kaldırmak için "
+                    "haritanın sol üstündeki düzenleme/silme (✏️/🗑️) "
+                    "aracını kullanabilir ya da yeni bir alan daha "
+                    "çizebilirsiniz."
+                )
+
+            elif area_polygons:
+
+                st.success(
+                    f"✅ {len(area_polygons)} alan aktif — "
+                    f"{area_summary_suffix} aşağıdaki filtrelerle "
+                    "birlikte (bölgeler OR ile birleştirilerek) "
+                    "uygulanacak. Kaldırmak için haritada seçip "
+                    "düzenleme/silme (✏️/🗑️) aracını kullanın."
                 )
 
             else:
@@ -4402,6 +4790,16 @@ def render_data_export():
                     st.session_state["area_map_version"] = (
                         area_map_version + 1
                     )
+
+                    # Sadece session_state'te reddetmek yetmez -- URL'de
+                    # export_ap/export_am hâlâ duruyorsa, sayfa yenilenince
+                    # (F5) ya da link tekrar açılınca (session_state
+                    # sıfırlandığı için) alan filtresi geri gelir. Bu
+                    # yüzden URL'den de kalıcı olarak silinir.
+                    for stale_key in ("export_ap", "export_am"):
+                        if stale_key in st.query_params:
+                            del st.query_params[stale_key]
+
                     st.rerun()
 
     with st.expander(
@@ -5031,18 +5429,41 @@ def render_data_export():
             dataframe["flight_id"].dropna().unique().tolist()
         )
 
-        if flights_in_area:
+        # area_mode="exclude" iken dataframe, seçilen alan(lar)a hiç
+        # girmemiş uçuşların satırlarını içerir (bkz. build_clickhouse_
+        # where) -- bu yüzden buradaki flight_id listesi "alanda uçmuş"
+        # değil, tam tersine "alana hiç girmemiş" uçuşları temsil eder.
+        if area_mode == "exclude":
 
-            st.success(
-                f"🗺️ Seçilen alanda uçmuş **{len(flights_in_area)}** "
-                f"uçuş bulundu: {', '.join(flights_in_area)}"
-            )
+            if flights_in_area:
+
+                st.success(
+                    f"🗺️ Seçilen alan(lar)a hiç girmemiş "
+                    f"**{len(flights_in_area)}** uçuş bulundu: "
+                    f"{', '.join(flights_in_area)}"
+                )
+
+            else:
+
+                st.warning(
+                    "Seçilen alan(lar)a girmemiş bir uçuş bulunamadı "
+                    "(tüm uçuşlar en az bir kez bu alan(lar)a girmiş)."
+                )
 
         else:
 
-            st.warning(
-                "Seçilen alanda uçmuş bir uçuş bulunamadı."
-            )
+            if flights_in_area:
+
+                st.success(
+                    f"🗺️ Seçilen alanda uçmuş **{len(flights_in_area)}** "
+                    f"uçuş bulundu: {', '.join(flights_in_area)}"
+                )
+
+            else:
+
+                st.warning(
+                    "Seçilen alanda uçmuş bir uçuş bulunamadı."
+                )
 
     with st.expander(
         "👁️ Önizleme (ilk 200 satır)",
@@ -5468,6 +5889,12 @@ def render_flight_map():
 
 def main():
 
+    # Bu render'ın ne kadar sürdüğü (sonunda ölçülüp
+    # "_last_render_duration_sec" olarak kaydedilir), otomatik
+    # yenileme aktifse bir SONRAKİ tetiklemenin bekleme süresinden
+    # düşülür -- bkz. aşağıdaki "AUTO REFRESH" bölümü.
+    render_started_at = time.time()
+
     st.title(
         "İHA Veri Platformu — Pipeline Metrikleri & Katalog"
     )
@@ -5619,6 +6046,19 @@ def main():
             f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
         )
 
+        _prev_render_duration = st.session_state.get(
+            "_last_render_duration_sec"
+        )
+
+        if _prev_render_duration is not None:
+
+            st.caption(
+                "Önceki render işlem süresi: "
+                f"{_prev_render_duration:.1f} sn "
+                "(gerçek otomatik yenileme aralığı, seçilen süreye "
+                "bu kadar eklenerek oluşur)"
+            )
+
     active_tab = st.session_state["active_main_tab"]
 
     # ========================================================
@@ -5656,20 +6096,48 @@ def main():
     #     boyutlandırılıyor ve iframe'in ölçülen yüksekliği 420px
     #     yerine ~1900px'e sıçrayıp haritanın altında dev bir boş
     #     alan bırakıyor, sayfanın geri kalanını aşağı itiyordu.
-    #     Bu yüzden duraklatma yalnızca export_in_progress ile değil,
-    #     kullanıcı "Veri Gözat / Dışa Aktar" sekmesindeyken de
-    #     (haritayla etkileşim satır sayısı hesaplanmadan önce
-    #     olduğu için) uygulanır.
+    #     Bu yüzden duraklatma "veri getirildikten sonra" değil,
+    #     kullanıcı "Veri Gözat / Dışa Aktar" sekmesindeyken (haritayla
+    #     etkileşim satır sayısı hesaplanmadan önce olduğu için)
+    #     BAŞLAR -- export_row_count/export_df yalnızca bu sekme
+    #     aktifken render_data_export() içinden set edildiği için,
+    #     tek başına active_tab == MAIN_TAB_EXPORT kontrolü hem satır
+    #     sayısı hesaplanmadan ÖNCEKİ hem SONRAKİ tüm senaryoları
+    #     kapsar.
+    #
+    #  4) ÖNEMLİ (regresyon, düzeltildi): export_row_count/export_df
+    #     kontrolünü export_in_progress'e AYRICA eklemek (active_tab
+    #     kontrolünden bağımsız olarak) ciddi bir hataya yol açtı --
+    #     bu iki session_state anahtarı yalnızca kullanıcı Export
+    #     sekmesindeyken FİLTRELER DEĞİŞTİĞİNDE temizlenir (yukarıda,
+    #     render_data_export() içinde); kullanıcı satır sayısını
+    #     hesaplayıp/veriyi getirip filtre değiştirmeden BAŞKA bir
+    #     sekmeye geçtiğinde bu anahtarlar session_state'te KALICI
+    #     olarak set halinde kalıyordu. Sonuç: export_in_progress
+    #     sonsuza dek True kalıyor, otomatik yenileme HANGİ SEKMEDE
+    #     olursa olsun, ne kadar beklenirse beklensin bir daha asla
+    #     tetiklenmiyordu. active_tab == MAIN_TAB_EXPORT tek başına
+    #     zaten yeterli olduğu için (bkz. not 3) bu iki anahtar
+    #     kaldırıldı.
 
-    export_in_progress = (
-        st.session_state.get("export_row_count") is not None
-        or st.session_state.get("export_df") is not None
-        or active_tab == MAIN_TAB_EXPORT
-    )
+    export_in_progress = active_tab == MAIN_TAB_EXPORT
 
     autorefresh_slot = st.empty()
 
     if refresh_seconds and not export_in_progress:
+
+        # ÖNEMLİ: interval, render'dan render'a DEĞİŞMEMELİDİR -- bkz.
+        # yukarıdaki not (1): interval'i render'ın ölçülen süresine
+        # göre dinamik ayarlayıp seçilen süreye "yakınsatmak" DENENDİ,
+        # ama tam olarak yukarıdaki notun uyardığı şekilde bozdu:
+        # otomatik yenileme tamamen durdu (asla tetiklenmedi). Bu
+        # yüzden interval burada SABİT kalır; seçilen süre yalnızca
+        # JS zamanlayıcısının TİK süresidir -- kullanıcının gördüğü
+        # gerçek döngü buna rerun'un işlem süresi (Dagster GraphQL +
+        # ClickHouse + Postgres çağrıları) eklenerek oluşur. Bu fark
+        # sol paneldeki "Önceki render işlem süresi" ile şeffaf şekilde
+        # gösterilir; kullanıcı buna göre daha büyük bir aralık
+        # seçebilir.
 
         with autorefresh_slot:
 
@@ -5801,6 +6269,13 @@ def main():
         if active_tab == MAIN_TAB_FLIGHT_MAP:
 
             render_flight_map()
+
+    # Otomatik yenilemenin bir sonraki bekleme süresini telafi
+    # edebilmesi için, bu render'ın toplam süresi ölçülüp kaydedilir
+    # (bkz. yukarıdaki "AUTO REFRESH" bölümü).
+    st.session_state["_last_render_duration_sec"] = (
+        time.time() - render_started_at
+    )
 
 
 # ============================================================
