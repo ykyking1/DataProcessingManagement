@@ -1,6 +1,8 @@
 import argparse
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -19,6 +21,14 @@ def parse_args() -> argparse.Namespace:
         required=True,
         type=Path,
         help="Path to the validated data file or directory.",
+    )
+    parser.add_argument(
+        "--release-path",
+        type=Path,
+        help=(
+            "Stable DVC target. When supplied, validated data is copied here "
+            "before dvc add; otherwise data-path itself is tracked."
+        ),
     )
     parser.add_argument(
         "--pipeline-version",
@@ -52,6 +62,72 @@ def resolve_data_path(data_path: Path) -> Path:
         raise FileNotFoundError(f"Validated data output not found: {resolved_path}")
 
     return resolved_path
+
+
+def resolve_release_path(release_path: Path) -> Path:
+    candidate = release_path if release_path.is_absolute() else PROJECT_ROOT / release_path
+    resolved_path = candidate.resolve()
+
+    try:
+        resolved_path.relative_to(PROJECT_ROOT)
+    except ValueError as error:
+        raise ValueError("Release path must be inside the project directory.") from error
+
+    if resolved_path == PROJECT_ROOT:
+        raise ValueError("Release path cannot be the project root.")
+    return resolved_path
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def stage_release_data(source_path: Path, release_path: Path) -> Path:
+    """Replace the stable release target only after a complete local copy."""
+
+    if source_path == release_path:
+        return release_path
+
+    if release_path.is_relative_to(source_path) or source_path.is_relative_to(
+        release_path
+    ):
+        raise ValueError("Data path and release path cannot contain each other.")
+
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    operation_id = uuid.uuid4().hex
+    staging_path = release_path.with_name(
+        f".{release_path.name}.staging-{operation_id}"
+    )
+    backup_path = release_path.with_name(
+        f".{release_path.name}.backup-{operation_id}"
+    )
+
+    previous_release_moved = False
+    release_installed = False
+    try:
+        if source_path.is_dir():
+            shutil.copytree(source_path, staging_path, copy_function=shutil.copy2)
+        else:
+            shutil.copy2(source_path, staging_path)
+
+        if release_path.exists():
+            release_path.replace(backup_path)
+            previous_release_moved = True
+        staging_path.replace(release_path)
+        release_installed = True
+    except BaseException:
+        if previous_release_moved and not release_path.exists():
+            backup_path.replace(release_path)
+        raise
+    finally:
+        _remove_path(staging_path)
+        if release_installed:
+            _remove_path(backup_path)
+
+    return release_path
 
 
 def track_with_dvc(data_path: Path) -> Path:
@@ -104,7 +180,16 @@ def main() -> None:
     print(f"  Pipeline Git SHA: {args.pipeline_git_sha}")
     print(f"  Raw batches: {', '.join(args.raw_batches)}")
 
-    pointer_path = track_with_dvc(data_path)
+    dvc_target = data_path
+    if args.release_path is not None:
+        release_path = resolve_release_path(args.release_path)
+        dvc_target = stage_release_data(data_path, release_path)
+        print(
+            "Validated data staged for release: "
+            f"{dvc_target.relative_to(PROJECT_ROOT).as_posix()}"
+        )
+
+    pointer_path = track_with_dvc(dvc_target)
     relative_pointer_path = pointer_path.relative_to(PROJECT_ROOT)
     print(f"DVC pointer updated: {relative_pointer_path.as_posix()}")
 

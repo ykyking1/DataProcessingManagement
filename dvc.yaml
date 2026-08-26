@@ -11,6 +11,7 @@ stages:
     deps:
       - scripts/preprocess_tab_spark.py
       - requirements-repro.txt
+      - tools/spark/WindowsLocalFileSystem.java
       - ${tab_pipeline.input}
     params:
       - tab_pipeline.input
@@ -36,6 +37,7 @@ stages:
       - scripts/preprocess_tab_spark.py
       - scripts/validate_tab_spark_ge.py
       - requirements-repro.txt
+      - tools/spark/WindowsLocalFileSystem.java
       - ${tab_pipeline.processed_output}
     params:
       - tab_pipeline.processed_output

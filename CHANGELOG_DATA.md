@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.3 (2026-08-25)
+
+**Data processed with `unreleased-f853852` (`f853852`)**
+
+- Raw batches: `mx10000_5000rows_load_test.tab.zst-211f1dd9af50`
+- DVC target: `data/processed/mx_tab.dvc`
+
+### Data
+
+- **processed**: Publish MX10000 load test
+  ([`4c3e09d`](https://github.com/ykyking1/DataProcessingManagement/commit/4c3e09dbd662d4728c84bbc33cbc22bee5bdc6ca))
+
+
 ## v0.2.2 (2026-08-19)
 
 **Data processed with `template-test` (`0573a77`)**

@@ -4,6 +4,16 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.4.0 (2026-08-25)
+
+
+### Features
+
+- **pipeline**: Integrate Spark GE and DVC workflow ([`fdd9cce`](https://github.com/ykyking1/DataProcessingManagement/commit/fdd9ccec630b84a0ad758f5a92fadd0ecd98a6f0))
+
+
+
+
 ## pipeline-v0.3.0 (2026-08-25)
 
 

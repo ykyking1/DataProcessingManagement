@@ -6,9 +6,9 @@ __pycache__/
 /testdata/
 .env
 /tmp/
-/tools/spark/WindowsLocalFileSystem.java
 reports
 /data/raw/
+/data/cleaned/mx_tab_inbox/
 /dagster/data/raw/
 /dagster/tmp/
 /dagster/.tmp_dagster_home_*/
