@@ -183,6 +183,40 @@ def _update_alert(run_id: str, updates: dict) -> bool:
     return is_updated
 
 
+def _has_auto_fix_started(run_id: str) -> bool:
+    """
+    Bu run_id için daha önce bir otomatik düzeltme döngüsü başlatılıp
+    başlatılmadığını (alerts.json'daki "auto_fix_started" işaretine
+    bakarak) döner.
+
+    Neden gerekli: bir run'da AYNI ANDA BİRDEN FAZLA adım başarısız
+    olursa, alert_on_failure hook'u o run_id için BİRDEN FAZLA kez (her
+    başarısız adım için bir kez) tetiklenir. Bu kontrol olmadan, her
+    çağrı kendi bağımsız 3 denemelik döngüsünü başlatabilir -- aynı
+    run_id için birden fazla otomatik düzeltme süreci aynı anda
+    çalışır.
+    """
+
+    if not ALERT_FILE.exists():
+        return False
+
+    try:
+        existing_alerts = json.loads(
+            ALERT_FILE.read_text(encoding="utf-8")
+        )
+
+        if not isinstance(existing_alerts, list):
+            return False
+
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    return any(
+        alert.get("run_id") == run_id and alert.get("auto_fix_started")
+        for alert in existing_alerts
+    )
+
+
 # ---------------------------------------------------------------------------
 # Webhook
 # ---------------------------------------------------------------------------
@@ -259,11 +293,17 @@ AUTO_FIX_RETRY_DELAY_SECONDS = int(
     )
 )
 
-# Bir reexecution denemesi bu tag ile işaretlenir -- alert_on_failure bu
-# tag'i taşıyan bir run'ın başarısızlığında YENİ bir otomatik düzeltme
-# döngüsü BAŞLATMAZ (bu, kendi kendini tetikleyen sonsuz/üstel bir
-# retry zincirine yol açardı). Döngü tamamen TEK bir hook çağrısı
-# içinde, senkron olarak yürütülür (bkz. _auto_fix_failure).
+# Diagnostik amaçlı: her reexecution denemesi bu tag'lerle işaretlenir
+# (Dagster UI'da run'a bakınca "bu hangi otomatik düzeltme denemesiydi,
+# kökeni hangi run" görülebilsin diye). ÖNEMLİ: üstel retry zincirini
+# önleyen asıl mekanizma bu tag'LER DEĞİL -- alert_on_failure artık
+# bunun yerine run.parent_run_id (Dagster'ın garantili çekirdek alanı)
+# ve _has_auto_fix_started (alerts.json tabanlı idempotency) kontrolünü
+# kullanıyor; bkz. alert_on_failure içindeki "ÜSTEL PATLAMAYI ÖNLEME"
+# notu. Bu tag'lere ayrıca güvenilmemesinin sebebi, Dagster'ın tag
+# merge sırasının (create_reexecuted_run -> merge_dicts) bu özel
+# tag'lerin sonraki bir reexecution'a doğru şekilde taşınıp
+# taşınmayacağını garanti etmeyen, dolaylı bir sinyal olmasıydı.
 AUTO_FIX_ATTEMPT_TAG = "auto_fix_attempt"
 AUTO_FIX_ROOT_RUN_TAG = "auto_fix_root_run_id"
 
@@ -737,6 +777,71 @@ def alert_on_failure(context: HookContext):
         timezone.utc
     ).isoformat()
 
+    # -----------------------------------------------------------------------
+    # Dagster log -- HER ZAMAN yazılır (dashboard'a ayrı bir alert kaydı
+    # düşüp düşmeyeceğimizden bağımsız olarak, Dagster'ın kendi
+    # loglarında/compute log'unda her hata görünmeli).
+    # -----------------------------------------------------------------------
+
+    context.log.error(
+        f"HATA ALINDI! "
+        f"Job: {job_name}, "
+        f"Step: {step_name}. "
+        f"Hata: {error_text}"
+    )
+
+    # -----------------------------------------------------------------------
+    # Bu run bir "otomatik düzeltme denemesi" mi? -- run'ın bir
+    # parent_run_id'si VARSA, bu run KESİNLİKLE bir yeniden çalıştırmadır
+    # (Dagster'ın kendi create_reexecuted_run'ı parent_run_id'yi HER
+    # ZAMAN set eder -- garantili bir çekirdek Dagster alanı). Bu, hem
+    # BİZİM auto-fix'imizin başlattığı denemeleri HEM DE kullanıcının
+    # Dagster UI'dan elle yaptığı yeniden çalıştırmaları kapsar.
+    #
+    # Eğer öyleyse: bu hata için dashboard'daki "Hata Detayı"na AYRI BİR
+    # SATIR EKLENMEZ -- aksi halde 3 otomatik deneme başarısız olduğunda
+    # kullanıcı aynı köke ait 4 farklı "hata raporu" (orijinal + 3
+    # deneme) görür, ki bunların hepsi ZATEN TEK BİR orijinal alert
+    # üzerinde auto_fix_current_attempt / auto_fix_exhausted / auto_fix_
+    # error alanlarıyla (bkz. _auto_fix_failure) özetleniyor. Bunun
+    # yerine sadece Dagster loguna yazılır (yukarıda zaten yazıldı) ve
+    # webhook GÖNDERİLMEZ (aksi halde her deneme için ayrı bir Slack/
+    # Teams bildirimi gider).
+    #
+    # Eğer değilse (gerçekten YENİ/organik bir hata): normal şekilde
+    # alerts.json'a kaydedilir, webhook gönderilir ve -- daha önce
+    # başlatılmadıysa (_has_auto_fix_started; aynı run'da BİRDEN FAZLA
+    # adım aynı anda başarısız olursa bu hook o run_id için birden fazla
+    # kez tetiklenir, is_reexecution kontrolü bunu YAKALAYAMAZ çünkü
+    # hepsi aynı parent'sız run'a ait) -- otomatik düzeltme döngüsü
+    # başlatılır.
+    #
+    # ÜSTEL PATLAMAYI ÖNLEME: bu iki koruma olmadan, bir deneme
+    # başarısız olduğunda oluşan HER yeni run kendi 3 denemelik
+    # döngüsünü başlatabilir (3 -> 9 -> 27 ...) -- gözlemlenen "hata
+    # sayısı üstel artıyor" sorunu tam olarak buydu.
+    # -----------------------------------------------------------------------
+
+    try:
+        run = context.instance.get_run_by_id(context.run_id)
+        is_reexecution = bool(run and run.parent_run_id)
+
+    except Exception as exc:
+        context.log.error(
+            f"Run bilgisi okunamadı, güvenli taraf seçilip bu hata "
+            f"için ayrı alert oluşturulmayacak: {exc}"
+        )
+        is_reexecution = True
+
+    if is_reexecution:
+
+        context.log.info(
+            "Bu run bir yeniden çalıştırma (parent_run_id var); "
+            "dashboard'a ayrı bir alert eklenmeyecek, yeni bir "
+            "otomatik düzeltme döngüsü de BAŞLATILMAYACAK."
+        )
+        return
+
     alert_data = {
         "timestamp": timestamp,
         "job_name": job_name,
@@ -746,16 +851,16 @@ def alert_on_failure(context: HookContext):
         "run_id": context.run_id,
     }
 
-    # -----------------------------------------------------------------------
-    # Dagster log
-    # -----------------------------------------------------------------------
+    should_start_auto_fix = not _has_auto_fix_started(context.run_id)
 
-    context.log.error(
-        f"HATA ALINDI! "
-        f"Job: {job_name}, "
-        f"Step: {step_name}. "
-        f"Hata: {error_text}"
-    )
+    if should_start_auto_fix:
+        alert_data["auto_fix_started"] = True
+    else:
+        context.log.info(
+            "Bu run_id için otomatik düzeltme zaten başlatılmış "
+            "(muhtemelen aynı run'da başka bir adım da başarısız "
+            "oldu); tekrar başlatılmayacak."
+        )
 
     # -----------------------------------------------------------------------
     # Dashboard'ın okuyacağı alert dosyasına kaydet
@@ -781,12 +886,7 @@ def alert_on_failure(context: HookContext):
 
     # -----------------------------------------------------------------------
     # Otomatik düzeltme -- kullanıcıdan bağımsız, otomatik olarak
-    # tetiklenir (bkz. _auto_fix_failure). Bu run'ın KENDİSİ zaten bir
-    # otomatik düzeltme denemesiyse (AUTO_FIX_ATTEMPT_TAG tag'i varsa),
-    # burada YENİ bir döngü BAŞLATILMAZ -- o deneme zaten dıştaki
-    # _auto_fix_failure çağrısının polling'i tarafından takip ediliyor.
-    # Bu kontrol olmadan her başarısız deneme kendi 3 denemesini
-    # başlatır ve üstel bir retry patlamasına yol açar.
+    # tetiklenir (bkz. _auto_fix_failure).
     #
     # ÖNEMLİ: _auto_fix_failure bu hook'un içinde SENKRON olarak DEĞİL,
     # AYRI, TAMAMEN BAĞIMSIZ (detached) bir OS SÜRECİNDE başlatılır --
@@ -798,15 +898,9 @@ def alert_on_failure(context: HookContext):
     # süresiz "STARTED" durumunda kilitler.
     # -----------------------------------------------------------------------
 
-    try:
+    if should_start_auto_fix:
 
-        run = context.instance.get_run_by_id(context.run_id)
-        is_auto_fix_attempt = bool(
-            run and run.tags.get(AUTO_FIX_ATTEMPT_TAG)
-        )
-
-        if not is_auto_fix_attempt:
-
+        try:
             _launch_auto_fix_worker_process(context.run_id)
 
             context.log.info(
@@ -814,10 +908,10 @@ def alert_on_failure(context: HookContext):
                 f"fazla {AUTO_FIX_MAX_ATTEMPTS} deneme)."
             )
 
-    except Exception as exc:
-        context.log.error(
-            f"Otomatik düzeltme başlatılamadı: {exc}"
-        )
+        except Exception as exc:
+            context.log.error(
+                f"Otomatik düzeltme başlatılamadı: {exc}"
+            )
 
 
 # ---------------------------------------------------------------------------
