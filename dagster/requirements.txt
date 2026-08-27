@@ -1,6 +1,6 @@
 dagster
 dagster-webserver
-dvc==3.67.1
+dvc[s3]==3.67.1
 clickhouse-driver
 psycopg2-binary
 pandas
@@ -10,3 +10,6 @@ great_expectations==1.20.0
 zstandard==0.25.0
 requests
 python-dotenv
+minio==7.2.20
+PyYAML
+GitPython

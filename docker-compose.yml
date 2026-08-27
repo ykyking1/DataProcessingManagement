@@ -1,20 +1,90 @@
 services:
-  # Asset metadata geçmişi (bkz. dagster/metadata_store.py,
-  # docs/postgres_asset_metadata_schema.sql). Bağlantı bilgileri
-  # dagster/.env ve dashboard/.env içindeki POSTGRES_* değerleriyle
-  # eşleşmelidir.
+  minio:
+    build:
+      context: .
+      dockerfile: minio/Dockerfile
+    image: dpm-minio-local:latest
+    container_name: dpm-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - dpm_minio_data:/data
+
+  # Pipeline run ve asset materialization kataloğu.
+  # Şema: docs/postgres_pipeline_catalog_schema.sql
   postgres:
     image: postgres:16
     container_name: dpm-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: HalukPG123!
-      POSTGRES_DB: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+      POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - dpm_postgres_data:/var/lib/postgresql/data
+      - ./docs/postgres_pipeline_catalog_schema.sql:/docker-entrypoint-initdb.d/10-pipeline-catalog.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  dagster:
+    build:
+      context: .
+      dockerfile: dagster/Dockerfile
+    image:
+      dagster-local:latest
+    container_name: dagster-local
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_SECURE: "false"
+      DVC_REPO_ROOT: /workspace
+      DVC_REMOTE_NAME: minio
+      DVC_REMOTE_URL: s3://dvc-cache
+      DVC_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+      POSTGRES_CATALOG_SCHEMA_PATH: /app/docs/postgres_pipeline_catalog_schema.sql
+      PIPELINE_VERSION: ${PIPELINE_VERSION:-}
+      PIPELINE_GIT_TAG: ${PIPELINE_GIT_TAG:-}
+      PIPELINE_GIT_SHA: ${PIPELINE_GIT_SHA:-}
+      PIPELINE_GIT_DIRTY: ${PIPELINE_GIT_DIRTY:-false}
+      PIPELINE_CONTAINER_IMAGE: dagster-local:latest
+      PIPELINE_CONTAINER_IMAGE_DIGEST: ${PIPELINE_CONTAINER_IMAGE_DIGEST:-}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./:/workspace
+      - dpm_dvc_cache:/workspace/.dvc/cache
+      - dpm_dagster_home:/app/dagster_home
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
+  dpm_minio_data:
+    name: dpm_minio_data
   dpm_postgres_data:
+    name: dpm_postgres_data
+  dpm_dvc_cache:
+    name: dpm_dvc_cache
+  dpm_dagster_home:
+    name: dpm_dagster_home

@@ -1,90 +1,314 @@
-from pathlib import Path
+"""Dagster code location for the MinIO-backed data workflows."""
+
+import json
+import os
+import re
+from pathlib import Path, PurePosixPath
 
 from dagster import (
     AssetSelection,
+    DagsterRunStatus,
+    DefaultSensorStatus,
     Definitions,
+    RunRequest,
+    RunsFilter,
+    SkipReason,
     define_asset_job,
-    load_assets_from_modules,
+    run_status_sensor,
+    sensor,
 )
 from dotenv import load_dotenv
 
-# CLICKHOUSE_* / ALERT_WEBHOOK_URL gibi ortam değişkenleri bu dosyadan
-# okunur. assets/clickhouse.py ve alerting.py bu değerleri sadece
-# çalışma zamanında (fonksiyon çağrıldığında) os.environ üzerinden
-# okuduğu için, .env'in en geç bu modül import edilirken yüklenmiş
-# olması yeterlidir. "dagster dev" nereden çalıştırılırsa çalıştırılsın
-# doğru dosyayı bulmak için mutlak yol kullanılıyor.
-load_dotenv(
-    Path(__file__).resolve().parent / ".env"
-)
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import assets
-
-from schedules.telemetry_sensor import telemetry_sensor
-from schedules.mx_tab_sensor import mx_tab_sensor
-
-# İKİ HOOK'U DA İÇERİ AKTAR
 from alerting import alert_on_failure, clear_alert_on_success
+from postgres_catalog import record_terminal_job_run, resolve_pipeline_identity
 
 
-# ===========================================================================
-# ASSETS
-# ===========================================================================
-
-all_assets = load_assets_from_modules([assets])
-
-
-# ===========================================================================
-# JOB
-# ===========================================================================
-
-uav_data_pipeline_job = define_asset_job(
-    name="uav_data_pipeline_job",
-    # extended_telemetry_load KASITLI OLARAK dışarıda bırakılıyor:
-    # partitions_def'i yok ve file_path config'i zorunlu (varsayılanı
-    # yok) -- AssetSelection.all() içinde kalsaydı, sensor'ün günlük
-    # partition'lı dosyalar için oluşturduğu HER RunRequest bu asset'i
-    # de seçip config eksikliğinden run'ı hemen başlamadan
-    # başarısız ederdi. Bu asset yalnızca Dagster UI'dan elle
-    # "Materialize" edilip file_path verilerek çalıştırılmalı (bkz.
-    # assets.py::extended_telemetry_load).
-    selection=AssetSelection.all()
-    - AssetSelection.assets(
-        assets.extended_telemetry_load,
-        assets.spark_processed_tab,
-        assets.spark_validated_tab,
-        assets.dvc_published_mx_tab,
-    ),
-    hooks={
-        alert_on_failure,
-        clear_alert_on_success, # YENİ EKLENEN KISIM
-    },
+raw_to_staged_job = define_asset_job(
+    name="raw_to_staged_job",
+    selection=AssetSelection.assets(assets.staged_mx_tab),
+    hooks={alert_on_failure, clear_alert_on_success},
 )
 
-mx_tab_quality_job = define_asset_job(
-    name="mx_tab_quality_job",
+staged_to_published_job = define_asset_job(
+    name="staged_to_published_job",
     selection=AssetSelection.assets(
-        assets.spark_processed_tab,
-        assets.spark_validated_tab,
-        assets.dvc_published_mx_tab,
+        assets.processed_mx_batch,
+        assets.validated_mx_batch,
+        assets.published_mx_dataset,
     ),
+    hooks={alert_on_failure, clear_alert_on_success},
 )
 
 
-# ===========================================================================
-# DEFINITIONS
-# ===========================================================================
+MONITORED_PIPELINE_JOBS = [raw_to_staged_job, staged_to_published_job]
+
+
+def _record_terminal_status(context, status: str) -> None:
+    repo_root = Path(
+        os.getenv("DVC_REPO_ROOT", Path(__file__).resolve().parents[1])
+    ).resolve()
+    identity = resolve_pipeline_identity(repo_root)
+    record_terminal_job_run(context, identity, status)
+    context.log.info(
+        "PostgreSQL pipeline catalog updated: run=%s, status=%s",
+        context.dagster_run.run_id,
+        status,
+    )
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    monitored_jobs=MONITORED_PIPELINE_JOBS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def postgres_run_success_sensor(context):
+    _record_terminal_status(context, "SUCCESS")
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.FAILURE,
+    monitored_jobs=MONITORED_PIPELINE_JOBS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def postgres_run_failure_sensor(context):
+    _record_terminal_status(context, "FAILURE")
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.CANCELED,
+    monitored_jobs=MONITORED_PIPELINE_JOBS,
+    default_status=DefaultSensorStatus.RUNNING,
+)
+def postgres_run_canceled_sensor(context):
+    _record_terminal_status(context, "CANCELED")
+
+
+STAGED_MX_FILE_PATTERN = re.compile(
+    r"^(?P<dataset_id>mx(?P<column_count>\d+))_"
+    r"(?P<row_count>\d+)rows(?:[_-].*)?\.tab\.zst$",
+    flags=re.IGNORECASE,
+)
+
+
+def _job_has_active_run(context, job_name: str) -> bool:
+    active_statuses = [
+        DagsterRunStatus.QUEUED,
+        DagsterRunStatus.NOT_STARTED,
+        DagsterRunStatus.MANAGED,
+        DagsterRunStatus.STARTING,
+        DagsterRunStatus.STARTED,
+        DagsterRunStatus.CANCELING,
+    ]
+    return bool(
+        context.instance.get_runs(
+            filters=RunsFilter(
+                job_name=job_name,
+                statuses=active_statuses,
+            ),
+            limit=1,
+        )
+    )
+
+
+@sensor(
+    job=raw_to_staged_job,
+    minimum_interval_seconds=30,
+    default_status=DefaultSensorStatus.RUNNING,
+    description=(
+        "Watches raw MX .tab objects in MinIO and launches one staging run "
+        "for each new object key/ETag combination."
+    ),
+)
+def raw_minio_sensor(context):
+    if _job_has_active_run(context, raw_to_staged_job.name):
+        return SkipReason("A raw-to-staged run is already active.")
+
+    source_bucket = os.getenv("MINIO_RAW_BUCKET", assets.DEFAULT_RAW_BUCKET)
+    source_prefix = os.getenv("MINIO_RAW_PREFIX", "mx-tab/inbox/").strip("/")
+    if source_prefix:
+        source_prefix = f"{source_prefix}/"
+
+    client = assets.create_minio_client()
+    if not client.bucket_exists(source_bucket):
+        return SkipReason(f"MinIO bucket does not exist yet: {source_bucket}")
+
+    try:
+        observed_etags = json.loads(context.cursor) if context.cursor else {}
+    except (TypeError, json.JSONDecodeError):
+        observed_etags = {}
+    if not isinstance(observed_etags, dict):
+        observed_etags = {}
+
+    candidates = sorted(
+        (
+            item
+            for item in client.list_objects(
+                source_bucket,
+                prefix=source_prefix,
+                recursive=True,
+            )
+            if not item.is_dir and item.object_name.lower().endswith(".tab")
+        ),
+        key=lambda item: item.object_name,
+    )
+
+    for item in candidates:
+        source_etag = assets._normalise_etag(item.etag) or "unknown"
+        object_identity = f"{source_bucket}/{item.object_name}"
+        if observed_etags.get(object_identity) == source_etag:
+            continue
+
+        observed_etags[object_identity] = source_etag
+        context.update_cursor(json.dumps(observed_etags, sort_keys=True))
+        return RunRequest(
+            run_key=f"raw-minio:{object_identity}:{source_etag}",
+            run_config={
+                "ops": {
+                    "staged_mx_tab": {
+                        "config": {
+                            "source_bucket": source_bucket,
+                            "source_key": item.object_name,
+                            "source_etag": source_etag,
+                        }
+                    }
+                }
+            },
+            tags={
+                "source_bucket": source_bucket,
+                "source_key": item.object_name,
+                "source_etag": source_etag,
+            },
+        )
+
+    return SkipReason(
+        f"No new .tab objects under s3://{source_bucket}/{source_prefix}."
+    )
+
+
+@sensor(
+    job=staged_to_published_job,
+    minimum_interval_seconds=30,
+    default_status=DefaultSensorStatus.RUNNING,
+    description=(
+        "Watches staged MX .tab.zst objects in MinIO and launches the "
+        "Spark -> GE -> DVC workflow for each new object key/ETag pair."
+    ),
+)
+def staged_minio_sensor(context):
+    if _job_has_active_run(context, staged_to_published_job.name):
+        return SkipReason("A staged-to-published run is already active.")
+
+    source_bucket = os.getenv(
+        "MINIO_STAGED_BUCKET", assets.DEFAULT_STAGED_BUCKET
+    )
+    source_prefix = os.getenv(
+        "MINIO_STAGED_PREFIX", assets.DEFAULT_STAGED_PREFIX
+    ).strip("/")
+    if source_prefix:
+        source_prefix = f"{source_prefix}/"
+
+    client = assets.create_minio_client()
+    if not client.bucket_exists(source_bucket):
+        return SkipReason(f"MinIO bucket does not exist yet: {source_bucket}")
+
+    try:
+        observed_etags = json.loads(context.cursor) if context.cursor else {}
+    except (TypeError, json.JSONDecodeError):
+        observed_etags = {}
+    if not isinstance(observed_etags, dict):
+        observed_etags = {}
+
+    candidates = sorted(
+        (
+            item
+            for item in client.list_objects(
+                source_bucket,
+                prefix=source_prefix,
+                recursive=True,
+            )
+            if not item.is_dir
+            and item.object_name.lower().endswith(".tab.zst")
+        ),
+        key=lambda item: item.object_name,
+    )
+
+    cursor_changed = False
+    for item in candidates:
+        source_etag = assets._normalise_etag(item.etag) or "unknown"
+        object_identity = f"{source_bucket}/{item.object_name}"
+        if observed_etags.get(object_identity) == source_etag:
+            continue
+
+        file_name = PurePosixPath(item.object_name).name
+        match = STAGED_MX_FILE_PATTERN.fullmatch(file_name)
+        if match is None:
+            context.log.warning(
+                "Ignoring staged object with an unsupported name: s3://%s/%s",
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
+
+        dataset_id = match.group("dataset_id").lower()
+        batch_id = file_name[: -len(".tab.zst")]
+        row_count = int(match.group("row_count"))
+        column_count = int(match.group("column_count"))
+
+        observed_etags[object_identity] = source_etag
+        context.update_cursor(json.dumps(observed_etags, sort_keys=True))
+        return RunRequest(
+            run_key=f"staged-minio:{object_identity}:{source_etag}",
+            run_config={
+                "ops": {
+                    "processed_mx_batch": {
+                        "config": {
+                            "source_bucket": source_bucket,
+                            "source_key": item.object_name,
+                            "source_etag": source_etag,
+                            "dataset_id": dataset_id,
+                            "batch_id": batch_id,
+                            "row_count": row_count,
+                            "column_count": column_count,
+                        }
+                    }
+                }
+            },
+            tags={
+                "dataset_id": dataset_id,
+                "batch_id": batch_id,
+                "source_bucket": source_bucket,
+                "source_key": item.object_name,
+                "source_etag": source_etag,
+            },
+        )
+
+    if cursor_changed:
+        context.update_cursor(json.dumps(observed_etags, sort_keys=True))
+    return SkipReason(
+        f"No new supported .tab.zst objects under "
+        f"s3://{source_bucket}/{source_prefix}."
+    )
+
 
 defs = Definitions(
-    assets=all_assets,
-
-    jobs=[
-        uav_data_pipeline_job,
-        mx_tab_quality_job,
+    assets=[
+        assets.staged_mx_tab,
+        assets.processed_mx_batch,
+        assets.validated_mx_batch,
+        assets.published_mx_dataset,
     ],
-
+    jobs=[raw_to_staged_job, staged_to_published_job],
     sensors=[
-        telemetry_sensor,
-        mx_tab_sensor,
+        raw_minio_sensor,
+        staged_minio_sensor,
+        postgres_run_success_sensor,
+        postgres_run_failure_sensor,
+        postgres_run_canceled_sensor,
     ],
 )
