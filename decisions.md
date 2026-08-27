@@ -26,6 +26,7 @@
 - Commit mesajı üretimi Dagster asset'lerinin sorumluluğu değildir. `scripts_new/get_commit_message.py`, tam Dagster `run_id` ile yalnızca PostgreSQL kataloğunu okuyan ayrı bir developer aracıdır.
 - Araç sadece `SUCCESS` durumundaki ve `published_mx_dataset` materialization kaydı bulunan run'lar için öneri üretir; Git commit veya push komutu çalıştırmaz.
 - Dirty pipeline run'ları engellenmez. Önerilen commit mesajında `Pipeline-Git-Dirty: true` olarak açıkça belirtilir.
+- Dagster container'ı Windows host repository'sini `/workspace` altında bind mount ettiği için container Git'inde `core.autocrlf=true` kullanılacaktır. Böylece Windows CRLF checkout'u sahte repository/pipeline dirty durumu üretmez; gerçek DVC pointer ve kod değişiklikleri dirty olarak kalmaya devam eder.
 
 ## 2026-08-27 — Semantic release bağımlılık sabitlemesi
 
