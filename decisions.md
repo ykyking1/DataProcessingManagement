@@ -15,6 +15,8 @@
 - PostgreSQL, Dagster loglarını veya sensor cursor'larını kopyalamak için kullanılmayacaktır.
 - PostgreSQL'in uygulama şeması `pipeline_catalog` olacaktır.
 - `pipeline_job_runs`, her Dagster run'ının durumunu, MX batch kimliğini ve run başında sabitlenen pipeline version/Git tag/Git SHA/container kimliğini tutacaktır.
+- Pipeline sürümü monorepo HEAD'inden bağımsız, `releaserc-pipeline.toml` ile aynı pipeline path kapsamına göre çözülecektir. Son pipeline tag'inden sonra yalnızca data pointer'ları değiştiyse tag geçerliliğini korur; pipeline path'i değiştiyse son pipeline commit'i `unreleased-<sha>` olarak kaydedilir.
+- `pipeline_git_sha` pipeline bileşeninin revision'ını, `repository_git_sha` ise run anındaki gerçek repository HEAD'ini tutacaktır. Pipeline ve tüm repository dirty durumları ayrı alanlarda kaydedilecektir.
 - `pipeline_asset_materializations`, aynı run içinde başarıyla üretilen asset özetlerini ve MinIO, validation ve DVC çıktı metadata'sını tutacaktır.
 - Büyük veri dosyaları PostgreSQL'e yazılmayacaktır; MinIO/DVC üzerinde kalacaktır.
 - Run ve materialization yazımları `dagster_run_id` tabanlı idempotent upsert ile yapılacaktır.

@@ -17,6 +17,28 @@ import psycopg2.extras
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "docs" / "postgres_pipeline_catalog_schema.sql"
 
+# Keep this path set aligned with releaserc-pipeline.toml. A commit that only
+# changes data pointers must not change the independently versioned pipeline.
+PIPELINE_GIT_PATHS = (
+    "dagster",
+    ":(exclude)dagster/data",
+    "scripts",
+    "scripts_new",
+    "minio",
+    "docker-compose.yml",
+    ".dockerignore",
+    ".github/workflows/semantic-release.yml",
+    "releaserc-pipeline.toml",
+    "templates/pipeline_changelog",
+    "docs/postgres_pipeline_catalog_schema.sql",
+    "dvc.yaml",
+    "params.yaml",
+    ":(glob)requirements*.txt",
+    "pyproject.toml",
+    "uv.lock",
+    "poetry.lock",
+)
+
 
 @dataclass(frozen=True)
 class PipelineIdentity:
@@ -26,6 +48,8 @@ class PipelineIdentity:
     git_tag: str | None
     git_sha: str
     git_dirty: bool
+    repository_git_sha: str
+    repository_git_dirty: bool
     container_image: str | None
     container_image_digest: str | None
 
@@ -45,23 +69,80 @@ def _environment_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _latest_reachable_pipeline_tag(repo: Any, head_sha: str) -> str | None:
+    try:
+        return repo.git.describe(
+            "--tags",
+            "--match",
+            "pipeline-v*",
+            "--abbrev=0",
+            head_sha,
+        ).strip() or None
+    except Exception:
+        return None
+
+
+def _pipeline_paths_changed(repo: Any, older_sha: str, newer_sha: str) -> bool:
+    changed_paths = repo.git.diff(
+        "--name-only",
+        older_sha,
+        newer_sha,
+        "--",
+        *PIPELINE_GIT_PATHS,
+    )
+    return bool(changed_paths.strip())
+
+
+def _pipeline_worktree_dirty(repo: Any) -> bool:
+    status = repo.git.status(
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        *PIPELINE_GIT_PATHS,
+    )
+    return bool(status.strip())
+
+
+def _latest_pipeline_commit_sha(repo: Any, head_sha: str) -> str:
+    commit_sha = repo.git.log(
+        "-1",
+        "--format=%H",
+        head_sha,
+        "--",
+        *PIPELINE_GIT_PATHS,
+    ).strip()
+    return commit_sha or head_sha
+
+
 def resolve_pipeline_identity(repo_root: Path | str) -> PipelineIdentity:
-    """Resolve the code identity once and persist it with the first run row."""
+    """Resolve component and repository identities for one pipeline run.
+
+    Pipeline releases are independent from data releases in this monorepo. A
+    data-only commit after a pipeline tag keeps that pipeline version, while a
+    pipeline-path change after the tag produces an unreleased component SHA.
+    """
 
     configured_sha = os.getenv("PIPELINE_GIT_SHA", "").strip()
     configured_version = os.getenv("PIPELINE_VERSION", "").strip()
     configured_tag = os.getenv("PIPELINE_GIT_TAG", "").strip() or None
+    configured_repository_sha = os.getenv("REPOSITORY_GIT_SHA", "").strip()
     container_image = os.getenv("PIPELINE_CONTAINER_IMAGE", "").strip() or None
     container_digest = (
         os.getenv("PIPELINE_CONTAINER_IMAGE_DIGEST", "").strip() or None
     )
 
     if configured_sha:
+        pipeline_dirty = _environment_flag("PIPELINE_GIT_DIRTY")
         return PipelineIdentity(
             version=configured_version or f"unreleased-{configured_sha[:7]}",
             git_tag=configured_tag,
             git_sha=configured_sha,
-            git_dirty=_environment_flag("PIPELINE_GIT_DIRTY"),
+            git_dirty=pipeline_dirty,
+            repository_git_sha=configured_repository_sha or configured_sha,
+            repository_git_dirty=_environment_flag(
+                "REPOSITORY_GIT_DIRTY",
+                pipeline_dirty,
+            ),
             container_image=container_image,
             container_image_digest=container_digest,
         )
@@ -70,23 +151,40 @@ def resolve_pipeline_identity(repo_root: Path | str) -> PipelineIdentity:
         from git import Repo
 
         repo = Repo(Path(repo_root).resolve())
-        commit = repo.head.commit
-        git_sha = commit.hexsha
-        matching_tags = sorted(
-            tag.name
-            for tag in repo.tags
-            if tag.commit == commit and tag.name.startswith("pipeline-v")
+        repository_git_sha = repo.head.commit.hexsha
+        repository_git_dirty = repo.is_dirty(untracked_files=True)
+        pipeline_dirty = _pipeline_worktree_dirty(repo)
+
+        candidate_tag = configured_tag or _latest_reachable_pipeline_tag(
+            repo,
+            repository_git_sha,
         )
-        git_tag = configured_tag or (matching_tags[-1] if matching_tags else None)
-        git_dirty = repo.is_dirty(untracked_files=True)
+        candidate_tag_sha = (
+            repo.commit(candidate_tag).hexsha if candidate_tag else None
+        )
+        pipeline_changed = candidate_tag_sha is None or _pipeline_paths_changed(
+            repo,
+            candidate_tag_sha,
+            repository_git_sha,
+        )
+
+        if candidate_tag_sha is not None and not pipeline_changed:
+            git_tag = candidate_tag
+            git_sha = candidate_tag_sha
+        else:
+            git_tag = None
+            git_sha = _latest_pipeline_commit_sha(repo, repository_git_sha)
+
         version = configured_version or git_tag or f"unreleased-{git_sha[:7]}"
-        if not configured_version and git_dirty:
+        if not configured_version and pipeline_dirty:
             version = f"{version}-dirty"
         return PipelineIdentity(
             version=version,
             git_tag=git_tag,
             git_sha=git_sha,
-            git_dirty=git_dirty,
+            git_dirty=pipeline_dirty,
+            repository_git_sha=repository_git_sha,
+            repository_git_dirty=repository_git_dirty,
             container_image=container_image,
             container_image_digest=container_digest,
         )
@@ -96,6 +194,8 @@ def resolve_pipeline_identity(repo_root: Path | str) -> PipelineIdentity:
             git_tag=configured_tag,
             git_sha="unknown",
             git_dirty=_environment_flag("PIPELINE_GIT_DIRTY"),
+            repository_git_sha=configured_repository_sha or "unknown",
+            repository_git_dirty=_environment_flag("REPOSITORY_GIT_DIRTY"),
             container_image=container_image,
             container_image_digest=container_digest,
         )
@@ -162,8 +262,10 @@ def _stored_catalog_run(row: tuple[Any, ...]) -> CatalogRun:
             git_tag=row[2],
             git_sha=row[3],
             git_dirty=bool(row[4]),
-            container_image=row[5],
-            container_image_digest=row[6],
+            repository_git_sha=row[5],
+            repository_git_dirty=bool(row[6]),
+            container_image=row[7],
+            container_image_digest=row[8],
         ),
     )
 
@@ -203,6 +305,8 @@ def ensure_job_run(
                     pipeline_git_tag,
                     pipeline_git_sha,
                     pipeline_git_dirty,
+                    repository_git_sha,
+                    repository_git_dirty,
                     container_image,
                     container_image_digest,
                     run_tags,
@@ -210,7 +314,7 @@ def ensure_job_run(
                 )
                 VALUES (
                     %s, %s, %s, 'STARTED', %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (dagster_run_id) DO UPDATE SET
                     parent_run_id = COALESCE(
@@ -246,6 +350,8 @@ def ensure_job_run(
                     pipeline_git_tag,
                     pipeline_git_sha,
                     pipeline_git_dirty,
+                    repository_git_sha,
+                    repository_git_dirty,
                     container_image,
                     container_image_digest
                 """,
@@ -262,6 +368,8 @@ def ensure_job_run(
                     identity.git_tag,
                     identity.git_sha,
                     identity.git_dirty,
+                    identity.repository_git_sha,
+                    identity.repository_git_dirty,
                     identity.container_image,
                     identity.container_image_digest,
                     psycopg2.extras.Json(tags),
@@ -424,6 +532,8 @@ def record_terminal_job_run(
                     pipeline_git_tag,
                     pipeline_git_sha,
                     pipeline_git_dirty,
+                    repository_git_sha,
+                    repository_git_dirty,
                     container_image,
                     container_image_digest,
                     run_tags,
@@ -433,7 +543,7 @@ def record_terminal_job_run(
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (dagster_run_id) DO UPDATE SET
                     run_status = EXCLUDED.run_status,
@@ -458,6 +568,8 @@ def record_terminal_job_run(
                     identity.git_tag,
                     identity.git_sha,
                     identity.git_dirty,
+                    identity.repository_git_sha,
+                    identity.repository_git_dirty,
                     identity.container_image,
                     identity.container_image_digest,
                     psycopg2.extras.Json(tags),

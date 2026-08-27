@@ -61,6 +61,8 @@ def _fetch_run_and_assets(
                     pipeline_git_tag,
                     pipeline_git_sha,
                     pipeline_git_dirty,
+                    repository_git_sha,
+                    repository_git_dirty,
                     container_image,
                     container_image_digest,
                     started_at,
@@ -158,6 +160,16 @@ def _build_commit_message(
         trailers,
         "Pipeline-Git-Dirty",
         str(bool(run["pipeline_git_dirty"])).lower(),
+    )
+    _append_trailer(
+        trailers,
+        "Repository-Git-SHA",
+        run["repository_git_sha"],
+    )
+    _append_trailer(
+        trailers,
+        "Repository-Git-Dirty",
+        str(bool(run["repository_git_dirty"])).lower(),
     )
     _append_trailer(trailers, "DVC-Pointer", published.get("output_uri"))
     _append_trailer(trailers, "DVC-Hash", dvc_hash_value)

@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS pipeline_catalog.pipeline_job_runs (
     pipeline_git_tag        TEXT,
     pipeline_git_sha        TEXT NOT NULL,
     pipeline_git_dirty      BOOLEAN NOT NULL DEFAULT FALSE,
+    repository_git_sha      TEXT NOT NULL,
+    repository_git_dirty    BOOLEAN NOT NULL DEFAULT FALSE,
     container_image         TEXT,
     container_image_digest  TEXT,
 
@@ -61,6 +63,21 @@ CREATE TABLE IF NOT EXISTS pipeline_catalog.pipeline_job_runs (
         CHECK (finished_at IS NULL OR finished_at >= started_at)
 );
 
+-- Existing named volumes are migrated in place. For historical rows the old
+-- pipeline SHA was also the only repository SHA that had been recorded.
+ALTER TABLE pipeline_catalog.pipeline_job_runs
+    ADD COLUMN IF NOT EXISTS repository_git_sha TEXT;
+
+UPDATE pipeline_catalog.pipeline_job_runs
+SET repository_git_sha = pipeline_git_sha
+WHERE repository_git_sha IS NULL;
+
+ALTER TABLE pipeline_catalog.pipeline_job_runs
+    ALTER COLUMN repository_git_sha SET NOT NULL;
+
+ALTER TABLE pipeline_catalog.pipeline_job_runs
+    ADD COLUMN IF NOT EXISTS repository_git_dirty BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_pipeline_job_runs_job_started
     ON pipeline_catalog.pipeline_job_runs (job_name, started_at DESC);
 
@@ -79,6 +96,9 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_job_runs_source
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_job_runs_git_sha
     ON pipeline_catalog.pipeline_job_runs (pipeline_git_sha);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_job_runs_repository_git_sha
+    ON pipeline_catalog.pipeline_job_runs (repository_git_sha);
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_job_runs_version
     ON pipeline_catalog.pipeline_job_runs (pipeline_version);

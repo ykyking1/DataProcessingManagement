@@ -649,6 +649,8 @@ def published_mx_dataset(
             "pipeline_git_tag": pipeline_identity.git_tag or "none",
             "pipeline_git_sha": pipeline_identity.git_sha,
             "pipeline_git_dirty": pipeline_identity.git_dirty,
+            "repository_git_sha": pipeline_identity.repository_git_sha,
+            "repository_git_dirty": pipeline_identity.repository_git_dirty,
             "validation_report_uri": validated_mx_batch["report_uri"],
         }
     )
