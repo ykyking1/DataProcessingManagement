@@ -4,6 +4,22 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.5.0-rc.2 (2026-08-27)
+
+
+### Bug Fixes
+
+- **pipeline**: Install git for lineage resolution ([`48a582e`](https://github.com/ykyking1/DataProcessingManagement/commit/48a582ee7f741b404717afb53e809ab5f29a61c5))
+
+
+
+### Chores
+
+- **pipeline**: Resolve component version by paths ([`43084b1`](https://github.com/ykyking1/DataProcessingManagement/commit/43084b11121523568287edd1cc128e911b4a4403))
+
+
+
+
 ## pipeline-v0.5.0-rc.1 (2026-08-27)
 
 
