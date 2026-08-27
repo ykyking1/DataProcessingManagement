@@ -4,6 +4,16 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.5.0-rc.3 (2026-08-27)
+
+
+### Bug Fixes
+
+- **pipeline**: Normalize bind-mount line endings ([`01c284f`](https://github.com/ykyking1/DataProcessingManagement/commit/01c284fb6b83d0c3704b04a69ffe3299076bba25))
+
+
+
+
 ## pipeline-v0.5.0-rc.2 (2026-08-27)
 
 
