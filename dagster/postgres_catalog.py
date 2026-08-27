@@ -188,17 +188,12 @@ def resolve_pipeline_identity(repo_root: Path | str) -> PipelineIdentity:
             container_image=container_image,
             container_image_digest=container_digest,
         )
-    except Exception:
-        return PipelineIdentity(
-            version=configured_version or "unreleased-unknown",
-            git_tag=configured_tag,
-            git_sha="unknown",
-            git_dirty=_environment_flag("PIPELINE_GIT_DIRTY"),
-            repository_git_sha=configured_repository_sha or "unknown",
-            repository_git_dirty=_environment_flag("REPOSITORY_GIT_DIRTY"),
-            container_image=container_image,
-            container_image_digest=container_digest,
-        )
+    except Exception as error:
+        raise RuntimeError(
+            "Pipeline Git identity could not be resolved. Ensure the git "
+            "executable and repository metadata are available, or configure "
+            "PIPELINE_GIT_SHA explicitly."
+        ) from error
 
 
 def _connection_parameters() -> dict[str, Any]:
