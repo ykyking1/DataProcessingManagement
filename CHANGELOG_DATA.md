@@ -2,6 +2,16 @@
 
 <!-- version list -->
 
+## v0.2.4-rc.1 (2026-08-27)
+
+**Data processed with `unreleased-ce02448-dirty` (`ce024487f14c3ceb6cdc938215f88003593b67b0`)**
+
+### Data
+
+- **mx**: Baseline processed DVC pointers
+  ([`4ba679f`](https://github.com/ykyking1/DataProcessingManagement/commit/4ba679fe7f7835457772cbf503ec857b87bb2c5f))
+
+
 ## v0.2.3 (2026-08-25)
 
 **Data processed with `unreleased-f853852` (`f853852`)**
