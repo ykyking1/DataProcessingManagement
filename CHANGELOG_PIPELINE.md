@@ -4,6 +4,22 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.5.0-rc.1 (2026-08-27)
+
+
+### Chores
+
+- **release**: Configure feature branch prereleases ([`cd1e746`](https://github.com/ykyking1/DataProcessingManagement/commit/cd1e746a2862c49a047f01a5fd11d2f988f2e0fd))
+
+
+
+### Features
+
+- **pipeline**: Add versioned MinIO publication workflow ([`ddb52f0`](https://github.com/ykyking1/DataProcessingManagement/commit/ddb52f09c0fa116b8dbcb9874cdcc38ef7050aca))
+
+
+
+
 ## pipeline-v0.4.0 (2026-08-25)
 
 
