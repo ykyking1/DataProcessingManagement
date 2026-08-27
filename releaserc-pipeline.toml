@@ -11,6 +11,11 @@ major_on_zero = true
 match = "main"
 prerelease = false
 
+[semantic_release.branches.minio_dvc_e2e]
+match = "feat/minio-dvc-e2e-docker"
+prerelease = true
+prerelease_token = "rc"
+
 [semantic_release.commit_parser_options]
 minor_tags = ["feat", "schema"]
 patch_tags = ["fix", "perf", "build"]
@@ -22,6 +27,14 @@ path_filters = [
     "dagster/**",
     "!dagster/data/**",
     "scripts/**",
+    "scripts_new/**",
+    "minio/**",
+    "docker-compose.yml",
+    ".dockerignore",
+    ".github/workflows/semantic-release.yml",
+    "releaserc-pipeline.toml",
+    "templates/pipeline_changelog/**",
+    "docs/postgres_pipeline_catalog_schema.sql",
     "dvc.yaml",
     "params.yaml",
     "requirements*.txt",
