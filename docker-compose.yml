@@ -38,6 +38,30 @@ services:
       timeout: 5s
       retries: 12
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: dpm-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9002:9000"
+    volumes:
+      - dpm_clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          clickhouse-client --user "$${CLICKHOUSE_USER}"
+          --password "$${CLICKHOUSE_PASSWORD}" --query "SELECT 1"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   dagster:
     build:
       context: .
@@ -57,6 +81,13 @@ services:
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
       SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_NATIVE_PORT: "9000"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-telemetry}
+      CLICKHOUSE_INSERT_CHUNK_ROWS: ${CLICKHOUSE_INSERT_CHUNK_ROWS:-10000}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_DATABASE: ${POSTGRES_DATABASE:-postgres}
@@ -78,14 +109,51 @@ services:
       - dpm_dvc_cache:/workspace/.dvc/cache
       - dpm_dagster_home:/app/dagster_home
     depends_on:
+      minio:
+        condition: service_started
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: dpm-dashboard-local:latest
+    container_name: dpm-dashboard
+    restart: unless-stopped
+    environment:
+      DAGSTER_GRAPHQL_URL: http://dagster:3000/graphql
+      DAGSTER_UI_URL: http://localhost:3000
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-telemetry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      dagster:
+        condition: service_started
 
 volumes:
   dpm_minio_data:
     name: dpm_minio_data
   dpm_postgres_data:
     name: dpm_postgres_data
+  dpm_clickhouse_data:
+    name: dpm_clickhouse_data
   dpm_dvc_cache:
     name: dpm_dvc_cache
   dpm_dagster_home:

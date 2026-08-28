@@ -1,7 +1,7 @@
 """Publish one validated processed batch through a stable DVC dataset pointer.
 
-Each logical MX dataset owns one stable pointer, for example
-``data/processed/mx10000.dvc``. Individual batches live below the tracked
+Each logical dataset owns one stable pointer, for example
+``data/processed/flightdemo.dvc``. Individual batches live below the tracked
 dataset directory and do not create their own DVC pointer files.
 
 The module exposes ``publish_processed_batch`` for Dagster assets and also has
@@ -30,6 +30,7 @@ DEFAULT_DVC_REMOTE = "minio"
 DEFAULT_DVC_REMOTE_URL = "s3://dvc-cache"
 DEFAULT_DVC_ENDPOINT_URL = "http://127.0.0.1:9000"
 SAFE_BATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SAFE_DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,16 @@ def _validate_batch_id(batch_id: str) -> str:
     return value
 
 
+def _validate_dataset_id(dataset_id: str) -> str:
+    value = dataset_id.strip().lower()
+    if not SAFE_DATASET_ID.fullmatch(value):
+        raise ValueError(
+            "dataset_id must start with an alphanumeric character and contain "
+            "only letters, digits, underscores, or hyphens."
+        )
+    return value
+
+
 def dataset_id_from_column_count(column_count: int) -> str:
     """Return the stable logical dataset name for an MX column count."""
 
@@ -99,12 +110,17 @@ def expected_batch_path(
     *,
     repo_root: Path,
     release_root: Path | str,
-    column_count: int,
+    dataset_id: str | None = None,
+    column_count: int | None = None,
     batch_id: str,
 ) -> tuple[str, Path, Path]:
     """Return dataset id, tracked dataset path, and expected batch path."""
 
-    dataset_id = dataset_id_from_column_count(column_count)
+    resolved_dataset_id = (
+        _validate_dataset_id(dataset_id)
+        if dataset_id is not None
+        else dataset_id_from_column_count(column_count or 0)
+    )
     safe_batch_id = _validate_batch_id(batch_id)
     resolved_release_root = _resolve_inside_repo(
         release_root,
@@ -114,9 +130,9 @@ def expected_batch_path(
     if resolved_release_root == repo_root:
         raise ValueError("release_root cannot be the repository root.")
 
-    dataset_path = resolved_release_root / dataset_id
+    dataset_path = resolved_release_root / resolved_dataset_id
     batch_path = dataset_path / "batches" / safe_batch_id
-    return dataset_id, dataset_path, batch_path
+    return resolved_dataset_id, dataset_path, batch_path
 
 
 def _run_dvc(repo_root: Path, arguments: list[str]) -> None:
@@ -253,7 +269,8 @@ def publish_processed_batch(
     data_path: Path | str,
     *,
     repo_root: Path | str,
-    column_count: int,
+    dataset_id: str | None = None,
+    column_count: int | None = None,
     row_count: int,
     batch_id: str,
     release_root: Path | str = DEFAULT_RELEASE_ROOT,
@@ -261,10 +278,10 @@ def publish_processed_batch(
     dvc_remote_url: str = DEFAULT_DVC_REMOTE_URL,
     dvc_endpoint_url: str = DEFAULT_DVC_ENDPOINT_URL,
 ) -> DvcPublishResult:
-    """Track and push one validated batch through its logical MX pointer.
+    """Track and push one validated batch through its logical dataset pointer.
 
     Processing must write the batch directly to the returned logical location
-    (``.../mxNNNNN/batches/<batch_id>``). Requiring that layout avoids another
+    (``.../<dataset_id>/batches/<batch_id>``). Requiring that layout avoids another
     full copy of a potentially very large processed batch.
     """
 
@@ -278,9 +295,10 @@ def publish_processed_batch(
 
     resolved_repo_root = _resolve_repo_root(repo_root)
     safe_batch_id = _validate_batch_id(batch_id)
-    dataset_id, dataset_path, required_batch_path = expected_batch_path(
+    resolved_dataset_id, dataset_path, required_batch_path = expected_batch_path(
         repo_root=resolved_repo_root,
         release_root=release_root,
+        dataset_id=dataset_id,
         column_count=column_count,
         batch_id=safe_batch_id,
     )
@@ -330,7 +348,7 @@ def publish_processed_batch(
     )
 
     result = DvcPublishResult(
-        dataset_id=dataset_id,
+        dataset_id=resolved_dataset_id,
         batch_id=safe_batch_id,
         batch_path=resolved_data_path,
         dataset_path=dataset_path,
@@ -344,7 +362,7 @@ def publish_processed_batch(
     )
 
     print("Validated processed batch published with DVC:")
-    print(f"  Dataset: {dataset_id}")
+    print(f"  Dataset: {resolved_dataset_id}")
     print(f"  Batch: {safe_batch_id}")
     print(f"  DVC pointer: {relative_pointer_path.as_posix()}")
     print(f"  DVC hash: {dvc_hash_name}:{dvc_hash}")
@@ -361,7 +379,9 @@ def parse_args() -> argparse.Namespace:
         default=Path(os.getenv("DVC_REPO_ROOT", PROJECT_ROOT)),
     )
     parser.add_argument("--release-root", type=Path, default=DEFAULT_RELEASE_ROOT)
-    parser.add_argument("--column-count", required=True, type=int)
+    dataset_group = parser.add_mutually_exclusive_group(required=True)
+    dataset_group.add_argument("--dataset-id")
+    dataset_group.add_argument("--column-count", type=int)
     parser.add_argument("--row-count", required=True, type=int)
     parser.add_argument("--batch-id", required=True)
     parser.add_argument(
@@ -385,6 +405,7 @@ def main() -> None:
         args.data_path,
         repo_root=args.repo_root,
         release_root=args.release_root,
+        dataset_id=args.dataset_id,
         column_count=args.column_count,
         row_count=args.row_count,
         batch_id=args.batch_id,

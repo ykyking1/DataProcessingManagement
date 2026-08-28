@@ -5842,14 +5842,8 @@ def render_flight_map():
         ]
     )
 
-    # streamlit-folium'un JS tarafı bazen bileşenin iframe yüksekliğini
-    # (Streamlit.setFrameHeight argümansız çağrıldığında document.body.
-    # scrollHeight'a düşüyor) kararsız ölçer; height'ı !important ile
-    # sabitlemek bunu geçersiz kılar (bkz. Alan Bazlı Filtre haritasındaki
-    # aynı düzeltme). CSS, yalnızca bu haritayı saran container'a
-    # (st.container(key=...) ile eklenen "st-key-..." sınıfı) scope
-    # edilir ki Alan Bazlı Filtre haritasının kendi (420px) yüksekliğini
-    # etkilemesin.
+    # streamlit-folium'un iframe yüksekliğini kararsız ölçmesini
+    # yalnızca uçuş rotası haritası için geçersiz kıl.
     st.markdown(
         """
         <style>

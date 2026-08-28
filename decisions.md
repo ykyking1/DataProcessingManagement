@@ -24,7 +24,7 @@
 - Başarılı, başarısız ve iptal edilmiş terminal run durumları Dagster run-status sensor'larıyla PostgreSQL'e aktarılacaktır.
 - DVC hash'i yeniden hesaplanmayacak; `dvc add` tarafından oluşturulan küçük `.dvc` pointer dosyasından okunacaktır.
 - Commit mesajı üretimi Dagster asset'lerinin sorumluluğu değildir. `scripts_new/get_commit_message.py`, tam Dagster `run_id` ile yalnızca PostgreSQL kataloğunu okuyan ayrı bir developer aracıdır.
-- Araç sadece `SUCCESS` durumundaki ve `published_mx_dataset` materialization kaydı bulunan run'lar için öneri üretir; Git commit veya push komutu çalıştırmaz.
+- Araç sadece `SUCCESS` durumundaki ve aktif yayın asset'i (`published_flight_dataset`) materialization kaydı bulunan run'lar için öneri üretir; Git commit veya push komutu çalıştırmaz.
 - Dirty pipeline run'ları engellenmez. Önerilen commit mesajında `Pipeline-Git-Dirty: true` olarak açıkça belirtilir.
 - Dagster container'ı Windows host repository'sini `/workspace` altında bind mount ettiği için container Git'inde `core.autocrlf=true` kullanılacaktır. Böylece Windows CRLF checkout'u sahte repository/pipeline dirty durumu üretmez; gerçek DVC pointer ve kod değişiklikleri dirty olarak kalmaya devam eder.
 
@@ -34,3 +34,12 @@
 - Resmî GitHub Action alt bağımlılığı dışarıdan sabitlemeye izin vermediğinden release workflow'u Python CLI kurulumuna geçirilmiştir.
 - Upstream python-semantic-release düzeltmesi yayınlanana kadar `GitPython==3.1.59` açıkça sabitlenecektir; düzeltme yayınlandığında bu geçici pin kaldırılacaktır.
 - Pipeline release kapsamı aktif `scripts_new/**`, MinIO, Docker Compose, PostgreSQL katalog şeması ve release workflow/config dosyalarını içerecektir.
+
+## 2026-08-28 — Dashboard uyumlu flight telemetry veri sözleşmesi
+
+- Aktif E2E dataset kimliği `flightdemo` olacaktır; MX geniş-kolon generator'ı yalnız bağımsız benchmark aracı olarak kalacaktır.
+- Kaynak ve işlenmiş TAB verisi dashboard'un beklediği 17 kolonlu AU-AIR uyumlu geniş şemayı kullanacaktır: `time`, konum, irtifa, hız, açı, görüntü/bounding-box, `class` ve `flight_id`.
+- Spark preprocessing bu kolonları typed hale getirecek; Great Expectations tam kolon sırası, satır sayısı, null, coğrafi sınır, bounding-box ve class kurallarını doğrulayacaktır.
+- Validation başarılı olduğunda veri ClickHouse `default.telemetry` MergeTree tablosuna geniş formatta ve `ZSTD(3)` codec ile yazılacaktır; dashboard sorguları aynı tabloyu doğrudan okuyacaktır.
+- ClickHouse retry idempotency'si teknik `source_batch_id` kolonu üzerinden sağlanacak; yalnız yeniden yüklenen batch silinip tekrar yazılacaktır.
+- DVC, işlenmiş flight verisini `data/processed/flightdemo.dvc` adlı tek ve kararlı dataset pointer'ı üzerinden versiyonlayacaktır.

@@ -27,24 +27,28 @@ from alerting import alert_on_failure, clear_alert_on_success
 from postgres_catalog import record_terminal_job_run, resolve_pipeline_identity
 
 
-raw_to_staged_job = define_asset_job(
-    name="raw_to_staged_job",
-    selection=AssetSelection.assets(assets.staged_mx_tab),
+raw_flight_to_staged_job = define_asset_job(
+    name="raw_flight_to_staged_job",
+    selection=AssetSelection.assets(assets.staged_flight_tab),
     hooks={alert_on_failure, clear_alert_on_success},
 )
 
-staged_to_published_job = define_asset_job(
-    name="staged_to_published_job",
+staged_flight_to_published_job = define_asset_job(
+    name="staged_flight_to_published_job",
     selection=AssetSelection.assets(
-        assets.processed_mx_batch,
-        assets.validated_mx_batch,
-        assets.published_mx_dataset,
+        assets.processed_flight_batch,
+        assets.validated_flight_batch,
+        assets.clickhouse_flight_batch,
+        assets.published_flight_dataset,
     ),
     hooks={alert_on_failure, clear_alert_on_success},
 )
 
 
-MONITORED_PIPELINE_JOBS = [raw_to_staged_job, staged_to_published_job]
+MONITORED_PIPELINE_JOBS = [
+    raw_flight_to_staged_job,
+    staged_flight_to_published_job,
+]
 
 
 def _record_terminal_status(context, status: str) -> None:
@@ -87,8 +91,8 @@ def postgres_run_canceled_sensor(context):
     _record_terminal_status(context, "CANCELED")
 
 
-STAGED_MX_FILE_PATTERN = re.compile(
-    r"^(?P<dataset_id>mx(?P<column_count>\d+))_"
+STAGED_FLIGHT_FILE_PATTERN = re.compile(
+    r"^(?P<dataset_id>flightdemo)_"
     r"(?P<row_count>\d+)rows(?:[_-].*)?\.tab\.zst$",
     flags=re.IGNORECASE,
 )
@@ -115,20 +119,20 @@ def _job_has_active_run(context, job_name: str) -> bool:
 
 
 @sensor(
-    job=raw_to_staged_job,
+    job=raw_flight_to_staged_job,
     minimum_interval_seconds=30,
     default_status=DefaultSensorStatus.RUNNING,
     description=(
-        "Watches raw MX .tab objects in MinIO and launches one staging run "
+        "Watches raw flight .tab objects in MinIO and launches one staging run "
         "for each new object key/ETag combination."
     ),
 )
-def raw_minio_sensor(context):
-    if _job_has_active_run(context, raw_to_staged_job.name):
+def raw_flight_minio_sensor(context):
+    if _job_has_active_run(context, raw_flight_to_staged_job.name):
         return SkipReason("A raw-to-staged run is already active.")
 
     source_bucket = os.getenv("MINIO_RAW_BUCKET", assets.DEFAULT_RAW_BUCKET)
-    source_prefix = os.getenv("MINIO_RAW_PREFIX", "mx-tab/inbox/").strip("/")
+    source_prefix = os.getenv("MINIO_RAW_PREFIX", "flight-tab/inbox/").strip("/")
     if source_prefix:
         source_prefix = f"{source_prefix}/"
 
@@ -168,7 +172,7 @@ def raw_minio_sensor(context):
             run_key=f"raw-minio:{object_identity}:{source_etag}",
             run_config={
                 "ops": {
-                    "staged_mx_tab": {
+                    "staged_flight_tab": {
                         "config": {
                             "source_bucket": source_bucket,
                             "source_key": item.object_name,
@@ -190,16 +194,16 @@ def raw_minio_sensor(context):
 
 
 @sensor(
-    job=staged_to_published_job,
+    job=staged_flight_to_published_job,
     minimum_interval_seconds=30,
     default_status=DefaultSensorStatus.RUNNING,
     description=(
-        "Watches staged MX .tab.zst objects in MinIO and launches the "
-        "Spark -> GE -> DVC workflow for each new object key/ETag pair."
+        "Watches staged flight .tab.zst objects in MinIO and launches the "
+        "Spark -> GE -> ClickHouse + DVC workflow for each object key/ETag pair."
     ),
 )
-def staged_minio_sensor(context):
-    if _job_has_active_run(context, staged_to_published_job.name):
+def staged_flight_minio_sensor(context):
+    if _job_has_active_run(context, staged_flight_to_published_job.name):
         return SkipReason("A staged-to-published run is already active.")
 
     source_bucket = os.getenv(
@@ -244,7 +248,7 @@ def staged_minio_sensor(context):
             continue
 
         file_name = PurePosixPath(item.object_name).name
-        match = STAGED_MX_FILE_PATTERN.fullmatch(file_name)
+        match = STAGED_FLIGHT_FILE_PATTERN.fullmatch(file_name)
         if match is None:
             context.log.warning(
                 "Ignoring staged object with an unsupported name: s3://%s/%s",
@@ -258,7 +262,7 @@ def staged_minio_sensor(context):
         dataset_id = match.group("dataset_id").lower()
         batch_id = file_name[: -len(".tab.zst")]
         row_count = int(match.group("row_count"))
-        column_count = int(match.group("column_count"))
+        column_count = assets.FLIGHT_COLUMN_COUNT
 
         observed_etags[object_identity] = source_etag
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))
@@ -266,7 +270,7 @@ def staged_minio_sensor(context):
             run_key=f"staged-minio:{object_identity}:{source_etag}",
             run_config={
                 "ops": {
-                    "processed_mx_batch": {
+                    "processed_flight_batch": {
                         "config": {
                             "source_bucket": source_bucket,
                             "source_key": item.object_name,
@@ -298,15 +302,16 @@ def staged_minio_sensor(context):
 
 defs = Definitions(
     assets=[
-        assets.staged_mx_tab,
-        assets.processed_mx_batch,
-        assets.validated_mx_batch,
-        assets.published_mx_dataset,
+        assets.staged_flight_tab,
+        assets.processed_flight_batch,
+        assets.validated_flight_batch,
+        assets.clickhouse_flight_batch,
+        assets.published_flight_dataset,
     ],
-    jobs=[raw_to_staged_job, staged_to_published_job],
+    jobs=[raw_flight_to_staged_job, staged_flight_to_published_job],
     sensors=[
-        raw_minio_sensor,
-        staged_minio_sensor,
+        raw_flight_minio_sensor,
+        staged_flight_minio_sensor,
         postgres_run_success_sensor,
         postgres_run_failure_sensor,
         postgres_run_canceled_sensor,

@@ -128,10 +128,10 @@ def _build_commit_message(
             f"{run['dagster_run_id']} ({run['run_status']})"
         )
 
-    published = assets.get("published_mx_dataset")
+    published = assets.get("published_flight_dataset")
     if published is None:
         raise CommitMessageError(
-            "Run başarılı olsa da published_mx_dataset kaydı bulunamadı; "
+            "Run başarılı olsa da published_flight_dataset kaydı bulunamadı; "
             "commit önerisi üretmek güvenli değil."
         )
 
@@ -141,7 +141,7 @@ def _build_commit_message(
         raise CommitMessageError("Run kaydında dataset_id veya batch_id eksik.")
 
     published_metadata = published.get("metadata") or {}
-    validation = assets.get("validated_mx_batch") or {}
+    validation = assets.get("validated_flight_batch") or {}
     validation_metadata = validation.get("metadata") or {}
 
     dvc_hash_name = published_metadata.get("dvc_hash_name")
