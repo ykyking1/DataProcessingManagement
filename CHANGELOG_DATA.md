@@ -2,6 +2,16 @@
 
 <!-- version list -->
 
+## v0.2.4-rc.2 (2026-08-28)
+
+**Data processed with `pipeline-v0.5.0-rc.3` (`b0889010b35046253f4af0e724e7a5ac76b94d9e`)**
+
+### Data
+
+- **mx10000**: Publish mx10000_5000rows_e2e04
+  ([`7830720`](https://github.com/ykyking1/DataProcessingManagement/commit/78307209cd6a5a1523c55e41c8639a95f6925113))
+
+
 ## v0.2.4-rc.1 (2026-08-27)
 
 **Data processed with `unreleased-ce02448-dirty` (`ce024487f14c3ceb6cdc938215f88003593b67b0`)**
