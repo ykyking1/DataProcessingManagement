@@ -65,6 +65,7 @@ Dashboard bölümleri:
 import io
 import json
 import os
+import re
 import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -1037,7 +1038,30 @@ def build_clickhouse_where(
             value = value_filter.get("value")
             exclude = value_filter.get("exclude", False)
 
-            if column not in available_columns:
+            hesaplanan = COMPUTED_VALUE_COLUMNS.get(column)
+
+            if hesaplanan is not None:
+
+                # Gerçek bir kolon DEĞİL -- sabit, kod içinde tanımlı
+                # bir SQL ifadesi (kullanıcı girdisinden gelmez, bu
+                # yüzden parametre bağlamaya gerek yok / injection
+                # riski taşımaz). Yalnızca ifadenin dayandığı ham
+                # kolonlar (ör. velocity_x, velocity_y) tabloda
+                # gerçekten varsa uygulanır.
+
+                if not all(
+                    c in available_columns
+                    for c in hesaplanan["gereken_kolonlar"]
+                ):
+                    continue
+
+                kolon_ifadesi = f"({hesaplanan['ifade']})"
+
+            elif column in available_columns:
+
+                kolon_ifadesi = f"`{column}`"
+
+            else:
                 continue
 
             if operator == RANGE_FILTER_OPERATOR:
@@ -1051,7 +1075,7 @@ def build_clickhouse_where(
                 param_max = f"value_filter_{index}_max"
 
                 between_expr = (
-                    f"`{column}` BETWEEN "
+                    f"{kolon_ifadesi} BETWEEN "
                     f"{{{param_min}:Float64}} AND {{{param_max}:Float64}}"
                 )
 
@@ -1075,7 +1099,7 @@ def build_clickhouse_where(
             param_name = f"value_filter_{index}"
 
             comparison_expr = (
-                f"`{column}` "
+                f"{kolon_ifadesi} "
                 f"{VALUE_FILTER_OPERATORS[operator]} "
                 f"{{{param_name}:Float64}}"
             )
@@ -4863,7 +4887,10 @@ def render_data_export():
                     or vf["operator"] == RANGE_FILTER_OPERATOR
                 )
 
-                if vf["column"] in numeric_columns and valid_operator:
+                if (
+                    vf["column"] in numeric_columns
+                    or vf["column"] in COMPUTED_VALUE_COLUMNS
+                ) and valid_operator:
 
                     restored_filter_row = {
                         "id": index,
