@@ -56,6 +56,7 @@ sıcaklık, ısı, sıcak, soğuk             → sicaklik
 motor, devir, rpm                       → motor_devri
 enlem, lat, latitude                    → enlem
 boylam, lon, longitude                  → boylam
+enlem / boylam                          → enlem / boylam
 saat 7 ile 9 arası, saat 18-21 arasında → gun_ici_saat
 4 saatten kısa/uzun süren uçuş         → ucus_suresi
 
