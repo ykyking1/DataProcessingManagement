@@ -646,6 +646,776 @@ VALUE_FILTER_OPERATORS = {
 RANGE_FILTER_OPERATOR = "between"
 
 
+# ============================================================
+# LLM DOĞAL DİL FİLTRE ENTEGRASYONU (qwen_benchmark.py)
+# ============================================================
+#
+# "🤖 Doğal Dil ile Filtrele" kutusuna yazılan Türkçe sorgu, yerelde
+# çalışan Ollama üzerinden qwen3:1.7b modeline gönderilir (bkz.
+# qwen_benchmark.py -- SYSTEM_PROMPT, sorgula(), son_islem()). Modelin
+# döndürdüğü {"filtreler": [...], "mantik": ..., "zaman_araligi": ...}
+# JSON'u burada, panonun TÜM elle doldurulan bölümlerinin karşılık
+# geldiği session_state anahtarlarına çevrilir (bkz. render_data_export):
+#   - value_filters                                (Değer Bazlı Filtreler)
+#   - export_start_time / export_end_time / _mode  (Zaman aralığı)
+#   - export_selected_hours / _mode                (gun_ici_saat -> Saat filtresi)
+#   - export_duration_*                            (ucus_suresi -> Uçuş süresi)
+#   - export_selected_classes                      (Class -- deterministik eşleşme)
+#   - export_selected_flights / _mode              (Uçuş -- deterministik eşleşme)
+# yani LLM, formu kullanıcının yerine doldurmuş gibi davranır.
+#
+# ÖNEMLİ SINIRLAMALAR:
+#   - qwen_benchmark.py; batarya, sicaklik, motor_devri, basinc gibi
+#     alanları da tanıyabiliyor, ancak AU-AIR şemasında bunların karşılığı
+#     YOK (bkz. AU_AIR_COLUMNS). Böyle bir alan geçen sorgular sessizce
+#     yok sayılmaz, kullanıcıya "desteklenmiyor" olarak bildirilir.
+#     "hiz" bunun İSTİSNASIdır -- gerçek bir kolon olmasa da
+#     velocity_x/velocity_y'den hesaplanabildiği için desteklenir (bkz.
+#     COMPUTED_VALUE_COLUMNS).
+#   - Pano, değer bazlı filtrelerde yalnızca "VE" (AND) birleşimini
+#     destekliyor (bkz. build_clickhouse_where). Model "mantik": "OR"
+#     döndürürse filtreler yine eklenir ama kullanıcıya bunun AND olarak
+#     uygulanacağı açıkça belirtilir.
+#   - Class, uçuş (flight_id) ve kolon adı eşleştirmesi LLM'DEN GEÇMEZ --
+#     bunlar veri setine özgü kapalı kelime listeleri olduğu için sorgu
+#     metni, get_available_classes() / get_available_flights() /
+#     get_available_columns()'ın döndürdüğü GERÇEK değerlerle
+#     deterministik olarak karşılaştırılır (bkz. llm_sinif_filtresini_
+#     belirle / llm_ucus_filtresini_belirle / llm_kolon_filtresini_
+#     belirle) -- halüsinasyon riski taşımaz ama SYSTEM_PROMPT'ta da yer
+#     almaz.
+#   - "hariç" / "dışında" tespiti (llm_haric_mi) basit bir yakınlık
+#     sezgiselidir, tam bir dilbilgisi çözümleyicisi değildir; birden
+#     fazla dışlama içeren karmaşık cümlelerde yanlış eşleşebilir --
+#     sonuç her zaman "🔎 Aktif filtre" özetiyle kontrol edilmelidir.
+#   - Harita alanı (poligon) filtresi buradan hiç desteklenmiyor --
+#     serbest metinden güvenilir bir coğrafi poligon çıkarmak (geocoding
+#     gerektirir) kapsam dışı bırakıldı, elle çizilmeye devam ediyor.
+
+try:
+    from qwen_benchmark import sorgula as _llm_sorgula
+    from qwen_benchmark import son_islem as _llm_son_islem
+    _LLM_IMPORT_HATASI = None
+except Exception as _llm_import_exc:  # ollama kurulu değil, dosya yok vb.
+    _llm_sorgula = None
+    _llm_son_islem = None
+    _LLM_IMPORT_HATASI = str(_llm_import_exc)
+
+
+# qwen_benchmark.py'deki "alan" adları -> gerçek ClickHouse kolonu.
+# Şemada karşılığı olmayan alanlar (batarya, sicaklik, motor_devri,
+# basinc...) BİLEREK burada yok; bkz. yukarıdaki not.
+LLM_ALAN_TO_COLUMN = {
+    "irtifa": "altitude",
+    "yatis_acisi": "roll",
+    "yunuslama_acisi": "pitch",
+    "sapma_acisi": "yaw",
+    "dikey_hiz": "velocity_z",
+    "enlem": "latitude",
+    "boylam": "longitude",
+    "hiz": "hiz",
+}
+
+# "hiz" (yer hızı / ground speed), AU-AIR'de tek bir kolon DEĞİLDİR --
+# velocity_x/velocity_y bileşenlerinden hesaplanır (dikey bileşen
+# velocity_z zaten ayrı olarak dikey_hiz'de karşılanıyor, o yüzden
+# burada yalnızca yatay bileşenler kullanılır). "ifade" alanı SABİT,
+# kod içinde tanımlı bir SQL ifadesidir (kullanıcı girdisinden gelmez),
+# bu yüzden build_clickhouse_where içinde parametre bağlamaya gerek
+# duymadan doğrudan sorguya eklenebilir -- injection riski taşımaz.
+COMPUTED_VALUE_COLUMNS = {
+    "hiz": {
+        "ifade": (
+            "sqrt(velocity_x * velocity_x + velocity_y * velocity_y)"
+        ),
+        "gereken_kolonlar": ["velocity_x", "velocity_y"],
+    },
+}
+
+# qwen_benchmark operatörü -> VALUE_FILTER_OPERATORS / RANGE_FILTER_OPERATOR
+LLM_OPERATOR_TO_FILTER_OP = {
+    "<": "<",
+    "<=": "<=",
+    ">": ">",
+    ">=": ">=",
+    "==": "=",
+    "!=": "!=",
+    "between": RANGE_FILTER_OPERATOR,
+}
+
+
+def llm_gun_ici_saat_filtresini_ayikla(filtreler: list):
+    """
+    qwen_benchmark'ın "gun_ici_saat" alanıyla döndürdüğü filtreleri
+    (ör. "saat 7 ile 9 arası") filtreler listesinden ayırıp, panonun
+    "Saat filtresi" (export_selected_hours -> toHour(time) IN (...))
+    widget'ının beklediği 0-23 arası tam sayı listesine çevirir.
+
+    "gun_ici_saat" gerçek bir ClickHouse kolonu DEĞİLDİR (time'dan
+    türetilir), bu yüzden LLM_ALAN_TO_COLUMN / llm_filtreleri_donustur
+    üzerinden değil, ayrı bu fonksiyonla işlenir.
+
+    Döner: (kalan_filtreler, saat_listesi_veya_None, uyari_veya_None)
+    """
+
+    kalan = []
+    saatler = None
+    uyari = None
+
+    for f in (filtreler or []):
+
+        if not isinstance(f, dict) or f.get("alan") != "gun_ici_saat":
+            kalan.append(f)
+            continue
+
+        operator = f.get("operator")
+        deger = f.get("deger")
+
+        if operator is None or deger is None:
+            uyari = (
+                "Saat filtresi için net bir aralık anlaşılamadı, "
+                "atlandı."
+            )
+            continue
+
+        try:
+
+            if operator == RANGE_FILTER_OPERATOR:
+
+                if not isinstance(deger, list) or len(deger) != 2:
+                    raise ValueError("aralık iki değer içermiyor")
+
+                bas, bit = int(min(deger)), int(max(deger))
+                saatler = list(range(max(bas, 0), min(bit, 23) + 1))
+
+            elif operator == "==":
+                saatler = [int(deger)]
+
+            elif operator in (">", ">="):
+                alt = int(deger) if operator == ">=" else int(deger) + 1
+                saatler = list(range(max(alt, 0), 24))
+
+            elif operator in ("<", "<="):
+                ust = int(deger) if operator == "<=" else int(deger) - 1
+                saatler = list(range(0, min(ust, 23) + 1))
+
+            else:
+                uyari = (
+                    f"Saat filtresi için '{operator}' operatörü "
+                    "desteklenmiyor, atlandı."
+                )
+                continue
+
+        except (TypeError, ValueError):
+            uyari = (
+                f"Saat filtresi için sayısal olmayan bir değer geldi "
+                f"({deger!r}), atlandı."
+            )
+            continue
+
+    return kalan, saatler, uyari
+
+
+def llm_ucus_suresi_filtresini_ayikla(filtreler: list):
+    """
+    qwen_benchmark'ın "ucus_suresi" alanıyla döndürdüğü filtreleri
+    (ör. "4 saatten kısa süren uçuşlar") filtreler listesinden ayırıp,
+    panonun "⏱️ Uçuş süresine göre filtrele" bölümünün kullandığı
+    duration_filter sözlüğüne ({"operator": ..., "hours": ...,
+    "hours2": ...}) çevirir.
+
+    "ucus_suresi" de gun_ici_saat gibi gerçek bir ClickHouse kolonu
+    DEĞİLDİR (her uçuşun min(time)/max(time) farkından hesaplanır),
+    bu yüzden LLM_ALAN_TO_COLUMN üzerinden değil, ayrı bu fonksiyonla
+    işlenir.
+
+    Döner: (kalan_filtreler, duration_filter_veya_None, uyari_veya_None)
+    """
+
+    kalan = []
+    duration_filter = None
+    uyari = None
+
+    for f in (filtreler or []):
+
+        if not isinstance(f, dict) or f.get("alan") != "ucus_suresi":
+            kalan.append(f)
+            continue
+
+        operator = f.get("operator")
+        deger = f.get("deger")
+
+        if operator is None or deger is None:
+            uyari = (
+                "Uçuş süresi filtresi için net bir eşik anlaşılamadı, "
+                "atlandı."
+            )
+            continue
+
+        if operator not in VALUE_FILTER_OPERATORS and (
+            operator != RANGE_FILTER_OPERATOR
+        ):
+            uyari = (
+                f"Uçuş süresi filtresi için '{operator}' operatörü "
+                "desteklenmiyor, atlandı."
+            )
+            continue
+
+        try:
+
+            if operator == RANGE_FILTER_OPERATOR:
+
+                if not isinstance(deger, list) or len(deger) != 2:
+                    raise ValueError("aralık iki değer içermiyor")
+
+                duration_filter = {
+                    "operator": RANGE_FILTER_OPERATOR,
+                    "hours": float(min(deger)),
+                    "hours2": float(max(deger)),
+                }
+
+            else:
+                duration_filter = {
+                    "operator": operator,
+                    "hours": float(deger),
+                }
+
+        except (TypeError, ValueError):
+            uyari = (
+                "Uçuş süresi filtresi için sayısal olmayan bir değer "
+                f"geldi ({deger!r}), atlandı."
+            )
+            continue
+
+    return kalan, duration_filter, uyari
+
+
+def llm_filtreleri_donustur(
+    filtreler: list,
+    numeric_columns: list,
+    baslangic_id: int = 0,
+):
+    """
+    qwen_benchmark.sorgula() (+ son_islem()) çıktısındaki "filtreler"
+    listesini, "🎯 Class ve Değer Bazlı Filtreler" bölümünün kullandığı
+    value_filter satırlarına dönüştürür.
+
+    id'ler baslangic_id'den itibaren artan şekilde verilir (0'dan
+    başlanmaz) -- aksi halde daha önce elle eklenip silinmiş bir
+    filtrenin widget'larına ait eski session_state değerleri (ör.
+    value_filter_operator_0), aynı id yeniden kullanıldığında geri
+    sızabilir.
+
+    Döner: (value_filter_satirlari, atlanan_aciklamalari)
+    """
+
+    satirlar = []
+    atlananlar = []
+    sonraki_id = baslangic_id
+
+    for f in (filtreler or []):
+
+        if not isinstance(f, dict):
+            continue
+
+        alan = f.get("alan")
+        operator = f.get("operator")
+        deger = f.get("deger")
+
+        column = LLM_ALAN_TO_COLUMN.get(alan)
+
+        if column is None:
+            atlananlar.append(
+                f"'{alan}' alanının AU-AIR verisinde karşılığı "
+                "olmadığı için atlandı."
+            )
+            continue
+
+        hesaplanan = COMPUTED_VALUE_COLUMNS.get(column)
+
+        if hesaplanan is not None:
+
+            eksik_kolonlar = [
+                c
+                for c in hesaplanan["gereken_kolonlar"]
+                if c not in numeric_columns
+            ]
+
+            if eksik_kolonlar:
+                atlananlar.append(
+                    f"'{column}' hesaplanan alanı için gereken "
+                    f"{', '.join(eksik_kolonlar)} kolon(u/ları) "
+                    "tabloda bulunamadı, atlandı."
+                )
+                continue
+
+        elif column not in numeric_columns:
+            atlananlar.append(
+                f"'{column}' kolonu şu an ClickHouse tablosunda "
+                "sayısal olarak bulunamadı, atlandı."
+            )
+            continue
+
+        if operator is None or deger is None:
+            atlananlar.append(
+                f"'{column}' için net bir eşik değeri anlaşılamadı "
+                "(ör. \"çok yüksek\" gibi belirsiz bir ifade), bu "
+                "filtre atlandı."
+            )
+            continue
+
+        filtre_op = LLM_OPERATOR_TO_FILTER_OP.get(operator)
+
+        if filtre_op is None:
+            atlananlar.append(
+                f"'{column}' için '{operator}' operatörü tanınmadı, "
+                "atlandı."
+            )
+            continue
+
+        satir = {
+            "id": sonraki_id,
+            "column": column,
+            "operator": filtre_op,
+            "exclude": False,
+        }
+
+        if filtre_op == RANGE_FILTER_OPERATOR:
+
+            if not isinstance(deger, list) or len(deger) != 2:
+                atlananlar.append(
+                    f"'{column}' için aralık (min-maks) değeri "
+                    "anlaşılamadı, atlandı."
+                )
+                continue
+
+            try:
+                satir["value"] = float(min(deger))
+                satir["value2"] = float(max(deger))
+            except (TypeError, ValueError):
+                atlananlar.append(
+                    f"'{column}' için sayısal olmayan bir aralık "
+                    f"geldi ({deger!r}), atlandı."
+                )
+                continue
+
+        else:
+
+            try:
+                satir["value"] = float(deger)
+            except (TypeError, ValueError):
+                atlananlar.append(
+                    f"'{column}' için sayısal olmayan bir değer "
+                    f"geldi ({deger!r}), atlandı."
+                )
+                continue
+
+        satirlar.append(satir)
+        sonraki_id += 1
+
+    return satirlar, atlananlar
+
+
+_LLM_ZAMAN_SAYI_BIRIM_REGEX = re.compile(r"(\d+)\s*(dakika|saat)", re.I)
+
+# qwen_benchmark'ın SYSTEM_PROMPT'undaki ZAMAN İFADELERİ listesi yalnızca
+# GÖRELİ ifadeleri kapsıyor ("son 1 saat", "bugün" vb.) -- kesin takvim
+# tarihleri (ör. "20 haziran 2025") o listede YOK. Model yine de -- "aynen
+# kopyala" talimatına uyarak -- böyle bir ifadeyi olduğu gibi zaman_araligi
+# alanına koyuyor; bu yüzden burada, göreli ifadelerden hiçbiri
+# eşleşmediğinde, ayrı bir MUTLAK TARİH ayrıştırıcısına düşülür.
+
+_LLM_TR_AYLAR = {
+    "ocak": 1, "şubat": 2, "subat": 2, "mart": 3, "nisan": 4,
+    "mayıs": 5, "mayis": 5, "haziran": 6, "temmuz": 7,
+    "ağustos": 8, "agustos": 8, "eylül": 9, "eylul": 9,
+    "ekim": 10, "kasım": 11, "kasim": 11, "aralık": 12, "aralik": 12,
+}
+
+_LLM_TARIH_ISIM_REGEX = re.compile(
+    r"(\d{1,2})\s+(" + "|".join(_LLM_TR_AYLAR.keys()) + r")\s+(\d{4})",
+    re.I,
+)
+_LLM_TARIH_SAYISAL_REGEX = re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b")
+_LLM_TARIH_ISO_REGEX = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+
+
+def _llm_mutlak_tarihleri_bul(ifade: str):
+    """
+    ifade içinde geçen kesin (mutlak) tarihleri, cümledeki geçiş
+    sırasına göre bir datetime.date listesi olarak döner. "20 haziran
+    2025", "20.06.2025", "2025-06-20" biçimlerini tanır. Geçersiz bir
+    tarih (ör. 32. gün) sessizce atlanır.
+    """
+
+    bulunanlar = []
+
+    for eslesme in _LLM_TARIH_ISIM_REGEX.finditer(ifade):
+        try:
+            bulunanlar.append((
+                eslesme.start(),
+                date(
+                    int(eslesme.group(3)),
+                    _LLM_TR_AYLAR[_tr_kucuk(eslesme.group(2))],
+                    int(eslesme.group(1)),
+                ),
+            ))
+        except ValueError:
+            continue
+
+    for eslesme in _LLM_TARIH_SAYISAL_REGEX.finditer(ifade):
+        try:
+            gun, ay, yil = (int(g) for g in eslesme.groups())
+            bulunanlar.append((eslesme.start(), date(yil, ay, gun)))
+        except ValueError:
+            continue
+
+    for eslesme in _LLM_TARIH_ISO_REGEX.finditer(ifade):
+        try:
+            yil, ay, gun = (int(g) for g in eslesme.groups())
+            bulunanlar.append((eslesme.start(), date(yil, ay, gun)))
+        except ValueError:
+            continue
+
+    bulunanlar.sort(key=lambda x: x[0])
+
+    return [tarih for _, tarih in bulunanlar]
+
+
+def llm_zaman_araligini_coz(ifade: str, referans: datetime):
+    """
+    qwen_benchmark'ın ürettiği "zaman_araligi" ifadesini (göreli --
+    "son 10 dakika", "bugün", "dün"-- ya da mutlak -- "20 haziran
+    2025", "20 haziran 2025 ile 19 eylül 2025 arası" --) (baslangic,
+    bitis) datetime çiftine çevirir.
+
+    "referans" gerçek saat DEĞİL, verideki EN SON zaman damgası
+    (get_time_range()'in döndürdüğü max_time) olmalıdır -- aksi halde
+    geçmişe ait bir telemetri kümesinde göreli ifadeler ("son 1 saat")
+    her zaman boş sonuç döner.
+
+    Çözümlenemezse None döner (zaman aralığı değiştirilmez).
+    """
+
+    if not ifade:
+        return None
+
+    ifade_l = ifade.strip().lower()
+
+    if "yarım saat" in ifade_l:
+        return referans - timedelta(minutes=30), referans
+
+    if ifade_l == "bugün":
+        gun_baslangic = datetime.combine(
+            referans.date(), datetime.min.time()
+        )
+        return gun_baslangic, referans
+
+    if ifade_l == "dün":
+        dun = referans.date() - timedelta(days=1)
+        return (
+            datetime.combine(dun, datetime.min.time()),
+            datetime.combine(dun, datetime.max.time()),
+        )
+
+    if "bu sabah" in ifade_l:
+        gun_baslangic = datetime.combine(
+            referans.date(), datetime.min.time()
+        )
+        return gun_baslangic + timedelta(hours=6), referans
+
+    eslesme = _LLM_ZAMAN_SAYI_BIRIM_REGEX.search(ifade_l)
+
+    if eslesme:
+        sayi = int(eslesme.group(1))
+        birim = eslesme.group(2)
+        delta = (
+            timedelta(minutes=sayi)
+            if birim == "dakika"
+            else timedelta(hours=sayi)
+        )
+        return referans - delta, referans
+
+    # Hiçbir göreli kalıp eşleşmedi -- mutlak takvim tarihi(leri) dene.
+
+    mutlak_tarihler = _llm_mutlak_tarihleri_bul(ifade)
+
+    if len(mutlak_tarihler) >= 2:
+
+        bas, bit = min(mutlak_tarihler), max(mutlak_tarihler)
+
+        return (
+            datetime.combine(bas, datetime.min.time()),
+            datetime.combine(bit, datetime.max.time()),
+        )
+
+    if len(mutlak_tarihler) == 1:
+
+        tek = mutlak_tarihler[0]
+
+        return (
+            datetime.combine(tek, datetime.min.time()),
+            datetime.combine(tek, datetime.max.time()),
+        )
+
+    return None
+
+
+# ------------------------------------------------------------
+# SINIF (class) VE UÇUŞ (flight_id) EŞLEŞTİRME
+# ------------------------------------------------------------
+#
+# Bu ikisi, qwen3:1.7b'nin önceden BİLEMEYECEĞİ, veri setine özgü
+# kapalı kelime listeleridir (class değerleri AU-AIR etiketleridir,
+# flight_id'ler ingestion sırasında dosya adından türetilir -- bkz.
+# ingestion.py). Modele bunları "tahmin ettirmek" yerine, sorgu
+# metninde GEÇEN kelimeler doğrudan get_available_classes() /
+# get_available_flights()'ın döndürdüğü GERÇEK değerlerle (ve birkaç
+# yaygın Türkçe eş anlamlıyla) karşılaştırılır -- halüsinasyon riski
+# taşımayan, deterministik bir eşleştirme; bu yüzden SYSTEM_PROMPT'a
+# eklenmedi.
+
+LLM_SINIF_ESANLAMLI = {
+    "insan": "human", "yaya": "human", "kişi": "human", "kisi": "human",
+    "araba": "car", "otomobil": "car", "araç": "car", "arac": "car",
+    "kamyon": "truck",
+    "van": "van", "minibüs": "van", "minibus": "van",
+    "motosiklet": "motorbike", "motor": "motorbike",
+    "bisiklet": "bicycle",
+    "otobüs": "bus", "otobus": "bus",
+    "römork": "trailer", "romork": "trailer", "treyler": "trailer",
+}
+
+
+def _tr_kucuk(metin: str) -> str:
+    """
+    Türkçe'ye duyarlı küçük harfe çevirme. Python'un standart
+    str.lower() metodu BÜYÜK "İ" harfini "i" değil "i̇" (nokta
+    işaretiyle birleşik, iki karakter) yapar -- bu da "İnsan" gibi bir
+    kelimenin "insan" eş anlamlısıyla eşleşmesini SESSİZCE bozar. Bu
+    yüzden Türkçe metin karşılaştırmalarında (kelime eşleştirme,
+    "hariç" sezgiseli) her zaman .lower() yerine bu fonksiyon
+    kullanılır.
+    """
+
+    return metin.replace("İ", "i").replace("I", "ı").lower()
+
+
+def _llm_kelime_gecer_mi(kelime: str, metin: str) -> bool:
+
+    if not kelime:
+        return False
+
+    return re.search(
+        r"(?<![\wğüşıöçİĞÜŞÖÇ])"
+        + re.escape(_tr_kucuk(kelime))
+        + r"(?![\wğüşıöçİĞÜŞÖÇ])",
+        _tr_kucuk(metin),
+    ) is not None
+
+
+def llm_sinif_filtresini_belirle(sorgu: str, mevcut_siniflar: list):
+    """
+    Sorgu metninde geçen class adlarını (doğrudan ya da Türkçe eş
+    anlamlısıyla) mevcut_siniflar (get_available_classes()) ile
+    eşleştirir. Eşleşme yoksa boş liste döner (mevcut tüm class'lar
+    dahil edilmiş sayılır -- bkz. multiselect'in "boş = hepsi" kuralı).
+    """
+
+    if not sorgu or not mevcut_siniflar:
+        return []
+
+    eslesenler = []
+    mevcut_kucuk = {_tr_kucuk(c): c for c in mevcut_siniflar}
+
+    for sinif_kucuk, gercek in mevcut_kucuk.items():
+
+        if (
+            _llm_kelime_gecer_mi(sinif_kucuk, sorgu)
+            and gercek not in eslesenler
+        ):
+            eslesenler.append(gercek)
+
+    for esanlamli, ingilizce in LLM_SINIF_ESANLAMLI.items():
+
+        if not _llm_kelime_gecer_mi(esanlamli, sorgu):
+            continue
+
+        gercek = mevcut_kucuk.get(_tr_kucuk(ingilizce))
+
+        if gercek and gercek not in eslesenler:
+            eslesenler.append(gercek)
+
+    return eslesenler
+
+
+def llm_ucus_filtresini_belirle(sorgu: str, mevcut_ucuslar: list):
+    """
+    Sorgu metninde GEÇEN uçuş kimliklerini (ör. "flight_2") doğrudan
+    mevcut_ucuslar (get_available_flights()) ile eşleştirir.
+    """
+
+    if not sorgu or not mevcut_ucuslar:
+        return []
+
+    return [
+        ucus
+        for ucus in mevcut_ucuslar
+        if _llm_kelime_gecer_mi(ucus, sorgu)
+    ]
+
+
+# ------------------------------------------------------------
+# KOLON SEÇİMİ ("sadece X kolonunu göster")
+# ------------------------------------------------------------
+#
+# Bu bir SATIR FİLTRESİ değildir -- hangi satırların geleceğini değil,
+# gelen satırlarda hangi KOLONLARIN gösterileceğini/dışa aktarılacağını
+# belirler (bkz. "📋 Kolonlar"). LLM'e sorulmaz (class/flight_id gibi
+# deterministik eşleştirilir); üstelik yanlışlıkla HER filtre
+# sorgusunda tetiklenmemesi için yalnızca cümlede "kolon" kelimesiyle
+# birlikte "sadece/yalnızca" ya da "hariç/dışında" geçtiğinde devreye
+# girer -- aksi halde "irtifası 300'ün altındaki kayıtlar" gibi sıradan
+# bir filtre sorgusu bile yanlışlıkla kolon seçimi sanılabilirdi.
+
+LLM_KOLON_ESANLAMLI = {
+    "zaman": "time", "tarih": "time",
+    "enlem": "latitude", "lat": "latitude",
+    "boylam": "longitude", "lon": "longitude", "lng": "longitude",
+    "irtifa": "altitude", "yükseklik": "altitude",
+    "yukseklik": "altitude", "rakım": "altitude", "rakim": "altitude",
+    "yatış açısı": "roll", "yatis acisi": "roll",
+    "yunuslama açısı": "pitch", "yunuslama acisi": "pitch",
+    "sapma açısı": "yaw", "sapma acisi": "yaw",
+    "dikey hız": "velocity_z", "dikey hiz": "velocity_z",
+    "sınıf": "class", "sinif": "class",
+    "uçuş kimliği": "flight_id", "ucus kimligi": "flight_id",
+    "uçuş no": "flight_id", "ucus no": "flight_id",
+    "görüntü adı": "image_name", "goruntu adi": "image_name",
+    "resim adı": "image_name", "resim adi": "image_name",
+}
+
+_LLM_KOLON_KELIMESI = re.compile(r"\bkolon(u|unu|ları|larını|lar)?\b", re.I)
+_LLM_SADECE_KELIMELER = re.compile(r"\bsadece\b|\byalnızca\b|\byalniz\b", re.I)
+
+
+def llm_kolon_secimi_istegi_mi(sorgu: str) -> bool:
+    """
+    Sorgunun bir kolon seçimi/dışa aktarma isteği olup olmadığını
+    belirler -- "kolon" kelimesi TEK BAŞINA yeterli sayılmaz (yanlış
+    pozitif riski yüksek), "sadece/yalnızca" ya da "hariç/dışında" ile
+    BİRLİKTE geçmesi aranır.
+    """
+
+    if not sorgu or not _LLM_KOLON_KELIMESI.search(sorgu):
+        return False
+
+    return bool(
+        _LLM_SADECE_KELIMELER.search(sorgu)
+        or _LLM_HARIC_KELIMELER.search(sorgu)
+    )
+
+
+def llm_kolon_filtresini_belirle(sorgu: str, mevcut_kolonlar: list):
+    """
+    Sorgu metninde geçen kolon adlarını (doğrudan gerçek kolon adıyla
+    ya da Türkçe eş anlamlısıyla) mevcut_kolonlar (get_available_columns())
+    ile eşleştirir.
+    """
+
+    if not sorgu or not mevcut_kolonlar:
+        return []
+
+    eslesenler = []
+    mevcut_kucuk = {_tr_kucuk(c): c for c in mevcut_kolonlar}
+
+    for kolon_kucuk, gercek in mevcut_kucuk.items():
+
+        if (
+            _llm_kelime_gecer_mi(kolon_kucuk, sorgu)
+            and gercek not in eslesenler
+        ):
+            eslesenler.append(gercek)
+
+    for esanlamli, gercek_ad in LLM_KOLON_ESANLAMLI.items():
+
+        if not _llm_kelime_gecer_mi(esanlamli, sorgu):
+            continue
+
+        gercek = mevcut_kucuk.get(_tr_kucuk(gercek_ad))
+
+        if gercek and gercek not in eslesenler:
+            eslesenler.append(gercek)
+
+    return eslesenler
+
+
+_LLM_HARIC_KELIMELER = re.compile(
+    r"hariç|haric|dışında|disinda|dışındaki|disindaki", re.I
+)
+
+
+def llm_haric_mi(
+    sorgu: str,
+    anahtar: str,
+    diger_ogeler=None,
+    pencere: int = 20,
+) -> bool:
+    """
+    "anahtar" (bir sınıf adı, uçuş kimliği ya da zaman_araligi ifadesi
+    -- model bunu cümledeki haliyle AYNEN döndürür) sorgu metninde
+    geçtiği yerin HEMEN ARDINDAN (ör. "flight_2 hariç", "İnsan
+    dışındaki") bir dışlama kelimesi gelip gelmediğine bakar. Türkçede
+    "hariç"/"dışında" neredeyse her zaman değiştirdiği öğeden SONRA
+    geldiği için pencere yalnızca İLERİYE doğru açılır -- geriye doğru
+    bakmak, "flight_1 ve flight_2 hariç" gibi bir cümlede "hariç"i
+    yanlışlıkla flight_1'e de mal ederdi.
+
+    "diger_ogeler" verilirse (aynı sorguda tespit edilen DİĞER
+    sınıf/uçuş adları), pencere içinde dışlama kelimesinden ÖNCE başka
+    bir öge geçiyorsa dışlama o öğeye ait sayılır, bu "anahtar" için
+    False döner -- yukarıdaki "flight_1 ve flight_2 hariç" örneğinde
+    flight_1 için False, flight_2 için True döner.
+
+    Kesin bir dilbilgisi çözümleyicisi DEĞİLDİR, yalnızca yaygın
+    kalıpları yakalayan bir sezgiseldir; sonuç her zaman panonun
+    "🔎 Aktif filtre" özetiyle kontrol edilmelidir.
+    """
+
+    if not sorgu or not anahtar:
+        return False
+
+    sorgu_kucuk = _tr_kucuk(sorgu)
+    anahtar_kucuk = _tr_kucuk(anahtar)
+    konum = sorgu_kucuk.find(anahtar_kucuk)
+
+    if konum == -1:
+        return False
+
+    ileri_baslangic = konum + len(anahtar_kucuk)
+    ileri_bitis = min(len(sorgu_kucuk), ileri_baslangic + pencere)
+    parca = sorgu_kucuk[ileri_baslangic:ileri_bitis]
+
+    eslesme = _LLM_HARIC_KELIMELER.search(parca)
+
+    if not eslesme:
+        return False
+
+    for oge in (diger_ogeler or []):
+
+        oge_kucuk = _tr_kucuk(oge)
+
+        if oge_kucuk == anahtar_kucuk:
+            continue
+
+        oge_konum = parca.find(oge_kucuk)
+
+        if oge_konum != -1 and oge_konum < eslesme.start():
+            return False
+
+    return True
+
+
 def _polygon_has_area(polygon) -> bool:
     """
     Bir poligonun (köşe noktası listesi) ClickHouse'un pointInPolygon
@@ -4177,6 +4947,498 @@ def render_data_export():
     st.subheader(
         "1️⃣ Filtrele"
     )
+
+    with st.expander(
+        "🤖 Doğal Dil ile Filtrele (Qwen3)",
+        expanded=False,
+    ):
+
+        st.caption(
+            "Filtreleri elle kurmak yerine aradığınızı Türkçe yazın; "
+            "yerelde çalışan Qwen3:1.7B modeli sorguyu ayrıştırıp "
+            "aşağıdaki bölümleri sizin yerinize doldurur: zaman "
+            "aralığı, günün saati, uçuş süresi, class ve uçuş seçimi, "
+            "değer bazlı filtreler. Uygulandığında, önceki değer "
+            "bazlı filtrelerin YERİNE geçer, diğerlerini günceller. "
+            "Örn: *\"Saat 7-9 arasında, irtifası 300 metrenin altına "
+            "düşen İnsan class'lı kayıtlar\"*. Harita alanı (poligon) "
+            "filtresi buradan desteklenmiyor -- o hâlâ elle çizilir."
+        )
+
+        if _llm_sorgula is None:
+
+            st.warning(
+                "LLM entegrasyonu kullanılamıyor "
+                f"(`{_LLM_IMPORT_HATASI}`). `qwen_benchmark.py` "
+                "dosyasının `app.py` ile aynı klasörde olduğundan ve "
+                "`ollama` paketinin kurulu olduğundan emin olun "
+                "(`pip install ollama`), ayrıca yerel Ollama "
+                "servisinin (`ollama serve`) ve `qwen3:1.7b` modelinin "
+                "(`ollama pull qwen3:1.7b`) çalıştığını kontrol edin."
+            )
+
+        else:
+
+            llm_query_text = st.text_area(
+                "Sorgunuz",
+                key="llm_query_input",
+                placeholder=(
+                    "Örn: Batarya yüzde 20'nin altına düşen ve irtifa "
+                    "300 metrenin altında olan kayıtlar"
+                ),
+                height=80,
+            )
+
+            llm_submit = st.button(
+                "🔍 Sorguyu Yorumla ve Uygula",
+                key="llm_submit_btn",
+            )
+
+            if llm_submit:
+
+                if not llm_query_text or not llm_query_text.strip():
+
+                    st.session_state["llm_last_result"] = {
+                        "hata": "Önce bir sorgu yazın.",
+                    }
+
+                else:
+
+                    with st.spinner("Qwen3 sorguyu ayrıştırıyor..."):
+
+                        try:
+
+                            ham_parsed, _durum, ham = _llm_sorgula(
+                                llm_query_text
+                            )
+
+                            if ham_parsed is None:
+
+                                st.session_state["llm_last_result"] = {
+                                    "hata": (
+                                        "Model geçerli bir JSON "
+                                        f"döndürmedi: {ham[:200]!r}"
+                                    ),
+                                }
+
+                            else:
+
+                                parsed, _duzeltmeler = _llm_son_islem(
+                                    ham_parsed, llm_query_text
+                                )
+
+                                (
+                                    kalan_filtreler,
+                                    saat_listesi,
+                                    saat_uyari,
+                                ) = llm_gun_ici_saat_filtresini_ayikla(
+                                    parsed.get("filtreler", [])
+                                )
+
+                                (
+                                    kalan_filtreler,
+                                    duration_filter,
+                                    sure_uyari,
+                                ) = llm_ucus_suresi_filtresini_ayikla(
+                                    kalan_filtreler
+                                )
+
+                                baslangic_id = st.session_state.get(
+                                    "value_filter_next_id", 0
+                                )
+
+                                satirlar, uyarilar = (
+                                    llm_filtreleri_donustur(
+                                        kalan_filtreler,
+                                        get_numeric_columns(),
+                                        baslangic_id,
+                                    )
+                                )
+
+                                if saat_uyari:
+                                    uyarilar.append(saat_uyari)
+
+                                if sure_uyari:
+                                    uyarilar.append(sure_uyari)
+
+                                # --- Günün saati (gun_ici_saat) ---
+
+                                saat_uygulandi = False
+                                saat_haric = False
+
+                                if saat_listesi is not None:
+
+                                    st.session_state[
+                                        "export_selected_hours"
+                                    ] = saat_listesi
+
+                                    saat_haric = llm_haric_mi(
+                                        llm_query_text, "saat"
+                                    )
+                                    st.session_state[
+                                        "export_hours_mode_exclude"
+                                    ] = saat_haric
+
+                                    saat_uygulandi = True
+
+                                # --- Uçuş süresi (ucus_suresi) ---
+
+                                sure_uygulandi = False
+
+                                if duration_filter:
+
+                                    def _llm_saat_to_hm(saat_ondalik):
+                                        toplam_dk = round(
+                                            float(saat_ondalik) * 60
+                                        )
+                                        return (
+                                            toplam_dk // 60,
+                                            toplam_dk % 60,
+                                        )
+
+                                    st.session_state[
+                                        "export_duration_enabled"
+                                    ] = True
+                                    st.session_state[
+                                        "export_duration_operator"
+                                    ] = duration_filter["operator"]
+
+                                    _h, _m = _llm_saat_to_hm(
+                                        duration_filter["hours"]
+                                    )
+                                    st.session_state[
+                                        "export_duration_hours_h"
+                                    ] = _h
+                                    st.session_state[
+                                        "export_duration_hours_m"
+                                    ] = _m
+
+                                    if "hours2" in duration_filter:
+
+                                        _h2, _m2 = _llm_saat_to_hm(
+                                            duration_filter["hours2"]
+                                        )
+                                        st.session_state[
+                                            "export_duration_hours2_h"
+                                        ] = _h2
+                                        st.session_state[
+                                            "export_duration_hours2_m"
+                                        ] = _m2
+
+                                    sure_uygulandi = True
+
+                                # --- Class (sınıf) -- deterministik eşleştirme ---
+
+                                try:
+                                    mevcut_siniflar = (
+                                        get_available_classes()
+                                    )
+                                except Exception:
+                                    mevcut_siniflar = []
+
+                                sinif_eslesen = (
+                                    llm_sinif_filtresini_belirle(
+                                        llm_query_text, mevcut_siniflar
+                                    )
+                                )
+
+                                sinif_uygulandi = False
+
+                                if sinif_eslesen:
+                                    st.session_state[
+                                        "export_selected_classes"
+                                    ] = sinif_eslesen
+                                    sinif_uygulandi = True
+
+                                # --- Uçuş (flight_id) -- deterministik eşleştirme ---
+
+                                try:
+                                    mevcut_ucuslar = (
+                                        get_available_flights()
+                                    )
+                                except Exception:
+                                    mevcut_ucuslar = []
+
+                                ucus_eslesen = (
+                                    llm_ucus_filtresini_belirle(
+                                        llm_query_text, mevcut_ucuslar
+                                    )
+                                )
+
+                                ucus_uygulandi = False
+                                ucus_haric = False
+
+                                if ucus_eslesen:
+
+                                    st.session_state[
+                                        "export_selected_flights"
+                                    ] = ucus_eslesen
+
+                                    ucus_haric = any(
+                                        llm_haric_mi(
+                                            llm_query_text,
+                                            ucus,
+                                            diger_ogeler=ucus_eslesen,
+                                        )
+                                        for ucus in ucus_eslesen
+                                    )
+                                    st.session_state[
+                                        "export_flights_mode_exclude"
+                                    ] = ucus_haric
+
+                                    ucus_uygulandi = True
+
+                                # --- Kolon seçimi -- deterministik eşleştirme ---
+
+                                kolon_uygulandi = False
+                                kolon_haric = False
+                                kolon_eslesen = []
+
+                                if llm_kolon_secimi_istegi_mi(
+                                    llm_query_text
+                                ):
+
+                                    try:
+                                        mevcut_kolonlar = (
+                                            get_available_columns()
+                                        )
+                                    except Exception:
+                                        mevcut_kolonlar = []
+
+                                    kolon_eslesen = (
+                                        llm_kolon_filtresini_belirle(
+                                            llm_query_text,
+                                            mevcut_kolonlar,
+                                        )
+                                    )
+
+                                    if kolon_eslesen:
+
+                                        kolon_haric = any(
+                                            llm_haric_mi(
+                                                llm_query_text,
+                                                kolon,
+                                                diger_ogeler=(
+                                                    kolon_eslesen
+                                                ),
+                                            )
+                                            for kolon in kolon_eslesen
+                                        )
+
+                                        st.session_state[
+                                            "export_selected_columns"
+                                        ] = kolon_eslesen
+                                        st.session_state[
+                                            "export_columns_mode_exclude"
+                                        ] = kolon_haric
+
+                                        kolon_uygulandi = True
+
+                                    else:
+
+                                        uyarilar.append(
+                                            "Kolon seçimi istendi ama "
+                                            "sorgudan mevcut "
+                                            "kolonlarla eşleşen bir "
+                                            "ad çıkarılamadı."
+                                        )
+
+                                mantik = str(
+                                    parsed.get("mantik", "AND")
+                                ).strip().upper()
+
+                                if mantik == "OR" and len(satirlar) > 1:
+
+                                    uyarilar.append(
+                                        "Sorgu \"veya\" (OR) mantığı "
+                                        "içeriyor; pano değer bazlı "
+                                        "filtrelerde şu an yalnızca "
+                                        "\"VE\" (AND) birleşimini "
+                                        "destekliyor. Filtreler yine "
+                                        "de eklendi ama hepsi birden "
+                                        "(AND) uygulanacak."
+                                    )
+
+                                zaman_araligi = parsed.get(
+                                    "zaman_araligi"
+                                )
+
+                                zaman_uygulandi = False
+                                zaman_haric = False
+
+                                if zaman_araligi:
+
+                                    cozulen = llm_zaman_araligini_coz(
+                                        zaman_araligi, max_time
+                                    )
+
+                                    if cozulen:
+
+                                        (
+                                            st.session_state[
+                                                "export_start_time"
+                                            ],
+                                            st.session_state[
+                                                "export_end_time"
+                                            ],
+                                        ) = cozulen
+
+                                        zaman_haric = llm_haric_mi(
+                                            llm_query_text,
+                                            zaman_araligi,
+                                        )
+                                        st.session_state[
+                                            "export_time_mode_exclude"
+                                        ] = zaman_haric
+
+                                        zaman_uygulandi = True
+
+                                    else:
+
+                                        uyarilar.append(
+                                            "Zaman ifadesi "
+                                            f"'{zaman_araligi}' "
+                                            "çözümlenemedi, tarih "
+                                            "aralığı değiştirilmedi."
+                                        )
+
+                                st.session_state["value_filters"] = (
+                                    satirlar
+                                )
+                                st.session_state[
+                                    "value_filter_next_id"
+                                ] = baslangic_id + len(satirlar)
+
+                                st.session_state["llm_last_result"] = {
+                                    "parsed": parsed,
+                                    "uygulanan": len(satirlar),
+                                    "uyarilar": uyarilar,
+                                    "zaman_uygulandi": zaman_uygulandi,
+                                    "zaman_haric": zaman_haric,
+                                    "saat_uygulandi": saat_uygulandi,
+                                    "saat_haric": saat_haric,
+                                    "sure_uygulandi": sure_uygulandi,
+                                    "sinif_uygulandi": sinif_uygulandi,
+                                    "sinif_eslesen": sinif_eslesen,
+                                    "ucus_uygulandi": ucus_uygulandi,
+                                    "ucus_eslesen": ucus_eslesen,
+                                    "ucus_haric": ucus_haric,
+                                    "kolon_uygulandi": kolon_uygulandi,
+                                    "kolon_eslesen": kolon_eslesen,
+                                    "kolon_haric": kolon_haric,
+                                }
+
+                        except Exception as exc:
+
+                            st.session_state["llm_last_result"] = {
+                                "hata": (
+                                    "Qwen3'e ulaşılamadı ya da sorgu "
+                                    f"işlenemedi: {exc}"
+                                ),
+                            }
+
+                st.rerun()
+
+            son_sonuc = st.session_state.get("llm_last_result")
+
+            if son_sonuc:
+
+                if son_sonuc.get("hata"):
+
+                    st.error(son_sonuc["hata"])
+
+                else:
+
+                    if (
+                        son_sonuc["uygulanan"] > 0
+                        or son_sonuc["zaman_uygulandi"]
+                        or son_sonuc["saat_uygulandi"]
+                        or son_sonuc["sure_uygulandi"]
+                        or son_sonuc["sinif_uygulandi"]
+                        or son_sonuc["ucus_uygulandi"]
+                        or son_sonuc["kolon_uygulandi"]
+                    ):
+
+                        ek_parcalar = [
+                            f"{son_sonuc['uygulanan']} değer filtresi"
+                        ]
+
+                        if son_sonuc["zaman_uygulandi"]:
+                            ek_parcalar.append(
+                                "zaman aralığı"
+                                + (
+                                    " (hariç tut)"
+                                    if son_sonuc["zaman_haric"]
+                                    else ""
+                                )
+                            )
+
+                        if son_sonuc["saat_uygulandi"]:
+                            ek_parcalar.append(
+                                "saat filtresi"
+                                + (
+                                    " (hariç tut)"
+                                    if son_sonuc["saat_haric"]
+                                    else ""
+                                )
+                            )
+
+                        if son_sonuc["sure_uygulandi"]:
+                            ek_parcalar.append("uçuş süresi")
+
+                        if son_sonuc["sinif_uygulandi"]:
+                            ek_parcalar.append(
+                                f"{len(son_sonuc['sinif_eslesen'])} "
+                                "class ("
+                                + ", ".join(son_sonuc["sinif_eslesen"])
+                                + ")"
+                            )
+
+                        if son_sonuc["ucus_uygulandi"]:
+                            ek_parcalar.append(
+                                f"{len(son_sonuc['ucus_eslesen'])} "
+                                "uçuş ("
+                                + ", ".join(son_sonuc["ucus_eslesen"])
+                                + ")"
+                                + (
+                                    " (hariç tut)"
+                                    if son_sonuc["ucus_haric"]
+                                    else ""
+                                )
+                            )
+
+                        if son_sonuc["kolon_uygulandi"]:
+                            ek_parcalar.append(
+                                f"{len(son_sonuc['kolon_eslesen'])} "
+                                "kolon ("
+                                + ", ".join(son_sonuc["kolon_eslesen"])
+                                + ")"
+                                + (
+                                    " (hariç tut)"
+                                    if son_sonuc["kolon_haric"]
+                                    else ""
+                                )
+                            )
+
+                        st.success(
+                            "Uygulandı: " + " · ".join(ek_parcalar)
+                        )
+
+                    else:
+
+                        st.info(
+                            "Sorgudan uygulanabilir bir filtre "
+                            "çıkarılamadı."
+                        )
+
+                    for uyari in son_sonuc.get("uyarilar", []):
+                        st.warning(uyari)
+
+                    with st.expander(
+                        "Ayrıştırılan JSON (hata ayıklama)",
+                        expanded=False,
+                    ):
+                        st.json(son_sonuc["parsed"])
 
     with st.expander(
         "🕒 Zaman ve Uçuş",

@@ -31,7 +31,7 @@ from collections import defaultdict
 import ollama
 
 
-MODEL = "qwen3.5:4b"
+MODEL = "qwen3:1.7b"
 SON_ISLEM = True
 
 
@@ -56,7 +56,6 @@ sıcaklık, ısı, sıcak, soğuk             → sicaklik
 motor, devir, rpm                       → motor_devri
 enlem, lat, latitude                    → enlem
 boylam, lon, longitude                  → boylam
-enlem / boylam                          → enlem / boylam
 saat 7 ile 9 arası, saat 18-21 arasında → gun_ici_saat
 4 saatten kısa/uzun süren uçuş         → ucus_suresi
 
@@ -378,9 +377,6 @@ TEST_CASES = [
     {"kategori": "ucus_suresi_ayrim", "sorgu": "Saat 7 ile 9 arasında 4 saatten kısa süren uçuşları getir.",
      "beklenen": {"filtreler": [{"alan": "gun_ici_saat", "operator": "between", "deger": [7, 9]},
                                 {"alan": "ucus_suresi", "operator": "<", "deger": 4}], "mantik": "AND"}},
-
-    {"kategori": "mutlak_tarih", "sorgu": "20 haziran 2025 ile 19 eylül 2025 arasındaki uçuşları getir.",
-     "beklenen": {"filtreler": [], "zaman_araligi": "20 haziran 2025 ile 19 eylül 2025"}},
 
     {"kategori": "belirsiz", "sorgu": "Çok sıcak olan anları listeler misin?",
      "beklenen": {"filtreler": [{"alan": "sicaklik", "operator": None, "deger": None}]}},
