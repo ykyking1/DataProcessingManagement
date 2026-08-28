@@ -97,7 +97,13 @@ def record_asset_metadata(
     """
 
     asset_key = "/".join(context.asset_key.path)
-    partition_date = context.partition_key
+
+    # partitions_def'i OLMAYAN asset'lerde (ör. extended_telemetry_load,
+    # grid_telemetry_load) context.partition_key erişimi DagsterInvariant
+    # ViolationError fırlatır -- bu fonksiyon hem partition'lı hem
+    # partition'sız asset'lerden çağrılabildiği için bu durumu güvenle
+    # ele alıyoruz (partition'sız asset'lerde partition_date=NULL yazılır).
+    partition_date = context.partition_key if context.has_partition_key else None
 
     try:
         conn = psycopg2.connect(**_get_conn_params())

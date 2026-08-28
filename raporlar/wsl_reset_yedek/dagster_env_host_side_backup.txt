@@ -1,0 +1,33 @@
+# Paylaşılan altyapı bağlantı bilgileri (2026-08-26 pipeline birleştirmesi).
+#
+# ClickHouse ve Postgres artık AU-AIR/MX pipeline'ı ile senkron
+# ölçüm/grid pipeline'ının (bkz. scripts/pipeline_grid_to_clickhouse.py)
+# AYNI container'larını paylaşıyor -- iki ayrı Postgres container'ı
+# yerine TEK postgres container'ında iki veritabanı (telemetry_meta +
+# postgres/asset_metadata_history). ClickHouse host portu 9000 DEĞİL,
+# 9002 -- diğer pipeline'ın MinIO'suyla (host 9000) çakışmaması için
+# ClickHouse native portu host'ta 9002'ye map'lendi (container İÇİNDE
+# hâlâ 9000, sadece host'tan erişim portu farklı).
+#
+# docker-compose.yml'deki `dpm-postgres` servisi bu birleştirmeden
+# sonra GEREKSİZ -- host port 5432'yi paylaşılan `postgres`
+# container'ıyla çakıştırmamak için ARTIK ÇALIŞTIRILMAMALI.
+
+CLICKHOUSE_HOST=localhost
+CLICKHOUSE_NATIVE_PORT=9002
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=ch123
+CLICKHOUSE_DATABASE=default
+CLICKHOUSE_TABLE=telemetry
+
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=pg123
+POSTGRES_DATABASE=postgres
+
+MINIO_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin123
+MINIO_SECURE=false
+MINIO_BUCKET=telemetry

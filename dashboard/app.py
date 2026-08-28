@@ -4035,7 +4035,134 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
     return state
 
 
+def render_grid_tables_section():
+    """
+    Grid (sentetik/geniş-şemalı) verisinin basit bir önizleme/dışa
+    aktarma görünümü -- 2026-08-26'da eklendi, 2026-08-27'de uzun
+    formatı (telemetry_long) da destekleyecek şekilde güncellendi.
+
+    AŞAĞIDAKİ AU-AIR görünümünden (render_data_export'un geri kalanı)
+    KASITLI OLARAK bağımsız: AU-AIR'in filtre/harita mantığı sabit
+    17 sütuna (latitude, velocity_x, roll, ...) bağlı -- grid
+    tablolarının hiçbir ortak sütunu yok, o mantığa zorlanırsa hata
+    verir. Bu yüzden burada sadece ham SELECT + basit tablo/CSV
+    önizlemesi var, filtre yok.
+
+    İki kaynak destekleniyor:
+      - `telemetry_long`: TEK, sabit 5 sütunlu (flight_tag, time,
+        aircraft_type, sensor_name, value) tablo -- extended_telemetry_
+        load'ın output_format="long_sql" ile yüklediği GÜNCEL yöntem
+        (bkz. proje belleği, 2026-08-27). Seçenekler bu tablodaki
+        DISTINCT flight_tag'lerden türetilir.
+      - `telemetry_extended_grid_*`: eski, dosya/tür-başına AYRI geniş
+        tablo deseni (bkz. proje belleği) -- artık kullanılmıyor ama
+        varsa (eski bir yükleme kalmışsa) yine de gösterilsin diye
+        destekleniyor.
+
+    grid_telemetry_load (pipeline_grid_to_clickhouse.py) ile yüklenen
+    tablolar burada GÖRÜNMEZ -- o pipeline, ölçüm/doğrulama amaçlı
+    olduğu için tabloyu yükledikten hemen sonra siliyor (kasıtlı
+    tasarım, bkz. scripts/pipeline_grid_to_clickhouse.py).
+    """
+
+    st.subheader("Grid Tabloları (Uçak Türü Bazlı)")
+    st.caption(
+        "Sentetik/geniş-şemalı grid verisi -- `extended_telemetry_load` "
+        "asset'inin yüklediği tablolar. AU-AIR şemasından bağımsız, "
+        "aşağıdaki filtreler buraya uygulanmaz."
+    )
+
+    try:
+        client = get_clickhouse_client()
+        database = get_clickhouse_database()
+
+        # 1) Uzun format: TEK tablo, flight_tag'e göre gruplanmış satır
+        #    sayıları -- her flight_tag bir "seçenek" gibi davranıyor.
+        long_options: dict[str, tuple[str, str | None]] = {}
+        try:
+            long_result = client.query(
+                "SELECT flight_tag, count() AS row_count "
+                f"FROM `{database}`.`telemetry_long` "
+                "GROUP BY flight_tag ORDER BY flight_tag"
+            )
+            for flight_tag, row_count in long_result.result_rows:
+                label = f"{flight_tag} ({row_count:,} satır, uzun format)"
+                long_options[label] = ("telemetry_long", flight_tag)
+        except Exception:
+            # telemetry_long tablosu henüz yok -- normal, sessizce geç.
+            pass
+
+        # 2) Eski geniş-format tabloları (varsa).
+        wide_options: dict[str, tuple[str, str | None]] = {}
+        wide_result = client.query(
+            "SELECT name, total_rows FROM system.tables "
+            f"WHERE database = '{database}' "
+            "AND name LIKE 'telemetry_extended_grid_%' "
+            "ORDER BY name"
+        )
+        for name, total_rows in wide_result.result_rows:
+            label = f"{name} ({total_rows:,} satır, geniş format)"
+            wide_options[label] = (name, None)
+
+    except Exception as exc:
+        st.error(f"Grid tabloları listelenemedi: {exc}")
+        return
+
+    table_options = {**long_options, **wide_options}
+
+    if not table_options:
+        st.info(
+            "Henüz yüklenmiş bir grid tablosu yok -- Dagster'da "
+            "`extended_telemetry_load` asset'ini materialize edin."
+        )
+        return
+
+    selected_label = st.selectbox(
+        "Tablo/uçuş seçin",
+        options=list(table_options.keys()),
+        key="grid_table_selector",
+    )
+    selected_table, selected_flight_tag = table_options[selected_label]
+
+    preview_rows = st.slider(
+        "Önizleme satır sayısı", 10, 1000, 100, key="grid_preview_rows"
+    )
+
+    try:
+        client = get_clickhouse_client()
+        if selected_flight_tag is not None:
+            preview = client.query(
+                f"SELECT * FROM `{get_clickhouse_database()}`.`{selected_table}` "
+                "WHERE flight_tag = {flight_tag:String} "
+                f"LIMIT {preview_rows}",
+                parameters={"flight_tag": selected_flight_tag},
+            )
+        else:
+            preview = client.query(
+                f"SELECT * FROM `{get_clickhouse_database()}`.`{selected_table}` "
+                f"LIMIT {preview_rows}"
+            )
+        df = pd.DataFrame(preview.result_rows, columns=preview.column_names)
+    except Exception as exc:
+        st.error(f"Veri okunamadı: {exc}")
+        return
+
+    st.dataframe(df, use_container_width=True)
+
+    st.download_button(
+        "CSV olarak indir (önizleme)",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{selected_flight_tag or selected_table}_preview.csv",
+        mime="text/csv",
+        key="grid_csv_download",
+    )
+
+    st.divider()
+
+
 def render_data_export():
+
+    render_grid_tables_section()
 
     st.subheader(
         "AU-AIR Telemetri Verisi"

@@ -1,20 +1,31 @@
 services:
-  # Asset metadata geçmişi (bkz. dagster/metadata_store.py,
+  # 2026-08-26: Pipeline birleştirmesiyle bu servis GEREKSİZ hale geldi
+  # ve ÇALIŞTIRILMAMALI -- ayrı bir `postgres` container'ı (grid/tab
+  # pipeline'ının kullandığı) zaten host port 5432'yi kullanıyor ve
+  # asset_metadata_history şeması (docs/postgres_asset_metadata_schema.sql)
+  # o container'ın "postgres" veritabanına uygulandı. dagster/.env ve
+  # dashboard/.env artık o paylaşılan container'a işaret ediyor (aynı
+  # POSTGRES_USER/POSTGRES_PORT). Bu servisi tekrar ayağa kaldırmak
+  # host port 5432 çakışmasına yol açar -- silmek yerine burada bırakıldı,
+  # geçmişi/şemayı referans olarak görmek isteyenler için.
+  #
+  # Eski açıklama: Asset metadata geçmişi (bkz. dagster/metadata_store.py,
   # docs/postgres_asset_metadata_schema.sql). Bağlantı bilgileri
   # dagster/.env ve dashboard/.env içindeki POSTGRES_* değerleriyle
   # eşleşmelidir.
-  postgres:
-    image: postgres:16
-    container_name: dpm-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: HalukPG123!
-      POSTGRES_DB: postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - dpm_postgres_data:/var/lib/postgresql/data
-
-volumes:
-  dpm_postgres_data:
+  #
+  # postgres:
+  #   image: postgres:16
+  #   container_name: dpm-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: postgres
+  #     POSTGRES_PASSWORD: HalukPG123!
+  #     POSTGRES_DB: postgres
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - dpm_postgres_data:/var/lib/postgresql/data
+  #
+  # volumes:
+  #   dpm_postgres_data:

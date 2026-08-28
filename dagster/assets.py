@@ -46,6 +46,13 @@ MX_TAB_VALIDATION_REPORT = (
     / "dagster_spark_ge_validation.json"
 )
 MX_TAB_DVC_RELEASE_DIR = PROJECT_ROOT / "data" / "processed" / "mx_tab"
+# own_tab_dvc_published: local_data/ TAMAMEN git-ignore'lı (bkz. proje
+# .gitignore -- "/local_data/") -- DVC'nin ".dvc" işaretçi dosyası git
+# tarafından İZLENEBİLİR bir yolda olmak zorunda, o yüzden kaynak dosya
+# doğrudan yerinde DVC'ye eklenemiyor. dvc_published_mx_tab'daki
+# --release-path deseniyle aynı: veri önce buraya kopyalanıp buradan
+# DVC'ye eklenir.
+OWN_GRID_DVC_RELEASE_DIR = PROJECT_ROOT / "data" / "processed" / "own_grid"
 
 PIPELINE_GIT_PATHS = [
     "dagster",
@@ -585,8 +592,23 @@ class ExtendedTelemetryConfig(Config):
     table_name: str = "telemetry_extended"
     """Verinin yazılacağı ClickHouse tablosu."""
 
+    output_format: str = "long"
+    """'long' (varsayılan): tüm dosyalar sabit 5 sütunlu (flight_tag,
+    time, aircraft_type, sensor_name, value) TEK tabloya satır olarak
+    birikir -- şema sütun sayısından bağımsız kalır (bkz. proje
+    belleği, 2026-08-27: çok sayıda geniş tablo ClickHouse'un katalog
+    belleğini tüketiyordu). 'wide': dosyanın kendi geniş şemasıyla ayrı
+    bir tablo (load_extended_telemetry.py::_fast_template_load)."""
+
     chunk_rows: int = 50_000
     """Her INSERT'te ClickHouse'a gönderilecek satır sayısı."""
+
+    sample_rows: int = 50_000
+    """Sütun tiplerini (UInt8/Int64/Float64/String) çıkarmak için okunacak
+    örnek satır sayısı -- load_extended_telemetry.py::_infer_schema bunu
+    chunk_rows'tan BAĞIMSIZ, TEK SEFERDE (chunk'lanmadan) okur. Çok geniş
+    şemalı (binlerce sütunlu) dosyalarda varsayılan (50.000) bellek
+    açısından ağır olabilir -- gerekirse küçültün."""
 
 
 @asset(
@@ -607,7 +629,9 @@ def extended_telemetry_load(context, config: ExtendedTelemetryConfig):
             str(SCRIPTS_DIR / "load_extended_telemetry.py"),
             "--file-path", config.file_path,
             "--table-name", config.table_name,
+            "--output-format", config.output_format,
             "--chunk-rows", str(config.chunk_rows),
+            "--sample-rows", str(config.sample_rows),
             "--metadata-out", str(metadata_path),
         ]
 
@@ -624,16 +648,133 @@ def extended_telemetry_load(context, config: ExtendedTelemetryConfig):
         f"(tablo={metadata['table']}, {metadata['elapsed_seconds']}sn)."
     )
 
+    result_metadata = {
+        "source_file": metadata["source_file"],
+        "table": metadata["table"],
+        "row_count": metadata["row_count"],
+        "column_count": metadata["column_count"],
+        "chunk_count": metadata["chunk_count"],
+        "elapsed_seconds": metadata["elapsed_seconds"],
+        "time_column_source": metadata["time_column_source"],
+        "load_method": metadata.get("load_method"),
+        "detected_aircraft_type": metadata.get("detected_aircraft_type"),
+        "flight_tag": metadata.get("flight_tag"),
+    }
+
+    # Dashboard'ın "Katalog" sekmesindeki Metadata Geçmişi'nde görünsün
+    # diye -- diğer asset'lerle (raw_uav_telemetry vb.) aynı desen.
+    record_asset_metadata(
+        context,
+        group_name="extended",
+        flight_id=metadata.get("flight_tag"),
+        row_count=metadata["row_count"],
+        metadata=result_metadata,
+    )
+
     return MaterializeResult(
         metadata={
-            "source_file": metadata["source_file"],
-            "table": metadata["table"],
-            "row_count": metadata["row_count"],
-            "column_count": metadata["column_count"],
-            "chunk_count": metadata["chunk_count"],
-            "elapsed_seconds": metadata["elapsed_seconds"],
-            "time_column_source": metadata["time_column_source"],
+            **result_metadata,
             "schema": MetadataValue.json(metadata["schema"]),
+        }
+    )
+
+
+# ===========================================================================
+# grid_telemetry_load
+# ===========================================================================
+#
+# extended_telemetry_load ile AYNI problem uzayını (geniş şemalı --
+# binlerce sütunlu -- telemetri dosyalarını ClickHouse'a yükleme)
+# hedefler, ama İKİSİ DE KASITLI OLARAK farklı stratejiler kullanır:
+#
+#   extended_telemetry_load: şemayı BİLİNMEYEN, herhangi bir dosyadan
+#   (Türkçe CSV, .gz, bozuk değerler vb.) çıkarır -- genel amaçlı ama
+#   pandas tabanlı temizlik yüzünden çok geniş dosyalarda (10K+ sütun)
+#   YAVAŞ (bkz. load_extended_telemetry.py'nin docstring'i).
+#
+#   grid_telemetry_load: sentetik grid gibi ŞEMASI ÖNCEDEN BİLİNEN,
+#   temiz .tab dosyaları için -- scripts/pipeline_grid_to_clickhouse.py
+#   (ölçülmüş ~28k satır/sn) kullanır: pandas'tan hiç geçmeden, ham
+#   byte'ları zstd'ye akıtıp tip dönüşümünü ClickHouse'un kendi native
+#   parser'ına bırakır. Şema önceden bilinmeyen/dağınık dosyalar için
+#   UYGUN DEĞİLDİR -- onun için extended_telemetry_load kullanılmalı.
+
+class GridTelemetryConfig(Config):
+
+    n_cols_k: int
+    """Sütun tier'i (binlik) -- örn. synthetic_20k_50000.tab için 20."""
+
+    n_rows: int
+    """Satır sayısı -- örn. synthetic_20k_50000.tab için 50000."""
+
+
+@asset(
+    group_name="grid",
+    compute_kind="clickhouse",
+    description=(
+        "Şeması önceden bilinen (sentetik grid) bir .tab dosyasını, "
+        "pipeline_grid_to_clickhouse.py'nin kanıtlanmış hızlı yöntemiyle "
+        "(zstd -> MinIO -> ClickHouse s3() toplu yükleme, pandas'sız) "
+        "ClickHouse'a yükler."
+    ),
+)
+def grid_telemetry_load(context, config: GridTelemetryConfig):
+
+    with _temp_metadata_path() as metadata_path:
+
+        command = [
+            sys.executable,
+            str(SCRIPTS_DIR / "load_grid_to_clickhouse.py"),
+            "--n-cols-k", str(config.n_cols_k),
+            "--n-rows", str(config.n_rows),
+            "--metadata-out", str(metadata_path),
+        ]
+
+        context.log.info(
+            f"load_grid_to_clickhouse.py çalıştırılıyor "
+            f"(n_cols_k={config.n_cols_k}, n_rows={config.n_rows})."
+        )
+        _run_script(context, command)
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    context.log.info(
+        f"ClickHouse'a {metadata['row_count_clickhouse']} satır yazıldı "
+        f"(tablo={metadata['clickhouse_table_name']})."
+    )
+
+    result_metadata = {
+        "tab_file_name": metadata["tab_file_name"],
+        "aircraft_type": metadata["aircraft_type"],
+        "row_count_tab": metadata["row_count_tab"],
+        "row_count_clickhouse": metadata["row_count_clickhouse"],
+        "column_count": metadata["column_count"],
+        "original_size_bytes": metadata["original_size_bytes"],
+        "tab_zst_size_bytes": metadata["tab_zst_size_bytes"],
+        "compress_duration_seconds": metadata["compress_duration_seconds"],
+        "minio_upload_duration_seconds": metadata["minio_upload_duration_seconds"],
+        "clickhouse_load_duration_seconds": metadata["clickhouse_load_duration_seconds"],
+        "clickhouse_table_name": metadata["clickhouse_table_name"],
+        "clickhouse_disk_bytes": metadata["clickhouse_disk_bytes"],
+        "status": metadata["status"],
+    }
+
+    # Dashboard'ın "Katalog" sekmesindeki Metadata Geçmişi'nde görünsün
+    # diye -- diğer asset'lerle (raw_uav_telemetry vb.) aynı desen. Not:
+    # bu tablo pipeline_grid_to_clickhouse.py tarafından yükleme
+    # bitince SİLİNİYOR (kasıtlı -- bkz. o script'in docstring'i);
+    # kalıcı olan Postgres'teki bu metadata kaydı ve conversion_manifest.
+    record_asset_metadata(
+        context,
+        group_name="grid",
+        flight_id=None,
+        row_count=metadata["row_count_clickhouse"],
+        metadata=result_metadata,
+    )
+
+    return MaterializeResult(
+        metadata={
+            **result_metadata,
         }
     )
 
@@ -842,6 +983,174 @@ def dvc_published_mx_tab(
             "validation_report": MetadataValue.path(
                 str(validation_report_path)
             ),
+            "pipeline_version": pipeline_version,
+            "pipeline_git_sha": pipeline_git_sha,
+            "raw_batch": raw_batch,
+            "dvc_target": relative_release_path.as_posix(),
+            "dvc_pointer_git_path": relative_pointer_path.as_posix(),
+            "dvc_pushed": False,
+            "git_commit_created": False,
+            "git_push_performed": False,
+        },
+    )
+
+
+# ===========================================================================
+# own_tab_validated -> own_tab_dvc_published
+# ===========================================================================
+#
+# spark_processed_tab/spark_validated_tab/dvc_published_mx_tab ile AYNI
+# fikir (GE doğrulama + DVC yayınlama), ama KENDİ sentetik grid dosya-
+# larımız (scripts/gen_synthetic_grid.py, load_extended_telemetry.py'nin
+# hızlı yolunun kullandığı AIRCRAFT_10K..50K şeması) üzerinde çalışır --
+# 2026-08-28, "arkadaşlarımın job'larını kendi yöntemimizle deneyebilir
+# miyiz" sorusuna cevaben eklendi.
+#
+# Spark KULLANILMIYOR: bu ortamda pyspark kurulu olsa da JVM (java) hiç
+# kurulu değil -- yani spark_validated_tab'ın Spark yolu bu container'da
+# zaten çalışmıyor (incelemede bulundu). Bunun yerine scripts/validate_
+# tab_ge_pandas.py, GE'nin pandas backend'iyle dosyanın yalnızca bir
+# ÖRNEKLEMİNİ (varsayılan 2000 satır) okuyup doğruluyor -- geniş şemalı
+# (10K-50K sütun) dosyanın TAMAMINI pandas'a okumak hem yavaş hem
+# gereksiz olurdu; tam yükleme zaten load_extended_telemetry.py'nin işi.
+
+
+class OwnTabValidationConfig(Config):
+    """Kendi sentetik grid .tab dosyamız için GE (pandas) doğrulama ayarları."""
+
+    input_path: str = "local_data/synthetic_grid/synthetic_10k_1000.tab"
+    report_path: str = "reports/validation/own_tab_ge_pandas.json"
+    expected_aircraft_type: str | None = None
+    result_format: str = "BASIC"
+    sample_rows: int = 2000
+
+
+@asset(
+    group_name="own_data_quality",
+    compute_kind="great_expectations",
+    description=(
+        "Validates a sample of our own synthetic grid .tab file with Great "
+        "Expectations (pandas backend, no Spark/JVM required) and exposes "
+        "the JSON quality report in Dagster metadata."
+    ),
+)
+def own_tab_validated(context, config: OwnTabValidationConfig):
+    input_path = _resolve_project_path(config.input_path)
+    report_path = _resolve_project_path(config.report_path)
+    report_path.unlink(missing_ok=True)
+
+    command = [
+        sys.executable,
+        str(SCRIPTS_DIR / "validate_tab_ge_pandas.py"),
+        "--input",
+        str(input_path),
+        "--report",
+        str(report_path),
+        "--result-format",
+        config.result_format,
+        "--sample-rows",
+        str(config.sample_rows),
+    ]
+    if config.expected_aircraft_type:
+        command.extend(
+            ["--expected-aircraft-type", config.expected_aircraft_type]
+        )
+
+    context.log.info("Pandas GE validation started: %s", input_path)
+    execution_error = None
+    try:
+        _run_script(context, command, cwd=PROJECT_ROOT)
+    except RuntimeError as error:
+        execution_error = error
+
+    if not report_path.is_file():
+        if execution_error is not None:
+            raise execution_error
+        raise RuntimeError(f"Validation report was not created: {report_path}")
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    metadata = _quality_report_metadata(report_path, report)
+    statistics = report.get("statistics", {})
+    context.log.info(
+        "GE (pandas) quality result: success=%s, passed=%s/%s.",
+        report.get("success"),
+        statistics.get("successful_expectations", 0),
+        statistics.get("evaluated_expectations", 0),
+    )
+
+    if execution_error is not None or not report.get("success", False):
+        raise Failure(
+            description=f"GE (pandas) validation failed. Report: {report_path}",
+            metadata=metadata,
+        ) from execution_error
+
+    return MaterializeResult(value=str(input_path), metadata=metadata)
+
+
+@asset(
+    group_name="own_data_quality",
+    compute_kind="dvc",
+    description=(
+        "Stages our own validated synthetic grid .tab source file at a "
+        "git-visible release path, tracks it with DVC (no Git commit, no "
+        "dvc push), and logs the proposed Git commit metadata."
+    ),
+)
+def own_tab_dvc_published(context, own_tab_validated: str):
+    """Stage the validated source file at a git-visible path and DVC-track
+    it there; no Git commit, no dvc push.
+
+    local_data/ (kaynak dosyanın gerçek yeri) TAMAMEN git-ignore'lı --
+    DVC'nin ".dvc" işaretçi dosyası git tarafından izlenebilir bir yolda
+    olmak zorunda olduğu için kaynak dosya YERİNDE DVC'ye eklenemiyor
+    (denendi, "is git-ignored" hatası verdi). dvc_published_mx_tab'daki
+    --release-path deseniyle aynı çözüm: veri önce OWN_GRID_DVC_RELEASE_
+    DIR'a kopyalanır, DVC oradan eklenir.
+    """
+
+    source_path = Path(own_tab_validated).resolve()
+    release_path = (OWN_GRID_DVC_RELEASE_DIR / source_path.name).resolve()
+    pipeline_git_sha = _get_pipeline_git_sha()
+    pipeline_version = _get_pipeline_version(pipeline_git_sha)
+    raw_batch = source_path.stem
+
+    command = [
+        sys.executable,
+        str(SCRIPTS_DIR / "publish_validated_data.py"),
+        "--data-path",
+        str(source_path),
+        "--release-path",
+        str(release_path),
+        "--pipeline-version",
+        pipeline_version,
+        "--pipeline-git-sha",
+        pipeline_git_sha,
+        "--raw-batches",
+        raw_batch,
+    ]
+
+    context.log.info(
+        "DVC release started for own validated batch %s.", raw_batch
+    )
+    _run_script(context, command, cwd=PROJECT_ROOT)
+
+    pointer_path = release_path.with_name(f"{release_path.name}.dvc")
+    if not pointer_path.is_file():
+        raise RuntimeError(f"DVC pointer was not created: {pointer_path}")
+
+    relative_release_path = release_path.relative_to(PROJECT_ROOT)
+    relative_pointer_path = pointer_path.relative_to(PROJECT_ROOT)
+    context.log.info(
+        "DVC pointer updated. Review it and create the Git commit manually: %s",
+        relative_pointer_path.as_posix(),
+    )
+
+    return MaterializeResult(
+        value=str(pointer_path),
+        metadata={
+            "source_path": MetadataValue.path(str(source_path)),
+            "release_path": MetadataValue.path(str(release_path)),
+            "dvc_pointer": MetadataValue.path(str(pointer_path)),
             "pipeline_version": pipeline_version,
             "pipeline_git_sha": pipeline_git_sha,
             "raw_batch": raw_batch,
