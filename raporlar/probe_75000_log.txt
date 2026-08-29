@@ -1,6 +1,0 @@
-Prob: 50002 sutun x 75000 satir (3750.2M hucre)
-  bolme: 87.2sn, 10239.4MB
-  sikistirma: 652.2sn, 2550.8MB
-  MinIO yukleme: 32.4sn
-SONUC: COKTU -- 106.7sn sonra -- ServerException: Code: 241.
-DB::Exception: (total) memory limit exceeded: would use 9.35 GiB (attempt to allocate chunk of 4.01 MiB), current RSS: 8.71 GiB, maximum: 9.35 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker. Untracked memory across all threads: -9.79 MiB: (in file/uri tel

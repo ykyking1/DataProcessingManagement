@@ -45,13 +45,12 @@ import argparse
 import gzip
 import io
 import json
+import threading
 import time
+import uuid
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.csv as pa_csv
 import zstandard as zstd
 from clickhouse_driver import Client
 from minio import Minio
@@ -81,51 +80,34 @@ NUMERIC_FRACTION_THRESHOLD = 0.9
 ZSTD_LEVEL = 12
 
 # _split_compress_upload_by_rows: satır-parçaları ZSTD_LEVEL=12 yerine
-# BU (daha düşük, daha hızlı) seviyeyle sıkıştırılır -- 2026-08-28.
-# Tek büyük dosyayı bir kez sıkıştırmaktan farklı olarak burada YÜZLERCE
-# küçük parça sıkıştırılıyor; seviye 12'nin sıkıştırma oranı kazancı bu
-# ölçekte önemsiz kalırken CPU maliyeti (parça başına ~1-3sn) toplam
-# çalışma süresine ciddi ekleniyor (synthetic_20k_50000'de 100 parça x
-# birkaç saniye = dakikalarca). Seviye 6 -- zstd'nin hız/oran dengesinin
-# makul bir noktası -- MinIO/ağ zaten yerel olduğu için sıkıştırma oranı
-# burada disk/ağ tasarrufundan çok CPU süresini etkiliyor.
+# bu daha düşük (daha hızlı) seviyeyle sıkıştırır. Yüzlerce küçük parça
+# tek tek sıkıştırıldığından seviye 12'nin oran kazancı önemsiz kalırken
+# CPU maliyeti toplam süreye ciddi ekleniyor; seviye 6, zstd'nin hız/
+# oran dengesinde makul bir nokta (MinIO/ağ yerel olduğu için burada
+# asıl maliyet disk/ağ değil CPU süresi).
 ROW_CHUNK_ZSTD_LEVEL = 6
 
-# _fast_template_load_long_sql: ARRAY JOIN pivotunu tek seferde TÜM sensör
-# sütunlarıyla değil, gruplar halinde çalıştırır -- bkz. proje belleği,
-# 2026-08-28 kanıtı (20K sütun x 50K satırı tek sorguda pivotlamak, ara
-# tablo olmadan da host'u kritik belleğe düşürdü).
+# _fast_template_load_long_sql: ARRAY JOIN pivotunu tek seferde TÜM
+# sensör sütunlarıyla değil, gruplar halinde çalıştırır -- tek seferde
+# TÜM veriyi pivotlamak (ara tablo olsa da olmasa da) host'u kritik
+# belleğe düşürebiliyor. Parça boyutu SABİT değil, dosyanın kaynak
+# satır sayısına göre _compute_row_chunk_size() tarafından hesaplanır:
+# tepe bellek kullanımını belirleyen şey parça başına sütun sayısı değil,
+# parça başına ÜRETİLEN ÇIKTI satırı (kaynak_satır x parça_sütun).
 #
-# 2026-08-28 (2. güncelleme) -- SABİT parça boyutu yerine UYARLANABİLİR:
-# ölçüldüğü kadarıyla tepe bellek kullanımını asıl belirleyen şey
-# "parça_başına_SÜTUN_sayısı" değil, "parça_başına_ÇIKTI_SATIR_sayısı"
-# (= kaynak_satır_sayısı x parça_sütun_sayısı). Aynı 1000'lik sütun
-# parçası, 5.000 satırlık bir dosyada (5M çıktı satırı/parça) güvenli
-# ama 50.000 satırlık bir dosyada (50M çıktı satırı/parça) tehlikeli
-# olabilir. Bu yüzden artık _compute_pivot_chunk_size() dosyanın kaynak
-# satır sayısına göre parça boyutunu KENDİSİ hesaplıyor -- bkz. altta.
-#
-# 2026-08-28 (4. güncelleme) -- 3M'lik hedef test edildi (synthetic_
-# 20k_5000, 34 parça/INSERT) ve host'u kritik belleğe düşürdü, OYSA
-# AYNI dosya daha önce (temp-table'lı eski yöntemle) sorunsuz
-# yüklenmişti. Kanıt: 40k_5000'in (20 INSERT, parça başına ~10M çıktı
-# satırı) sorunsuz tamamlanması ile 50k_5000'in AYNI 10M/parça
-# değerinde (ama 25 INSERT ile) başarısız olması karşılaştırıldığında,
-# tek başına "parça başına satır sayısı" belirleyici değil -- TOPLAM
-# INSERT/parça SAYISI da önemli (ClickHouse'un arka plan parça
-# birleştirmesi, her INSERT yeni bir MergeTree parçası yarattığı için,
-# çok sayıda küçük INSERT'te kümülatif bir bellek baskısı biriktiriyor
-# -- bkz. proje belleği, aynı kök sebep ilk kez kaldırılan ara geniş
-# tabloda gözlenmişti). Çözüm: daha AZ ama daha BÜYÜK parça (toplam
-# INSERT sayısını azaltmak) -- hedef 10M'e çıkarıldı.
+# Ayrıca TOPLAM parça/INSERT sayısı da ayrı bir etken: her INSERT yeni
+# bir MergeTree parçası yaratır, ClickHouse'un arka plan birleştirmesi
+# bunu erittikçe bellek kullanır -- çok sayıda küçük INSERT'te bu
+# kümülatif bir baskıya dönüşüyor. Bu yüzden hedef, parça başına ÇOK
+# küçük değil, makul büyüklükte (10M çıktı satırı) tutuluyor: daha az
+# ama daha büyük parça, toplam INSERT sayısını azaltır.
 PIVOT_TARGET_OUTPUT_ROWS_PER_CHUNK = 10_000_000
 
 # Bir INSERT/mutation başlatmadan önce bu değerin altında (container'ın
-# /proc/meminfo::MemAvailable'ı -- Docker Desktop/WSL2'de bu, paylaşılan
-# VM'nin geneline bakar, sadece bu container'a değil) host'u kritik
-# belleğe düşürme riski çok yüksek kabul edilir; bkz. proje belleği,
-# 2026-08-28: host'un gerçekten çöktüğü tüm olaylarda bu değer hep
-# ~0,4-1,7GB aralığındaydı, düşüş çoğu zaman saniyeler içinde oluyordu.
+# /proc/meminfo::MemAvailable'ı -- Docker Desktop/WSL2'de paylaşılan
+# VM'nin geneli, sadece bu container değil) host'u kritik belleğe
+# düşürme riski yüksek kabul edilir. Gerçek host çökmelerinde bu değer
+# hep ~0,4-1,7GB aralığındaydı ve düşüş genelde saniyeler içinde oluyordu.
 MEMORY_SAFE_FLOOR_GB = 2.5
 
 
@@ -169,19 +151,201 @@ def _ensure_memory_headroom(stage_label: str) -> None:
         )
 
 
+# ClickHouse dinlenme hâlindeyken (arka plan birleştirmesi toparlanmışken)
+# tipik olarak yalnızca birkaç düzine aktif parça ve düşük bellek
+# kullanımı görülür -- sorun toplam veri hacmi değil, ard arda ÇOK HIZLI
+# gelen INSERT'lerin arka plan birleştirmesinin yetişebileceğinden daha
+# hızlı yeni parça biriktirmesi. Bu yüzden parça boyutunu/sayısını sabit
+# ayarlamak yerine, bu baskı doğrudan ölçülüp gerektiğinde YAVAŞLATILIR.
+MAX_ACTIVE_PARTS_BEFORE_CHUNK = 30
+PARTS_SETTLE_POLL_SECONDS = 5
+PARTS_SETTLE_MAX_WAIT_SECONDS = 300
+
+
+def _wait_for_merge_pressure_to_settle(
+    client: "Client", table_fqn: str, stage_label: str
+) -> None:
+    """
+    Bir sonraki INSERT'i göndermeden önce, hedef tablodaki AKTİF parça
+    sayısı MAX_ACTIVE_PARTS_BEFORE_CHUNK'ın üzerindeyse, ClickHouse'un
+    arka plan birleştirmesinin bunu azaltması için bekler (kısa
+    aralıklarla tekrar kontrol ederek). PARTS_SETTLE_MAX_WAIT_SECONDS
+    kadar beklendiği hâlde hâlâ yüksekse, host'u riske atmak yerine
+    -- _ensure_memory_headroom ile AYNI felsefe -- AÇIK bir hatayla
+    durur (host donmaz, bir sonraki denemede idempotent temizlik zaten
+    devrede).
+    """
+    database, table_name = table_fqn.split(".", 1)
+    waited = 0.0
+    while True:
+        active_parts = client.execute(
+            "SELECT count() FROM system.parts WHERE database = %(db)s "
+            "AND table = %(table)s AND active",
+            {"db": database, "table": table_name},
+        )[0][0]
+        if active_parts <= MAX_ACTIVE_PARTS_BEFORE_CHUNK:
+            return
+        if waited >= PARTS_SETTLE_MAX_WAIT_SECONDS:
+            raise RuntimeError(
+                f"'{stage_label}' adımından önce {table_fqn} tablosundaki "
+                f"aktif parça sayısı ({active_parts}) {PARTS_SETTLE_MAX_WAIT_SECONDS}sn "
+                f"beklenmesine rağmen {MAX_ACTIVE_PARTS_BEFORE_CHUNK}'ın altına "
+                "inmedi -- arka plan birleştirmesi yetişemiyor olabilir. Host'u "
+                "riske atmamak için burada durduruldu; bir sonraki denemede "
+                "idempotent temizlik zaten devrede."
+            )
+        print(
+            f"  (aktif parça sayısı {active_parts} > {MAX_ACTIVE_PARTS_BEFORE_CHUNK} -- "
+            f"birleştirmenin yetişmesi için {PARTS_SETTLE_POLL_SECONDS}sn bekleniyor...)",
+            flush=True,
+        )
+        time.sleep(PARTS_SETTLE_POLL_SECONDS)
+        waited += PARTS_SETTLE_POLL_SECONDS
+
+
+# Parça-baskısı hız kesicisi TEK BAŞINA yetersiz kalabiliyor: bir INSERT
+# başlamadan önceki kontrol geçse bile, ClickHouse'un kendi bellek
+# ayırıcısı (jemalloc) art arda gelen sorgularda kullandığı belleği
+# işletim sistemine hemen geri vermediği için, TEK BİR sorgunun ÇALIŞMASI
+# SIRASINDA bile bellek hızla kritiğe düşebiliyor. Bu yüzden sorgu
+# çalışırken de AYRI BİR İŞ PARÇACIĞINDA bellek izlenir; kritik eşiğe
+# değince sorgu KILL QUERY ile ANINDA iptal edilir -- host'u dondurmak
+# yerine temiz bir hata vermenin tek güvenilir yolu budur.
+MEMORY_WATCHDOG_CRITICAL_GB = 2.0
+MEMORY_WATCHDOG_POLL_SECONDS = 1.0
+
+
+def _execute_with_oom_watchdog(
+    client: "Client", query: str, stage_label: str, client_factory
+) -> None:
+    """
+    query'yi client üzerinde ÇALIŞTIRIRKEN, AYRI bir iş parçacığında
+    /proc/meminfo'yu MEMORY_WATCHDOG_POLL_SECONDS aralıklarla izler.
+    Bellek MEMORY_WATCHDOG_CRITICAL_GB'nin altına düşerse, AYRI bir
+    ClickHouse bağlantısından (aynı bağlantı meşgul olduğu için)
+    'KILL QUERY' gönderip sorguyu ANINDA iptal eder -- host'u kritik
+    belleğe düşmeye devam etmesine izin vermek yerine, ClickHouse'un
+    kendisi belleği bırakır. client_factory: gerektiğinde YENİ bir
+    Client açan, argümansız çağrılabilir bir fonksiyon.
+    """
+    query_id = uuid.uuid4().hex
+    killed = threading.Event()
+    stop_watching = threading.Event()
+
+    def _watch() -> None:
+        while not stop_watching.is_set():
+            available_gb = _get_available_memory_gb()
+            if available_gb is not None and available_gb < MEMORY_WATCHDOG_CRITICAL_GB:
+                print(
+                    f"  [BEKÇİ] Bellek kritik eşiğe düştü ({available_gb:.2f}GB < "
+                    f"{MEMORY_WATCHDOG_CRITICAL_GB}GB) -- '{stage_label}' sorgusu "
+                    "ANINDA iptal ediliyor (KILL QUERY)...",
+                    flush=True,
+                )
+                try:
+                    kill_client = client_factory()
+                    try:
+                        kill_client.execute(
+                            f"KILL QUERY WHERE query_id = '{query_id}' SYNC"
+                        )
+                    finally:
+                        kill_client.disconnect()
+                except Exception as exc:
+                    print(f"  [BEKÇİ] KILL QUERY gönderilemedi: {exc}", flush=True)
+                killed.set()
+                return
+            stop_watching.wait(MEMORY_WATCHDOG_POLL_SECONDS)
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+    try:
+        client.execute(query, settings=CH_SETTINGS, query_id=query_id)
+    except Exception as exc:
+        if killed.is_set():
+            raise MemoryError(
+                f"'{stage_label}' adımı çalışırken bellek kritik eşiğe "
+                f"düştüğü için ({MEMORY_WATCHDOG_CRITICAL_GB}GB altı) sorgu "
+                "bekçi tarafından otomatik iptal edildi -- host donmadan "
+                "güvenle durduruldu. Host'ta 'wsl --shutdown' çalıştırıp "
+                "tekrar deneyin; bir sonraki denemede idempotent temizlik "
+                "kısmi satırları otomatik siler."
+            ) from exc
+        raise
+    finally:
+        stop_watching.set()
+        watcher.join(timeout=2)
+
+
+# jemalloc, gerçek boşta kalma süresi verilirse kullandığı belleği
+# işletim sistemine geri veriyor -- art arda hiç durmadan gelen
+# INSERT'ler bu fırsatı hiç tanımadığı için bellek birikip gidiyor. Bu
+# yüzden her CHECKPOINT_INTERVAL_CHUNKS parçada bir DURULUR ve
+# ClickHouse'un belleği gerçekten CHECKPOINT_TARGET_GB'a inene kadar
+# beklenir -- büyük dosya tek nefeste değil, aralarında gerçek soğuma
+# molaları olan gruplar hâlinde yüklenir.
+CHECKPOINT_INTERVAL_CHUNKS = 2
+CHECKPOINT_TARGET_GB = 1.2
+CHECKPOINT_POLL_SECONDS = 5
+CHECKPOINT_MAX_WAIT_SECONDS = 180
+
+
+def _get_clickhouse_resident_gb(client: "Client") -> float | None:
+    try:
+        rows = client.execute(
+            "SELECT value FROM system.asynchronous_metrics WHERE metric = 'jemalloc.resident'"
+        )
+        return rows[0][0] / (1024**3) if rows else None
+    except Exception:
+        return None
+
+
+def _checkpoint_cooldown(client: "Client", stage_label: str) -> None:
+    """
+    ClickHouse'un kendi belleğinin (jemalloc.resident) CHECKPOINT_
+    TARGET_GB'a inmesini bekler -- jemalloc'a gerçek boşta kalma süresi
+    tanıyıp belleği geri vermesine fırsat verir. CHECKPOINT_MAX_WAIT_
+    SECONDS'a rağmen inmezse, host'u riske atmak yerine devam edilir
+    (bu bir "en iyi çaba" adımı -- asıl güvenlik ağı hâlâ _ensure_
+    memory_headroom + host'taki watch_host_memory.ps1).
+    """
+    resident_gb = _get_clickhouse_resident_gb(client)
+    if resident_gb is None or resident_gb <= CHECKPOINT_TARGET_GB:
+        return
+    print(
+        f"  [KONTROL NOKTASI] '{stage_label}' -- ClickHouse belleği "
+        f"{resident_gb:.2f}GB, {CHECKPOINT_TARGET_GB}GB'a inmesi için "
+        "soğuma bekleniyor...",
+        flush=True,
+    )
+    waited = 0.0
+    while waited < CHECKPOINT_MAX_WAIT_SECONDS:
+        time.sleep(CHECKPOINT_POLL_SECONDS)
+        waited += CHECKPOINT_POLL_SECONDS
+        resident_gb = _get_clickhouse_resident_gb(client)
+        if resident_gb is None or resident_gb <= CHECKPOINT_TARGET_GB:
+            print(
+                f"  [KONTROL NOKTASI] Soğudu ({resident_gb:.2f}GB, "
+                f"{waited:.0f}sn) -- devam ediliyor.",
+                flush=True,
+            )
+            return
+    print(
+        f"  [KONTROL NOKTASI] {CHECKPOINT_MAX_WAIT_SECONDS}sn beklendi, "
+        f"hâlâ {resident_gb:.2f}GB -- yine de devam ediliyor (host "
+        "gözetmeni gerekirse müdahale eder).",
+        flush=True,
+    )
+
+
 def _compute_row_chunk_size(n_sensor_columns: int) -> int:
     """
-    2026-08-28 (3. güncelleme, kullanıcı önerisi) -- SÜTUN bazlı
-    parçalama yerine SATIR bazlı: kaynak dosyanın kendisi, sıkıştırma
-    sırasında, satır bazında bu boyuttaki küçük parçalara bölünüp HER
-    PARÇA AYRI bir MinIO nesnesi olarak yükleniyor. Pivot adımı her
-    nesneyi TAM OLARAK BİR KEZ okuyor -- eski sütun-bazlı yaklaşımda
-    AYNI (tüm sütunlu) tam dosya, kaç parçaya bölünmüşse o kadar kez
-    yeniden indirilip açılıyordu (geniş dosyalarda ciddi, gereksiz
-    tekrar iş). Hedef yine aynı: parça başına ~
+    Kaynak dosya SATIR bazında bu boyuttaki küçük parçalara bölünür;
+    her parça AYRI bir MinIO nesnesi olarak yüklenir ve pivot adımında
+    TAM OLARAK BİR KEZ okunur (sütun bazlı parçalamada aynı tam dosya,
+    kaç parçaya bölünmüşse o kadar kez yeniden indirilip açılıyordu --
+    geniş dosyalarda gereksiz tekrar iş). Hedef: parça başına ~
     PIVOT_TARGET_OUTPUT_ROWS_PER_CHUNK çıktı satırı (satır_sayısı x
-    TÜM sensör sütunu sayısı) -- bu sefer parça sütun değil SATIR
-    ekseninde küçültülüyor.
+    TÜM sensör sütunu sayısı).
     """
     if n_sensor_columns <= 0:
         n_sensor_columns = 1
@@ -351,18 +515,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-name", default="telemetry_extended")
     parser.add_argument(
         "--output-format",
-        choices=["wide", "long", "long_sql"],
+        choices=["wide", "long_sql"],
         default="long_sql",
         help=(
             "'wide': dosyanın kendi geniş (sütun-başına-sensör) şemasıyla "
             "AYRI bir tablo (bkz. _fast_template_load) -- çok sayıda geniş "
-            "tablo ClickHouse'un katalog belleğini zorluyor (bkz. proje "
-            "belleği, 2026-08-27). 'long': Python'da (pandas/PyArrow) "
-            "uzun formata çevirip yükler -- doğru ama ağır yerel G/Ç "
-            "üretiyor (host bellek riski, bkz. proje belleği). "
-            "'long_sql' (varsayılan): AYNI uzun format hedefi, ama "
-            "dönüşüm ClickHouse'un kendi SQL'inde (ARRAY JOIN) yapılır --"
-            "Python tarafında hiç ara dosya üretilmez, en güvenli yol."
+            "tablo ClickHouse'un katalog belleğini zorluyor, büyük ölçekte "
+            "önerilmez. 'long_sql' (varsayılan): sabit 5 sütunlu uzun/tidy "
+            "format; dönüşüm ClickHouse'un kendi SQL'inde (ARRAY JOIN) "
+            "yapılır, Python tarafında hiç ara dosya üretilmez."
         ),
     )
     parser.add_argument(
@@ -780,29 +941,22 @@ def _fast_template_load(args: argparse.Namespace, path: Path, template: dict) ->
 def _fast_template_load_long_sql(args: argparse.Namespace, path: Path, template: dict) -> dict:
     """
     Uzun (long/tidy) formata SUNUCU TARAFINDA (ClickHouse SQL, ARRAY
-    JOIN) çevirir -- 2026-08-27'de eklendi, _fast_template_load_long
-    (pandas melt + PyArrow, Python tarafında) yerine.
+    JOIN) çevirir; pandas melt + PyArrow (Python tarafında) yerine.
 
-    NEDEN pandas/PyArrow değil: Python tarafında dönüştürmek dpm-
-    services container'ında dev ara dosyalar üretiyordu (bir dosya için
-    GB'larca yerel .zst) -- bu, WSL2'nin Linux sayfa önbelleğini şişirip
-    HOST'UN bütün belleğini tüketmesine yol açtı (bkz. proje belleği,
-    2026-08-27 "host donması" olayı).
+    NEDEN Python'da değil: Python tarafında dönüştürmek dev ara dosyalar
+    (bir dosya için GB'larca yerel .zst) üretip WSL2'nin Linux sayfa
+    önbelleğini şişiriyor, host'un bütün belleğini tüketebiliyordu.
 
-    2026-08-27 GÜNCELLEMESİ -- geçici geniş tablo da KALDIRILDI: ilk
-    sürüm dosyayı önce GEÇİCİ bir MergeTree tablosuna yüklüyordu, sonra
-    ARRAY JOIN ile pivotluyordu. Ölçüldü (bkz. proje belleği): bu geçici
-    tablonun kendisi tek başına +1,2GB'a mal oluyordu, ÜSTELİK INSERT
-    bittikten SONRA bile ClickHouse'un arka plan parça birleştirmesi
-    (background merge) HİÇBİR YENİ SORGU ÇALIŞMADAN belleği +1GB daha
-    artırmaya devam ediyordu -- bu, "bazen daha erken/kötü" öngörülemez
-    çökme örüntüsünün asıl sebebiydi. Şimdi ARRAY JOIN doğrudan MinIO'
-    daki dosyadan (s3() tablo fonksiyonundan) okunuyor -- HİÇ ara
-    MergeTree tablosu oluşturulmuyor, dolayısıyla arka plan birleştirme
-    maliyeti de hiç oluşmuyor. Test edildiğinde yüklü uzun formatın
-    KENDİSİ zaten çok az bellek kullanıyordu (2 milyar satır ~500MB-
-    1GB) -- sorun hiçbir zaman format değildi, ARA ADIM olarak
-    kullanılan geçici geniş tabloydu.
+    NEDEN ara tablo yok: ilk sürüm dosyayı önce GEÇİCİ bir MergeTree
+    tablosuna yükleyip ardından ARRAY JOIN ile pivotluyordu. Bu geçici
+    tablo tek başına ciddi belleğe mal oluyor, üstelik INSERT bittikten
+    SONRA bile arka plan parça birleştirmesi (background merge) hiçbir
+    yeni sorgu çalışmadan belleği artırmaya devam ediyordu. ARRAY JOIN
+    artık doğrudan MinIO'daki dosyadan (s3() tablo fonksiyonundan)
+    okunuyor -- hiç ara MergeTree tablosu oluşturulmuyor, dolayısıyla
+    arka plan birleştirme maliyeti de oluşmuyor. Yüklü uzun formatın
+    kendisi zaten çok az bellek kullanıyor -- darboğaz hiçbir zaman
+    format değildi, ara adım olarak kullanılan geçici geniş tabloydu.
     """
 
     t_start = time.time()
@@ -826,12 +980,12 @@ def _fast_template_load_long_sql(args: argparse.Namespace, path: Path, template:
 
     # -----------------------------------------------------------------
     # 1) Dosyayı SATIR BAZINDA küçük parçalara bölüp her parçayı AYRI
-    #    sıkıştırıp AYRI bir MinIO nesnesi olarak yükle -- 2026-08-28
-    #    (3. güncelleme, kullanıcı önerisi): eski yöntemde TEK BİR tam
-    #    (tüm sütunlu) dosya yükleniyor, pivot adımı bunu N kez yeniden
-    #    okuyup açıyordu (N = sütun parçası sayısı) -- geniş dosyalarda
-    #    gereksiz, tekrar eden indirme/açma maliyeti. Şimdi her MinIO
-    #    nesnesi (satır parçası) pivot'ta TAM OLARAK BİR KEZ okunuyor.
+    #    sıkıştırıp AYRI bir MinIO nesnesi olarak yükle. Sütun bazlı
+    #    parçalamada tek bir tam (tüm sütunlu) dosya yükleniyor, pivot
+    #    adımı bunu N kez yeniden okuyup açıyordu (N = sütun parçası
+    #    sayısı) -- geniş dosyalarda gereksiz, tekrar eden indirme/açma
+    #    maliyeti. Şimdi her MinIO nesnesi (satır parçası) pivot'ta TAM
+    #    OLARAK BİR KEZ okunuyor.
     # -----------------------------------------------------------------
 
     row_chunk_size = _compute_row_chunk_size(len(sensor_columns))
@@ -940,17 +1094,13 @@ def _fast_template_load_long_sql(args: argparse.Namespace, path: Path, template:
         )
         print("Temizlik tamam.", flush=True)
 
-    # 2026-08-28 KANIT: ara tablo kaldırılmasına rağmen synthetic_20k_50000
-    # (20.000 sütun x 50.000 satır -> 1 milyar çıktı satırı) TEK SORGUDA
-    # pivotlanırken host kritik belleğe düştü. Demek ki tek seferde TÜM
-    # veriyi ARRAY JOIN ile açmanın kendisi de (ara tablo olmasa bile)
-    # büyük satır x sütun çarpımlarında tehlikeli. Çözüm (3. güncelleme):
-    # her satır-parçası (yukarıda ayrı ayrı yüklenen MinIO nesneleri)
-    # için AYRI bir INSERT -- her sorgu KENDİ (küçük) nesnesini TAM
-    # OLARAK BİR KEZ okur (eski sütun-bazlı yaklaşımda AYNI tam dosya
-    # N kez yeniden okunuyordu). ARRAY JOIN'in tek seferde ürettiği
-    # satır sayısı (= parçadaki_satır_sayısı x TÜM sensör sayısı)
-    # yaklaşık sabit kalır, VE parçalar arasında ClickHouse'a belleğini
+    # Tek seferde TÜM veriyi ARRAY JOIN ile açmak (ara tablo olsa da
+    # olmasa da) büyük satır x sütun çarpımlarında host'u kritik belleğe
+    # düşürebiliyor. Bu yüzden her satır-parçası (yukarıda ayrı ayrı
+    # yüklenen MinIO nesneleri) için AYRI bir INSERT çalıştırılır: her
+    # sorgu kendi (küçük) nesnesini tam olarak bir kez okur, ARRAY
+    # JOIN'in ürettiği satır sayısı (parçadaki satır x tüm sensör sayısı)
+    # yaklaşık sabit kalır ve parçalar arasında ClickHouse'a belleğini
     # toparlama fırsatı verilir.
     t_pivot = time.time()
     for chunk_idx, (object_key, chunk_row_count) in enumerate(row_chunks, start=1):
@@ -958,10 +1108,26 @@ def _fast_template_load_long_sql(args: argparse.Namespace, path: Path, template:
         # Mid-run'da bellek kritiğe düşerse, host'u riske atmak yerine
         # burada AÇIKÇA durur (bir sonraki denemede yukarıdaki idempotent
         # temizlik bu flight_tag'in kısmi satırlarını otomatik siler).
-        _ensure_memory_headroom(f"pivot parçası {chunk_idx}/{len(row_chunks)}")
+        stage_label = f"pivot parçası {chunk_idx}/{len(row_chunks)}"
+        _ensure_memory_headroom(stage_label)
+        # ...ve arka plan birleştirmesinin yetişmesi için parça-sayısı
+        # kontrolü -- bkz. MAX_ACTIVE_PARTS_BEFORE_CHUNK. Çok büyük
+        # dosyalarda (binlerce parça üretebilecek) INSERT hızını
+        # ClickHouse'un gerçekten kaldırabildiği hıza sabitler.
+        _wait_for_merge_pressure_to_settle(client, long_table_fqn, stage_label)
+        # ...ve her CHECKPOINT_INTERVAL_CHUNKS parçada bir gerçek bir
+        # soğuma molası -- bkz. CHECKPOINT_TARGET_GB. Sadece 1. parçada
+        # DEĞİL (henüz birikecek bir şey yok).
+        if chunk_idx > 1 and (chunk_idx - 1) % CHECKPOINT_INTERVAL_CHUNKS == 0:
+            _checkpoint_cooldown(client, stage_label)
         chunk_s3_url = f"{protocol}://{_get_minio_endpoint()}/{bucket}/{object_key}"
         t_chunk = time.time()
-        client.execute(
+        # Sorgu ÇALIŞIRKEN de bellek izlenir -- bkz. MEMORY_WATCHDOG_
+        # CRITICAL_GB. Başlamadan önceki kontrol (_ensure_memory_headroom)
+        # tek başına yetersiz kaldığı için (kanıt: proje belleği,
+        # synthetic_20k_50000 5. parçada) eklendi.
+        _execute_with_oom_watchdog(
+            client,
             f"""
             INSERT INTO {long_table_fqn} (flight_tag, time, aircraft_type, sensor_name, value)
             SELECT '{flight_tag}', `timestamp`, aircraft_type, pair.1, pair.2
@@ -971,7 +1137,14 @@ def _fast_template_load_long_sql(args: argparse.Namespace, path: Path, template:
             )
             ARRAY JOIN [{pairs_sql}] AS pair
             """,
-            settings=CH_SETTINGS,
+            stage_label,
+            client_factory=lambda: Client(
+                host=_get_clickhouse_native_host(),
+                port=_get_clickhouse_native_port(),
+                user=_get_clickhouse_user(),
+                password=_get_clickhouse_password(),
+                database=_get_clickhouse_database(),
+            ),
         )
         print(
             f"  parça {chunk_idx}/{len(row_chunks)} tamam "
@@ -1016,212 +1189,6 @@ def _fast_template_load_long_sql(args: argparse.Namespace, path: Path, template:
         "compress_upload_duration_seconds": round(split_elapsed, 1),
         "clickhouse_load_duration_seconds": round(pivot_elapsed, 1),
         "load_method": "known_template_long_format_sql",
-        "detected_aircraft_type": aircraft_type,
-        "flight_tag": flight_tag,
-        "sensor_count": len(sensor_columns),
-    }
-
-
-# --chunk-rows'luk parçalar halinde okunup dönüştürülüyor (bkz.
-# _fast_template_load_long) -- her parça bellekte kısa süre yaşar.
-_LONG_FORMAT_CHUNK_ROWS_DEFAULT = 2000
-
-
-def _fast_template_load_long(args: argparse.Namespace, path: Path, template: dict) -> dict:
-    """
-    Bilinen bir uçak türü şablonuyla eşleşen dosyaları "UZUN" (tidy/
-    long) formata çevirip yükler -- her (satır, sensör) çifti kendi
-    satırı olur, sonuç tablo HER ZAMAN sabit 5 sütun (flight_tag, time,
-    aircraft_type, sensor_name, value). Kaç dosya/uçak türü yüklenirse
-    yüklensin şema DEĞİŞMEZ -- bkz. proje belleğindeki 2026-08-27
-    tartışması: "geniş" formatta her tablo kendi (10K-50K) sütun
-    listesini kalıcı olarak ClickHouse'un katalog belleğinde tutuyordu,
-    bu da az sayıda çok-geniş tabloyla bile belleği tüketiyordu -- uzun
-    formatta veri hacmi (satır sayısı) ne kadar büyürse büyüsün şema
-    sabit kaldığı için bu sorun oluşmaz.
-
-    Dönüşüm VEKTÖRİZE numpy repeat/tile ile yapılır (satır-satır saf
-    Python döngüsü ya da pandas'ın chunk.melt()'i -- ikisi de çok geniş
-    dosyalarda milyarlarca çıktı satırı için dakikalar yerine saatler
-    sürerdi; numpy'ye geçiş pandas melt'e göre ~7x, PyArrow'un CSV
-    yazıcısına geçiş de pandas to_csv'ye göre ~2x hızlandırdı --
-    ölçüldü: 50 milyon satırlık bir parçada 94,6sn -> 27,9sn, bkz. proje
-    belleği 2026-08-27). `dtype=str` ile okunuyor: _infer_schema'nın
-    YAVAŞLIĞINA sebep olan sütun-sütun sayısal tip tahmini burada YOK --
-    her hücre zaten metin olarak okunup ClickHouse'un s3() yüklemesi
-    sırasında Float64'e çevriliyor.
-    """
-
-    t_start = time.time()
-    aircraft_type = template["aircraft_type"]
-    ordered_columns = template["ordered_columns"]  # ["timestamp","aircraft_type",sensor...]
-    sensor_columns = ordered_columns[2:]
-    sensor_columns_arr = np.array(sensor_columns)
-    n_sensor = len(sensor_columns)
-    flight_tag = path.stem
-
-    print(
-        f"Bilinen şablon eşleşti: {aircraft_type} ({len(ordered_columns)} "
-        "sütun) -- pandas'sız hızlı yol yerine UZUN FORMATA çevriliyor "
-        f"({len(sensor_columns)} sensör x satır = çok daha fazla fiziksel "
-        "satır, ama sabit 5 sütunlu tek tablo).",
-        flush=True,
-    )
-
-    local_zst_path = path.with_suffix(path.suffix + ".long.tsv.zst")
-    # level=6/threads=4 (ZSTD_LEVEL=12/tek-thread yerine) -- uzun format
-    # çıktısı zaten çok tekrarlı/sıkışabilir metin, seviye 12'nin ekstra
-    # oranı burada işe yaramıyor ama süresi 5-6x'e kadar artırıyordu.
-    compressor = zstd.ZstdCompressor(level=6, threads=4)
-    total_out_rows = 0
-    chunk_index = 0
-
-    # args.chunk_rows kullanılıyor (varsayılan 50.000, wide/slow yoldan
-    # miras) -- geniş tier'lerde (40K-50K sensör) bu ÇOK BÜYÜK olurdu
-    # (chunk_rows x sensör_sayısı kadar hücre tek seferde bellekte),
-    # çağıran taraf (driver script) tier'e göre KÜÇÜK bir değer
-    # GEÇMELİ. Emniyet için burada da bir üst sınır uygulanıyor.
-    effective_chunk_rows = min(args.chunk_rows, _LONG_FORMAT_CHUNK_ROWS_DEFAULT)
-
-    with open(local_zst_path, "wb") as raw_out, compressor.stream_writer(raw_out) as zf:
-        for chunk in pd.read_csv(
-            path, sep="\t", chunksize=effective_chunk_rows, dtype=str
-        ):
-            chunk.columns = chunk.columns.str.strip()
-            chunk = _drop_trailing_empty_columns(chunk)
-
-            n_rows = len(chunk)
-            flight_col = np.full(n_rows * n_sensor, flight_tag)
-            time_col = np.repeat(chunk["timestamp"].to_numpy(), n_sensor)
-            actype_col = np.repeat(chunk["aircraft_type"].to_numpy(), n_sensor)
-            sensor_col = np.tile(sensor_columns_arr, n_rows)
-            value_col = chunk[sensor_columns].to_numpy().ravel()
-
-            table = pa.table({
-                "flight_tag": flight_col,
-                "time": time_col,
-                "aircraft_type": actype_col,
-                "sensor_name": sensor_col,
-                "value": value_col,
-            })
-            buf = pa.BufferOutputStream()
-            pa_csv.write_csv(
-                table, buf,
-                write_options=pa_csv.WriteOptions(include_header=(chunk_index == 0)),
-            )
-            zf.write(buf.getvalue().to_pybytes())
-
-            total_out_rows += n_rows * n_sensor
-            chunk_index += 1
-            print(
-                f"  Parça {chunk_index}: {n_rows:,} kaynak satır -> "
-                f"{n_rows * n_sensor:,} uzun-format satır (toplam {total_out_rows:,})",
-                flush=True,
-            )
-
-    compress_elapsed = time.time() - t_start
-    zst_size = local_zst_path.stat().st_size
-    print(
-        f"Dönüşüm+sıkıştırma tamam: {total_out_rows:,} uzun-format satır, "
-        f"{zst_size / (1024**2):.1f}MB, {compress_elapsed:.1f}sn.",
-        flush=True,
-    )
-
-    mc = Minio(
-        _get_minio_endpoint(),
-        access_key=_get_minio_access_key(),
-        secret_key=_get_minio_secret_key(),
-        secure=_get_minio_secure(),
-    )
-    bucket = _get_minio_bucket()
-    _ensure_bucket(mc, bucket)
-
-    object_key = f"extended_telemetry_long/{args.table_name}/{flight_tag}.long.tsv.zst"
-    t_upload = time.time()
-    mc.fput_object(bucket, object_key, str(local_zst_path))
-    upload_elapsed = time.time() - t_upload
-    print(f"MinIO'ya yüklendi: {bucket}/{object_key} ({upload_elapsed:.1f}sn).", flush=True)
-
-    local_zst_path.unlink(missing_ok=True)
-
-    client = Client(
-        host=_get_clickhouse_native_host(),
-        port=_get_clickhouse_native_port(),
-        user=_get_clickhouse_user(),
-        password=_get_clickhouse_password(),
-        database=_get_clickhouse_database(),
-    )
-    database = _get_clickhouse_database()
-    table_fqn = f"{database}.{args.table_name}"
-
-    # SABİT şema -- kaç dosya/uçak türü yüklenirse yüklensin bu ASLA
-    # değişmez, o yüzden bu CREATE TABLE tüm çağrılar için birebir aynı.
-    client.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {table_fqn}
-        (
-            `flight_tag` LowCardinality(String),
-            `time` Float64,
-            `aircraft_type` LowCardinality(String),
-            `sensor_name` LowCardinality(String),
-            `value` Nullable(Float64)
-        )
-        ENGINE = MergeTree
-        ORDER BY (aircraft_type, sensor_name, time)
-        """,
-        settings=CH_SETTINGS,
-    )
-
-    protocol = "https" if _get_minio_secure() else "http"
-    s3_url = f"{protocol}://{_get_minio_endpoint()}/{bucket}/{object_key}"
-
-    t_load = time.time()
-    client.execute(
-        f"""
-        INSERT INTO {table_fqn}
-        SELECT * FROM s3(
-            '{s3_url}', '{_get_minio_access_key()}', '{_get_minio_secret_key()}',
-            'CSVWithNames'
-        )
-        """,
-        settings=CH_SETTINGS,
-    )
-    load_elapsed = time.time() - t_load
-
-    row_count = client.execute(
-        f"SELECT count() FROM {table_fqn} WHERE flight_tag = %(flight_tag)s",
-        {"flight_tag": flight_tag},
-        settings=CH_SETTINGS,
-    )[0][0]
-
-    elapsed_total = time.time() - t_start
-    print(
-        f"Tamamlandı (uzun format): {row_count:,} satır (kaynak: "
-        f"{len(sensor_columns):,} sensör), sikistir={compress_elapsed:.1f}sn "
-        f"yukle_minio={upload_elapsed:.1f}sn yukle_ch={load_elapsed:.1f}sn "
-        f"toplam={elapsed_total:.1f}sn ({table_fqn}).",
-        flush=True,
-    )
-
-    schema_rows = client.execute(f"DESCRIBE TABLE {table_fqn}", settings=CH_SETTINGS)
-    schema = {row[0]: row[1] for row in schema_rows}
-
-    return {
-        "source_file": str(path),
-        "table": table_fqn,
-        "database": database,
-        "row_count": row_count,
-        "column_count": 5,
-        "chunk_count": chunk_index,
-        "elapsed_seconds": round(elapsed_total, 1),
-        "time_column_source": "timestamp",
-        "schema": schema,
-        "minio_bucket": bucket,
-        "minio_object_key": object_key,
-        "compress_duration_seconds": round(compress_elapsed, 1),
-        "minio_upload_duration_seconds": round(upload_elapsed, 1),
-        "clickhouse_load_duration_seconds": round(load_elapsed, 1),
-        "load_method": "known_template_long_format",
         "detected_aircraft_type": aircraft_type,
         "flight_tag": flight_tag,
         "sensor_count": len(sensor_columns),
@@ -1335,8 +1302,6 @@ def main() -> None:
     if template is not None:
         if args.output_format == "long_sql":
             metadata = _fast_template_load_long_sql(args, path, template)
-        elif args.output_format == "long":
-            metadata = _fast_template_load_long(args, path, template)
         else:
             metadata = _fast_template_load(args, path, template)
         args.metadata_out.parent.mkdir(parents=True, exist_ok=True)

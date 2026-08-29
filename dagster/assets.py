@@ -592,13 +592,14 @@ class ExtendedTelemetryConfig(Config):
     table_name: str = "telemetry_extended"
     """Verinin yazılacağı ClickHouse tablosu."""
 
-    output_format: str = "long"
-    """'long' (varsayılan): tüm dosyalar sabit 5 sütunlu (flight_tag,
+    output_format: str = "long_sql"
+    """'long_sql' (varsayılan): tüm dosyalar sabit 5 sütunlu (flight_tag,
     time, aircraft_type, sensor_name, value) TEK tabloya satır olarak
-    birikir -- şema sütun sayısından bağımsız kalır (bkz. proje
-    belleği, 2026-08-27: çok sayıda geniş tablo ClickHouse'un katalog
-    belleğini tüketiyordu). 'wide': dosyanın kendi geniş şemasıyla ayrı
-    bir tablo (load_extended_telemetry.py::_fast_template_load)."""
+    birikir -- şema sütun sayısından bağımsız kalır, dönüşüm ClickHouse'un
+    kendi SQL'inde (ARRAY JOIN) yapılır. 'wide': dosyanın kendi geniş
+    şemasıyla ayrı bir tablo (load_extended_telemetry.py::
+    _fast_template_load) -- çok sayıda geniş tablo ClickHouse'un katalog
+    belleğini tüketebildiğinden büyük ölçekte önerilmez."""
 
     chunk_rows: int = 50_000
     """Her INSERT'te ClickHouse'a gönderilecek satır sayısı."""
