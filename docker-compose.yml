@@ -137,6 +137,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
     ports:
       - "127.0.0.1:8501:8501"
     depends_on:
