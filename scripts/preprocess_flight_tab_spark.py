@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 try:
-    from scripts_new.preprocess_tab_spark import (
+    from scripts.preprocess_tab_spark import (
         DEFAULT_MAX_COLUMNS,
         DEFAULT_SPARK_MASTER,
         DEFAULT_TIMESTAMP_FORMAT,

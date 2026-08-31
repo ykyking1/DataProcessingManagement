@@ -9,7 +9,7 @@ from typing import Any
 import great_expectations as gx
 
 try:
-    from scripts_new.preprocess_flight_tab_spark import (
+    from scripts.preprocess_flight_tab_spark import (
         FLIGHT_COLUMNS,
         NUMERIC_COLUMNS,
         create_spark_session,
@@ -17,12 +17,12 @@ try:
         read_tab_dataframe,
         spark_readable_tab_input,
     )
-    from scripts_new.preprocess_tab_spark import (
+    from scripts.preprocess_tab_spark import (
         DEFAULT_MAX_COLUMNS,
         DEFAULT_SPARK_MASTER,
         DEFAULT_TIMESTAMP_FORMAT,
     )
-    from scripts_new.validate_tab_spark_ge import write_validation_report
+    from scripts.validate_tab_spark_ge import write_validation_report
 except ModuleNotFoundError:
     from preprocess_flight_tab_spark import (
         FLIGHT_COLUMNS,

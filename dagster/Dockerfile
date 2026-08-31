@@ -14,7 +14,7 @@ COPY dagster/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY dagster/ ./dagster/
-COPY scripts_new/ ./scripts_new/
+COPY scripts/ ./scripts/
 COPY docs/postgres_pipeline_catalog_schema.sql ./docs/postgres_pipeline_catalog_schema.sql
 
 ENV DAGSTER_HOME=/app/dagster_home

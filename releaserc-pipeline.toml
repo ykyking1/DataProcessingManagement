@@ -27,7 +27,6 @@ path_filters = [
     "dagster/**",
     "!dagster/data/**",
     "scripts/**",
-    "scripts_new/**",
     "minio/**",
     "docker-compose.yml",
     ".dockerignore",

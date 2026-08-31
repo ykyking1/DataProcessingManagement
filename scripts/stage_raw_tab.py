@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts_new.clean_tab_trailing_tab import (
+from scripts.clean_tab_trailing_tab import (
     _remove_extra_trailing_fields,
     _remove_surplus_empty_fields,
     _split_and_trim,

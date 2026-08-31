@@ -17,8 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts_new.stage_raw_tab import stage_raw_tab_stream
-from scripts_new.publish_processed_with_dvc import publish_processed_batch
+from scripts.stage_raw_tab import stage_raw_tab_stream
+from scripts.publish_processed_with_dvc import publish_processed_batch
 from postgres_catalog import (
     ensure_job_run,
     record_asset_materialization,
@@ -351,7 +351,7 @@ def processed_flight_batch(
         / "batches"
         / config.batch_id
     )
-    script_path = repo_root / "scripts_new" / "preprocess_flight_tab_spark.py"
+    script_path = repo_root / "scripts" / "preprocess_flight_tab_spark.py"
     if not script_path.is_file():
         raise FileNotFoundError(f"Spark preprocessing script missing: {script_path}")
 
@@ -473,7 +473,7 @@ def validated_flight_batch(
         batch_id=batch_id,
     )
     source_etag = processed_flight_batch["source_etag"]
-    script_path = repo_root / "scripts_new" / "validate_flight_tab_spark_ge.py"
+    script_path = repo_root / "scripts" / "validate_flight_tab_spark_ge.py"
     if not script_path.is_file():
         raise FileNotFoundError(f"GE validation script missing: {script_path}")
 
@@ -619,7 +619,7 @@ def clickhouse_flight_batch(
         batch_id=batch_id,
     )
     script_path = (
-        repo_root / "scripts_new" / "load_validated_flight_to_clickhouse.py"
+        repo_root / "scripts" / "load_validated_flight_to_clickhouse.py"
     )
     if not script_path.is_file():
         raise FileNotFoundError(f"ClickHouse loader script missing: {script_path}")

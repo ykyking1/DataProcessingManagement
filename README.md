@@ -59,11 +59,11 @@ komutu çalıştırmaz.
 Dagster container'ından:
 
 ```sh
-docker compose exec dagster python /workspace/scripts_new/get_commit_message.py --run-id <RUN_ID>
+docker compose exec dagster python /workspace/scripts/get_commit_message.py --run-id <RUN_ID>
 ```
 
 Başlıksız, otomasyon dostu çıktı için `--raw` kullanılabilir. Python içinden
-de `scripts_new.get_commit_message.get_commit_message(run_id)` fonksiyonu
+de `scripts.get_commit_message.get_commit_message(run_id)` fonksiyonu
 çağrılabilir.
 
 Pipeline kimliği monorepo içinde path-aware çözülür. Son `pipeline-v*`

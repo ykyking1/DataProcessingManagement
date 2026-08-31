@@ -29,6 +29,7 @@ AIRCRAFT_TYPE_COLUMN = "aircraft_type"
 DEFAULT_TIMESTAMP_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
 DEFAULT_MAX_COLUMNS = 100_000
 DEFAULT_SPARK_MASTER = "local[2]"
+DEFAULT_SPARK_DRIVER_MEMORY = "4g"
 DEFAULT_ZSTD_LEVEL = 12
 ZSTD_SUFFIXES = {".zst", ".zstd"}
 WINDOWS_LOCAL_FS_SOURCE = (
@@ -242,13 +243,44 @@ def create_spark_session(
     *,
     app_name: str,
     master: str = DEFAULT_SPARK_MASTER,
+    driver_memory: str | None = None,
 ) -> "SparkSession":
-    """Create the Spark session used by the standalone DVC repro CLI."""
+    """Create a Spark session safe for the very wide MX schemas.
+
+    PySpark starts the driver JVM before ``SparkSession.builder`` settings are
+    applied. Driver heap must therefore be passed through
+    ``PYSPARK_SUBMIT_ARGS`` before importing ``SparkSession``. Code generation
+    is disabled because compiling one ``UnsafeProjection`` containing tens of
+    thousands of casts exhausts the JVM heap even when the row count is small.
+    """
+
+    resolved_driver_memory = (
+        driver_memory
+        or os.environ.get("SPARK_DRIVER_MEMORY", DEFAULT_SPARK_DRIVER_MEMORY)
+    ).strip()
+    if not resolved_driver_memory:
+        raise ValueError("Spark driver memory cannot be blank.")
+
+    submit_args = os.environ.get("PYSPARK_SUBMIT_ARGS", "pyspark-shell").strip()
+    has_driver_memory = (
+        "--driver-memory" in submit_args
+        or "spark.driver.memory" in submit_args
+    )
+    if not has_driver_memory:
+        os.environ["PYSPARK_SUBMIT_ARGS"] = (
+            f"--driver-memory {resolved_driver_memory} {submit_args}"
+        )
 
     from pyspark.sql import SparkSession
 
     local_fs_adapter = ensure_windows_local_fs_adapter()
-    builder = SparkSession.builder.appName(app_name).master(master)
+    builder = (
+        SparkSession.builder.appName(app_name)
+        .master(master)
+        .config("spark.driver.memory", resolved_driver_memory)
+        .config("spark.sql.codegen.wholeStage", "false")
+        .config("spark.sql.codegen.factoryMode", "NO_CODEGEN")
+    )
     if master.startswith("local"):
         os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
         builder = (
@@ -350,6 +382,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SPARK_MASTER,
     )
     parser.add_argument(
+        "--spark-driver-memory",
+        default=os.environ.get(
+            "SPARK_DRIVER_MEMORY",
+            DEFAULT_SPARK_DRIVER_MEMORY,
+        ),
+        help="Spark driver JVM heap size (default: 4g).",
+    )
+    parser.add_argument(
         "--zstd-level",
         type=int,
         default=DEFAULT_ZSTD_LEVEL,
@@ -362,6 +402,7 @@ def main() -> None:
     spark = create_spark_session(
         app_name="dvc-tab-preprocessing",
         master=args.spark_master,
+        driver_memory=args.spark_driver_memory,
     )
     try:
         with spark_readable_tab_input(args.input) as readable_input:

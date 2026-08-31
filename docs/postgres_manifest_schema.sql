@@ -25,8 +25,7 @@ CREATE TABLE conversion_manifest (
         -- 'error': deneme sirasinda bir istisna/hata olustu (bkz.
         --   error_detail) -- ornegin ClickHouse bellek limiti asimi.
         --   Satir SILINMEZ, bir sonraki basarili denemede 'done'a
-        --   guncellenir. Bkz. scripts/pipeline_grid_to_clickhouse.py
-        --   mark_processing()/mark_error() (plan Bolum 41.3).
+        --   guncellenir (plan Bolum 41.3).
     attempt_count           INT NOT NULL DEFAULT 0,
     max_attempts            INT NOT NULL DEFAULT 3,
 

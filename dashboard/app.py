@@ -4856,10 +4856,8 @@ def render_grid_tables_section():
         varsa (eski bir yükleme kalmışsa) yine de gösterilsin diye
         destekleniyor.
 
-    grid_telemetry_load (pipeline_grid_to_clickhouse.py) ile yüklenen
-    tablolar burada GÖRÜNMEZ -- o pipeline, ölçüm/doğrulama amaçlı
-    olduğu için tabloyu yükledikten hemen sonra siliyor (kasıtlı
-    tasarım, bkz. scripts/pipeline_grid_to_clickhouse.py).
+    Eski grid telemetry denemelerinde yüklenen tablolar burada GÖRÜNMEZ;
+    bu tablolar ölçüm/doğrulama sonrası silinecek şekilde tasarlanmıştı.
     """
 
     st.subheader("Grid Tabloları (Uçak Türü Bazlı)")

@@ -23,7 +23,6 @@ PIPELINE_GIT_PATHS = (
     "dagster",
     ":(exclude)dagster/data",
     "scripts",
-    "scripts_new",
     "minio",
     "docker-compose.yml",
     ".dockerignore",
