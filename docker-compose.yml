@@ -1,31 +1,162 @@
 services:
-  # 2026-08-26: Pipeline birleştirmesiyle bu servis GEREKSİZ hale geldi
-  # ve ÇALIŞTIRILMAMALI -- ayrı bir `postgres` container'ı (grid/tab
-  # pipeline'ının kullandığı) zaten host port 5432'yi kullanıyor ve
-  # asset_metadata_history şeması (docs/postgres_asset_metadata_schema.sql)
-  # o container'ın "postgres" veritabanına uygulandı. dagster/.env ve
-  # dashboard/.env artık o paylaşılan container'a işaret ediyor (aynı
-  # POSTGRES_USER/POSTGRES_PORT). Bu servisi tekrar ayağa kaldırmak
-  # host port 5432 çakışmasına yol açar -- silmek yerine burada bırakıldı,
-  # geçmişi/şemayı referans olarak görmek isteyenler için.
-  #
-  # Eski açıklama: Asset metadata geçmişi (bkz. dagster/metadata_store.py,
-  # docs/postgres_asset_metadata_schema.sql). Bağlantı bilgileri
-  # dagster/.env ve dashboard/.env içindeki POSTGRES_* değerleriyle
-  # eşleşmelidir.
-  #
-  # postgres:
-  #   image: postgres:16
-  #   container_name: dpm-postgres
-  #   restart: unless-stopped
-  #   environment:
-  #     POSTGRES_USER: postgres
-  #     POSTGRES_PASSWORD: HalukPG123!
-  #     POSTGRES_DB: postgres
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - dpm_postgres_data:/var/lib/postgresql/data
-  #
-  # volumes:
-  #   dpm_postgres_data:
+  minio:
+    build:
+      context: .
+      dockerfile: minio/Dockerfile
+    image: dpm-minio-local:latest
+    container_name: dpm-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - dpm_minio_data:/data
+
+  # Pipeline run ve asset materialization kataloğu.
+  # Şema: docs/postgres_pipeline_catalog_schema.sql
+  postgres:
+    image: postgres:16
+    container_name: dpm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+      POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - dpm_postgres_data:/var/lib/postgresql/data
+      - ./docs/postgres_pipeline_catalog_schema.sql:/docker-entrypoint-initdb.d/10-pipeline-catalog.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: dpm-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9002:9000"
+    volumes:
+      - dpm_clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          clickhouse-client --user "$${CLICKHOUSE_USER}"
+          --password "$${CLICKHOUSE_PASSWORD}" --query "SELECT 1"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  dagster:
+    build:
+      context: .
+      dockerfile: dagster/Dockerfile
+    image:
+      dagster-local:latest
+    container_name: dagster-local
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_SECURE: "false"
+      DVC_REPO_ROOT: /workspace
+      DVC_REMOTE_NAME: minio
+      DVC_REMOTE_URL: s3://dvc-cache
+      DVC_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-4g}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_NATIVE_PORT: "9000"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-telemetry}
+      CLICKHOUSE_INSERT_CHUNK_ROWS: ${CLICKHOUSE_INSERT_CHUNK_ROWS:-10000}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+      POSTGRES_CATALOG_SCHEMA_PATH: /app/docs/postgres_pipeline_catalog_schema.sql
+      PIPELINE_VERSION: ${PIPELINE_VERSION:-}
+      PIPELINE_GIT_TAG: ${PIPELINE_GIT_TAG:-}
+      PIPELINE_GIT_SHA: ${PIPELINE_GIT_SHA:-}
+      PIPELINE_GIT_DIRTY: ${PIPELINE_GIT_DIRTY:-false}
+      REPOSITORY_GIT_SHA: ${REPOSITORY_GIT_SHA:-}
+      REPOSITORY_GIT_DIRTY: ${REPOSITORY_GIT_DIRTY:-false}
+      PIPELINE_CONTAINER_IMAGE: dagster-local:latest
+      PIPELINE_CONTAINER_IMAGE_DIGEST: ${PIPELINE_CONTAINER_IMAGE_DIGEST:-}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./:/workspace
+      - dpm_dvc_cache:/workspace/.dvc/cache
+      - dpm_dagster_home:/app/dagster_home
+    depends_on:
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: dpm-dashboard-local:latest
+    container_name: dpm-dashboard
+    restart: unless-stopped
+    environment:
+      DAGSTER_GRAPHQL_URL: http://dagster:3000/graphql
+      DAGSTER_UI_URL: http://localhost:3000
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-telemetry}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse123}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      dagster:
+        condition: service_started
+
+volumes:
+  dpm_minio_data:
+    name: dpm_minio_data
+  dpm_postgres_data:
+    name: dpm_postgres_data
+  dpm_clickhouse_data:
+    name: dpm_clickhouse_data
+  dpm_dvc_cache:
+    name: dpm_dvc_cache
+  dpm_dagster_home:
+    name: dpm_dagster_home

@@ -2234,7 +2234,10 @@ def get_postgres_conn_params() -> dict:
         port=int(os.environ.get("POSTGRES_PORT", "5432")),
         user=os.environ.get("POSTGRES_USER", "postgres"),
         password=os.environ.get("POSTGRES_PASSWORD", ""),
-        dbname=os.environ.get("POSTGRES_DATABASE", "postgres"),
+        dbname=os.environ.get(
+            "POSTGRES_DATABASE",
+            os.environ.get("POSTGRES_DB", "postgres"),
+        ),
     )
 
 
@@ -4853,10 +4856,8 @@ def render_grid_tables_section():
         varsa (eski bir yükleme kalmışsa) yine de gösterilsin diye
         destekleniyor.
 
-    grid_telemetry_load (pipeline_grid_to_clickhouse.py) ile yüklenen
-    tablolar burada GÖRÜNMEZ -- o pipeline, ölçüm/doğrulama amaçlı
-    olduğu için tabloyu yükledikten hemen sonra siliyor (kasıtlı
-    tasarım, bkz. scripts/pipeline_grid_to_clickhouse.py).
+    Eski grid telemetry denemelerinde yüklenen tablolar burada GÖRÜNMEZ;
+    bu tablolar ölçüm/doğrulama sonrası silinecek şekilde tasarlanmıştı.
     """
 
     st.subheader("Grid Tabloları (Uçak Türü Bazlı)")
@@ -5099,9 +5100,9 @@ def render_data_export():
                 f"(`{_LLM_IMPORT_HATASI}`). `qwen_benchmark.py` "
                 "dosyasının `app.py` ile aynı klasörde olduğundan ve "
                 "`ollama` paketinin kurulu olduğundan emin olun "
-                "(`pip install ollama`), ayrıca yerel Ollama "
-                "servisinin (`ollama serve`) ve `qwen3:1.7b` modelinin "
-                "(`ollama pull qwen3:1.7b`) çalıştığını kontrol edin."
+                "(`pip install ollama`). Ayrıca `OLLAMA_HOST` ile "
+                "erişilen Ollama servisinin ve `OLLAMA_MODEL` ile "
+                "seçilen modelin çalıştığını kontrol edin."
             )
 
         else:
@@ -5110,8 +5111,8 @@ def render_data_export():
                 "Sorgunuz",
                 key="llm_query_input",
                 placeholder=(
-                    "Örn: Batarya yüzde 20'nin altına düşen ve irtifa "
-                    "300 metrenin altında olan kayıtlar"
+                    "Örn: Saat 7-9 arasında irtifası 300 metrenin "
+                    "altında olan person class'lı kayıtlar"
                 ),
                 height=80,
             )
@@ -7258,14 +7259,8 @@ def render_flight_map():
         ]
     )
 
-    # streamlit-folium'un JS tarafı bazen bileşenin iframe yüksekliğini
-    # (Streamlit.setFrameHeight argümansız çağrıldığında document.body.
-    # scrollHeight'a düşüyor) kararsız ölçer; height'ı !important ile
-    # sabitlemek bunu geçersiz kılar (bkz. Alan Bazlı Filtre haritasındaki
-    # aynı düzeltme). CSS, yalnızca bu haritayı saran container'a
-    # (st.container(key=...) ile eklenen "st-key-..." sınıfı) scope
-    # edilir ki Alan Bazlı Filtre haritasının kendi (420px) yüksekliğini
-    # etkilemesin.
+    # streamlit-folium'un iframe yüksekliğini kararsız ölçmesini
+    # yalnızca uçuş rotası haritası için geçersiz kıl.
     st.markdown(
         """
         <style>
@@ -7337,7 +7332,7 @@ def main():
     # sekmeyse "primary" (dolu/renkli), değilse "secondary"
     # (outline) tipiyle çizilir. st.button, Streamlit'in iç DOM
     # yapısı sürüm sürüm değişse de (bkz. dashboard/requirements.txt
-    # içindeki pinlenmiş streamlit==1.38.0) kararlı kalan, sade bir
+    # içindeki pinlenmiş Streamlit sürümü) kararlı kalan, sade bir
     # bileşen olduğu için CSS hack'i gerekmeden güvenilir biçimde
     # "aktif/pasif" görünümü verir.
     #

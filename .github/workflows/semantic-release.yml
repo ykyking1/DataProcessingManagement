@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feat/minio-dvc-e2e-docker
   workflow_dispatch:
 
 permissions:
@@ -26,30 +27,53 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create pipeline changelog, tag, and GitHub release
-        id: pipeline-release
-        uses: python-semantic-release/python-semantic-release@v10.6.1
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          config_file: releaserc-pipeline.toml
-          build: false
-          changelog: true
-          commit: true
-          push: true
-          vcs_release: true
-          git_committer_name: github-actions[bot]
-          git_committer_email: 41898282+github-actions[bot]@users.noreply.github.com
+          python-version: "3.13"
+
+      - name: Install semantic release tooling
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "python-semantic-release==10.6.1" \
+            "GitPython==3.1.59"
+          python -m pip check
+
+      # Temporary compatibility pin: python-semantic-release 10.6.1 reads
+      # Actor.name_email_regex, which GitPython removed in 3.1.60. Remove the
+      # GitPython pin after the upstream PSR fix is released.
+      - name: Configure release commit identity
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create pipeline changelog, tag, and GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_COMMIT_AUTHOR: >-
+            github-actions[bot]
+            <41898282+github-actions[bot]@users.noreply.github.com>
+        run: |
+          semantic-release -v --config releaserc-pipeline.toml version \
+            --changelog \
+            --commit \
+            --tag \
+            --push \
+            --vcs-release \
+            --skip-build
 
       - name: Create data changelog, tag, and GitHub release
-        id: data-release
-        uses: python-semantic-release/python-semantic-release@v10.6.1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          config_file: releaserc-data.toml
-          build: false
-          changelog: true
-          commit: true
-          push: true
-          vcs_release: true
-          git_committer_name: github-actions[bot]
-          git_committer_email: 41898282+github-actions[bot]@users.noreply.github.com
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_COMMIT_AUTHOR: >-
+            github-actions[bot]
+            <41898282+github-actions[bot]@users.noreply.github.com>
+        run: |
+          semantic-release -v --config releaserc-data.toml version \
+            --changelog \
+            --commit \
+            --tag \
+            --push \
+            --vcs-release \
+            --skip-build

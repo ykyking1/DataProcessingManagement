@@ -3,6 +3,47 @@
 Dagster orchestration, processing, validation, reproducibility, and runtime dependency changes are recorded here.
 
 <!-- version list -->
+## pipeline-v0.5.0-rc.3 (2026-08-27)
+
+
+### Bug Fixes
+
+- **pipeline**: Normalize bind-mount line endings ([`01c284f`](https://github.com/ykyking1/DataProcessingManagement/commit/01c284fb6b83d0c3704b04a69ffe3299076bba25))
+
+
+
+
+## pipeline-v0.5.0-rc.2 (2026-08-27)
+
+
+### Bug Fixes
+
+- **pipeline**: Install git for lineage resolution ([`48a582e`](https://github.com/ykyking1/DataProcessingManagement/commit/48a582ee7f741b404717afb53e809ab5f29a61c5))
+
+
+
+### Chores
+
+- **pipeline**: Resolve component version by paths ([`43084b1`](https://github.com/ykyking1/DataProcessingManagement/commit/43084b11121523568287edd1cc128e911b4a4403))
+
+
+
+
+## pipeline-v0.5.0-rc.1 (2026-08-27)
+
+
+### Chores
+
+- **release**: Configure feature branch prereleases ([`cd1e746`](https://github.com/ykyking1/DataProcessingManagement/commit/cd1e746a2862c49a047f01a5fd11d2f988f2e0fd))
+
+
+
+### Features
+
+- **pipeline**: Add versioned MinIO publication workflow ([`ddb52f0`](https://github.com/ykyking1/DataProcessingManagement/commit/ddb52f09c0fa116b8dbcb9874cdcc38ef7050aca))
+
+
+
 
 ## pipeline-v0.4.0 (2026-08-25)
 

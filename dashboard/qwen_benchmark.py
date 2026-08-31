@@ -23,6 +23,7 @@ Katkisini olcmek icin False yapabilirsin; rapor iki skoru ayri gosteriyor.
 """
 
 import json
+import os
 import re
 import statistics
 import time
@@ -31,7 +32,7 @@ from collections import defaultdict
 import ollama
 
 
-MODEL = "qwen3:1.7b"
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
 SON_ISLEM = True
 
 

@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1200" viewBox="0 0 1800 1200">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-soft" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#94a3b8"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .title { font: 700 42px 'Segoe UI', Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 22px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .section { font: 700 19px 'Segoe UI', Arial, sans-serif; letter-spacing: 1.7px; fill: #64748b; }
+      .node-title { font: 700 25px 'Segoe UI', Arial, sans-serif; fill: #0f172a; }
+      .node-sub { font: 400 18px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .step { font: 700 20px 'Segoe UI', Arial, sans-serif; fill: #ffffff; }
+      .catalog-title { font: 700 23px 'Segoe UI', Arial, sans-serif; fill: #0f172a; }
+      .catalog-sub { font: 400 17px 'Segoe UI', Arial, sans-serif; fill: #475569; }
+      .logic-main { font: 700 22px 'Segoe UI', Arial, sans-serif; fill: #1e3a8a; }
+      .logic-sub { font: 400 18px 'Segoe UI', Arial, sans-serif; fill: #334155; }
+      .edge { stroke: #475569; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+      .meta-edge { stroke: #94a3b8; stroke-width: 3; stroke-dasharray: 9 8; fill: none; marker-end: url(#arrow-soft); }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1000" fill="#f8fafc"/>
+  <text x="70" y="62" class="title">Uçtan Uca Veri İşleme ve Versiyonlama Akışı</text>
+  <text x="70" y="96" class="subtitle">Processing: Native Spark · Validation: Great Expectations + Spark</text>
+
+  <!-- Pipeline release prerequisite -->
+  <rect x="40" y="120" width="1720" height="180" rx="26" fill="#ffffff" stroke="#dbe4ee" stroke-width="2"/>
+  <text x="70" y="155" class="section">PIPELINE HAZIRLIĞI — YALNIZ PIPELINE KODU DEĞİŞTİYSE</text>
+
+  <path d="M 490 222 L 570 222" class="edge"/>
+  <path d="M 970 222 L 1050 222" class="edge"/>
+  <path d="M 1375 270 C 1375 315, 518 305, 518 395" class="meta-edge"/>
+  <text x="920" y="292" text-anchor="middle" class="catalog-sub">Temiz pipeline tag/SHA ile çalıştırılır</text>
+
+  <g filter="url(#shadow)">
+    <rect x="80" y="175" width="410" height="95" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+    <text x="285" y="215" text-anchor="middle" class="node-title">Pipeline Code Commit + Push</text>
+    <text x="285" y="246" text-anchor="middle" class="node-sub">Developer önce pipeline değişikliğini kaydeder</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="570" y="175" width="400" height="95" rx="18" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2"/>
+    <text x="770" y="215" text-anchor="middle" class="node-title">Pipeline Semantic Release</text>
+    <text x="770" y="246" text-anchor="middle" class="node-sub">Pipeline tag ve release commit'i oluşur</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1050" y="175" width="650" height="95" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1375" y="215" text-anchor="middle" class="node-title">Release'i Çek + Dagster Image Rebuild</text>
+    <text x="1375" y="246" text-anchor="middle" class="node-sub">Resmî data run'ı temiz pipeline kimliğiyle başlatılır</text>
+  </g>
+
+  <g transform="translate(0 200)">
+  <rect x="40" y="125" width="1720" height="410" rx="26" fill="#ffffff" stroke="#dbe4ee" stroke-width="2"/>
+  <text x="70" y="163" class="section">OTOMATİK PIPELINE</text>
+
+  <!-- Main flow connectors -->
+  <path d="M 340 265 L 390 265" class="edge"/>
+  <path d="M 645 265 L 695 265" class="edge"/>
+  <path d="M 950 265 L 1000 265" class="edge"/>
+  <path d="M 1255 265 L 1305 265" class="edge"/>
+
+  <!-- Metadata connectors -->
+  <path d="M 518 345 C 560 380, 650 390, 735 415" class="meta-edge"/>
+  <path d="M 1128 345 L 1040 415" class="meta-edge"/>
+  <path d="M 1433 345 C 1380 385, 1240 395, 1115 423" class="meta-edge"/>
+
+  <!-- Pipeline nodes -->
+  <g filter="url(#shadow)">
+    <rect x="85" y="195" width="255" height="150" rx="18" fill="#e0f2fe" stroke="#7dd3fc" stroke-width="2"/>
+    <circle cx="120" cy="218" r="20" fill="#0284c7"/>
+    <text x="120" y="225" text-anchor="middle" class="step">1</text>
+    <text x="212" y="260" text-anchor="middle" class="node-title">MinIO Raw</text>
+    <text x="212" y="295" text-anchor="middle" class="node-sub">Ham .tab verisi</text>
+    <text x="212" y="325" text-anchor="middle" class="node-sub">Object + ETag</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="390" y="195" width="255" height="150" rx="18" fill="#ede9fe" stroke="#c4b5fd" stroke-width="2"/>
+    <circle cx="425" cy="218" r="20" fill="#7c3aed"/>
+    <text x="425" y="225" text-anchor="middle" class="step">2</text>
+    <text x="518" y="260" text-anchor="middle" class="node-title">Dagster Staging</text>
+    <text x="518" y="295" text-anchor="middle" class="node-sub">Sensor ile tetikleme</text>
+    <text x="518" y="325" text-anchor="middle" class="node-sub">Temizleme + ZSTD</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="695" y="195" width="255" height="150" rx="18" fill="#fff7ed" stroke="#fdba74" stroke-width="2"/>
+    <circle cx="730" cy="218" r="20" fill="#ea580c"/>
+    <text x="730" y="225" text-anchor="middle" class="step">3</text>
+    <text x="823" y="250" text-anchor="middle" class="node-title">Processing</text>
+    <text x="823" y="290" text-anchor="middle" class="node-title">Native Spark</text>
+    <text x="823" y="320" text-anchor="middle" class="node-sub">Dağıtık .tab.zst partları</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1000" y="195" width="255" height="150" rx="18" fill="#ecfdf5" stroke="#86efac" stroke-width="2"/>
+    <circle cx="1035" cy="218" r="20" fill="#16a34a"/>
+    <text x="1035" y="225" text-anchor="middle" class="step">4</text>
+    <text x="1128" y="250" text-anchor="middle" class="node-title">Validation</text>
+    <text x="1128" y="290" text-anchor="middle" class="node-title">GE + Spark</text>
+    <text x="1128" y="320" text-anchor="middle" class="node-sub">Kalite kapısı + rapor</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1305" y="195" width="410" height="150" rx="18" fill="#f1f5f9" stroke="#94a3b8" stroke-width="2"/>
+    <circle cx="1340" cy="218" r="20" fill="#334155"/>
+    <text x="1340" y="225" text-anchor="middle" class="step">5</text>
+    <text x="1510" y="260" text-anchor="middle" class="node-title">DVC + MinIO Publish</text>
+    <text x="1510" y="295" text-anchor="middle" class="node-sub">Dataset pointer güncellenir</text>
+    <text x="1510" y="325" text-anchor="middle" class="node-sub">DVC cache remote'a push edilir</text>
+  </g>
+
+  <g>
+    <rect x="1010" y="357" width="235" height="34" rx="17" fill="#fee2e2"/>
+    <text x="1128" y="380" text-anchor="middle" font-family="Segoe UI, Arial" font-size="16" font-weight="700" fill="#991b1b">Başarısızsa yayınlama durur</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="650" y="415" width="500" height="90" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="900" y="450" text-anchor="middle" class="catalog-title">PostgreSQL Run + Asset Kataloğu</text>
+    <text x="900" y="480" text-anchor="middle" class="catalog-sub">Run kimliği · pipeline lineage · validation · DVC pointer/hash</text>
+  </g>
+  </g>
+
+  <!-- Commit message section -->
+  <g transform="translate(0 200)">
+  <rect x="40" y="560" width="1720" height="400" rx="26" fill="#ffffff" stroke="#dbe4ee" stroke-width="2"/>
+  <text x="70" y="600" class="section">COMMIT MESAJI — DEVELOPER AKIŞI</text>
+
+  <!-- Commit flow connectors -->
+  <path d="M 335 700 L 395 700" class="edge"/>
+  <path d="M 660 700 L 720 700" class="edge"/>
+  <path d="M 985 700 L 1045 700" class="edge"/>
+  <path d="M 1310 700 L 1370 700" class="edge"/>
+  <path d="M 900 505 C 900 560, 527 565, 527 635" class="meta-edge"/>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="635" width="265" height="130" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+    <circle cx="105" cy="653" r="20" fill="#475569"/>
+    <text x="105" y="660" text-anchor="middle" class="step">1</text>
+    <text x="202" y="698" text-anchor="middle" class="node-title">run_id Verilir</text>
+    <text x="202" y="738" text-anchor="middle" class="node-sub">Developer aracı çağırır</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="395" y="635" width="265" height="130" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <circle cx="430" cy="653" r="20" fill="#2563eb"/>
+    <text x="430" y="660" text-anchor="middle" class="step">2</text>
+    <text x="527" y="698" text-anchor="middle" class="node-title">Katalogdan Oku</text>
+    <text x="527" y="730" text-anchor="middle" class="node-sub">SUCCESS run + published</text>
+    <text x="527" y="753" text-anchor="middle" class="node-sub">asset kontrol edilir</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="720" y="635" width="265" height="130" rx="18" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="2"/>
+    <circle cx="755" cy="653" r="20" fill="#7c3aed"/>
+    <text x="755" y="660" text-anchor="middle" class="step">3</text>
+    <text x="852" y="698" text-anchor="middle" class="node-title">Mesajı Oluştur</text>
+    <text x="852" y="730" text-anchor="middle" class="node-sub">Subject + pipeline SHA</text>
+    <text x="852" y="753" text-anchor="middle" class="node-sub">DVC hash + validation</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1045" y="635" width="265" height="130" rx="18" fill="#fefce8" stroke="#fde047" stroke-width="2"/>
+    <circle cx="1080" cy="653" r="20" fill="#ca8a04"/>
+    <text x="1080" y="660" text-anchor="middle" class="step">4</text>
+    <text x="1177" y="698" text-anchor="middle" class="node-title">Öneriyi Yazdır</text>
+    <text x="1177" y="730" text-anchor="middle" class="node-sub">Konsol çıktısı üretir</text>
+    <text x="1177" y="753" text-anchor="middle" class="node-sub">Otomatik commit yapmaz</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1370" y="635" width="360" height="130" rx="18" fill="#ecfdf5" stroke="#86efac" stroke-width="2"/>
+    <circle cx="1405" cy="653" r="20" fill="#16a34a"/>
+    <text x="1405" y="660" text-anchor="middle" class="step">5</text>
+    <text x="1550" y="698" text-anchor="middle" class="node-title">Git Commit + Push</text>
+    <text x="1550" y="730" text-anchor="middle" class="node-sub">DVC pointer commit edilir</text>
+    <text x="1550" y="753" text-anchor="middle" class="node-sub">Data semantic release oluşur</text>
+  </g>
+
+  <g>
+    <rect x="205" y="815" width="1390" height="100" rx="18" fill="#dbeafe" stroke="#93c5fd" stroke-width="2"/>
+    <text x="900" y="853" text-anchor="middle" class="logic-main">Temel mantık: Mesaj güncel Git HEAD'den üretilmez.</text>
+    <text x="900" y="886" text-anchor="middle" class="logic-sub">Run sırasında PostgreSQL'e sabitlenen lineage bilgisi okunur; commit ve push developer kontrolünde kalır.</text>
+  </g>
+  </g>
+</svg>

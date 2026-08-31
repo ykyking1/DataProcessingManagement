@@ -1,0 +1,9 @@
+SONUC mode=threads deger=2: 81.8sn, 16667 satir, OK
+SONUC mode=threads deger=4: 80.8sn, 16667 satir, OK
+SONUC mode=threads deger=8: 76.3sn, 16667 satir, OK
+SONUC mode=threads deger=16: 83.6sn, 16667 satir, OK
+SONUC mode=insert_threads deger=1: 86.3sn, 16667 satir, OK
+SONUC mode=insert_threads deger=2: 86.4sn, 16667 satir, OK
+SONUC mode=insert_threads deger=4: 87.2sn, 16667 satir, OK
+SONUC mode=insert_threads deger=8: 77.3sn, 16667 satir, OK
+SWEEP_TAMAMLANDI

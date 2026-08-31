@@ -1,0 +1,5 @@
+Prob: 50002 sutun x 20000 satir (1000.0M hucre)
+  bolme: 48.3sn, 2730.7MB
+  sikistirma: 176.8sn, 680.3MB
+  MinIO yukleme: 13.9sn
+SONUC: BASARILI -- yukle=89.5sn, satir=20000 OK

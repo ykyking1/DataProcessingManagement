@@ -2,6 +2,47 @@
 
 <!-- version list -->
 
+## v0.2.5 (2026-08-31)
+
+### Data
+
+- Reset tracked datasets
+  ([`14b44e1`](https://github.com/ykyking1/DataProcessingManagement/commit/14b44e12fe6abb3392c2a20a1721d6c5536ca904))
+
+
+## v0.2.4 (2026-08-31)
+
+### Data
+
+- **flightdemo**: Publish 6000-row E2E batch
+  ([`64981c1`](https://github.com/ykyking1/DataProcessingManagement/commit/64981c169de81c74e628f19c052f330562d8add4))
+
+### Refactoring
+
+- **pipeline**: Consolidate active scripts
+  ([`d8fdfaf`](https://github.com/ykyking1/DataProcessingManagement/commit/d8fdfaf9655b90ae3065c537c1c716da9ba23fcf))
+
+
+## v0.2.4-rc.2 (2026-08-28)
+
+**Data processed with `pipeline-v0.5.0-rc.3` (`b0889010b35046253f4af0e724e7a5ac76b94d9e`)**
+
+### Data
+
+- **mx10000**: Publish mx10000_5000rows_e2e04
+  ([`7830720`](https://github.com/ykyking1/DataProcessingManagement/commit/78307209cd6a5a1523c55e41c8639a95f6925113))
+
+
+## v0.2.4-rc.1 (2026-08-27)
+
+**Data processed with `unreleased-ce02448-dirty` (`ce024487f14c3ceb6cdc938215f88003593b67b0`)**
+
+### Data
+
+- **mx**: Baseline processed DVC pointers
+  ([`4ba679f`](https://github.com/ykyking1/DataProcessingManagement/commit/4ba679fe7f7835457772cbf503ec857b87bb2c5f))
+
+
 ## v0.2.3 (2026-08-25)
 
 **Data processed with `unreleased-f853852` (`f853852`)**

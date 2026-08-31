@@ -11,6 +11,11 @@ major_on_zero = true
 match = "main"
 prerelease = false
 
+[semantic_release.branches.minio_dvc_e2e]
+match = "feat/minio-dvc-e2e-docker"
+prerelease = true
+prerelease_token = "rc"
+
 [semantic_release.commit_parser_options]
 minor_tags = ["schema"]
 patch_tags = ["data"]

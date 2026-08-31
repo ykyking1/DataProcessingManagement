@@ -58,7 +58,7 @@ def _infer_partition_date(file_path: Path) -> str:
         else:
             # .csv ve .tab ikisi de ayraçlı düz metin -- sep=None +
             # engine="python" ayracı (virgül, noktalı virgül ya da tab)
-            # otomatik algılar (bkz. ingest_telemetry.py::read_source).
+            # otomatik algılar.
             df = pd.read_csv(
                 file_path,
                 sep=None,
@@ -98,7 +98,7 @@ def telemetry_sensor(context: SensorEvaluationContext):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Parquet, CSV ve TAB dosyalarını (gzip ile sıkıştırılmış .csv.gz /
-    # .tab.gz varyantları dahil -- bkz. ingest_telemetry.py::read_source)
+    # .tab.gz varyantları dahil)
     # kontrol et
     files = sorted(
         list(DATA_DIR.glob("*.parquet"))

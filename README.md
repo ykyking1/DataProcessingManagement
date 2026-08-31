@@ -50,6 +50,28 @@ yapılmadı (bkz. plan Bölüm 5, madde 1).
 --max-row-group-rows <N>      Parquet row-group başına azami satır (varsayılan 100000)
 ```
 
+## PostgreSQL'den commit mesajı önerisi
+
+Başarıyla tamamlanmış ve DVC'ye publish edilmiş bir Dagster run'ı için
+commit mesajı PostgreSQL kataloğundan üretilebilir. Araç Git commit veya push
+komutu çalıştırmaz.
+
+Dagster container'ından:
+
+```sh
+docker compose exec dagster python /workspace/scripts/get_commit_message.py --run-id <RUN_ID>
+```
+
+Başlıksız, otomasyon dostu çıktı için `--raw` kullanılabilir. Python içinden
+de `scripts.get_commit_message.get_commit_message(run_id)` fonksiyonu
+çağrılabilir.
+
+Pipeline kimliği monorepo içinde path-aware çözülür. Son `pipeline-v*`
+tag'inden sonra yalnızca DVC/data dosyaları değiştiyse pipeline sürümü aynı
+kalır; pipeline kapsamındaki bir dosya değiştiyse `unreleased-<sha>` kullanılır.
+Commit önerisi hem pipeline revision'ını (`Pipeline-Git-SHA`) hem de run
+anındaki gerçek repository HEAD'ini (`Repository-Git-SHA`) içerir.
+
 **Önemli**: Peak belleği kontrol eden `--max-row-group-rows`'tur,
 `--chunk-rows` değil -- parquet-rs'nin varsayılan row-group boyutu
 (1.048.576 satır) çoğu gerçekçi dosyadan büyük olduğu için, bu ayarlanmazsa

@@ -1,0 +1,5 @@
+concurrency:
+  runs:
+    # This host runs memory-intensive Spark and ZSTD work. Keep all Dagster
+    # jobs in one global queue so raw staging cannot overlap Spark processing.
+    max_concurrent_runs: 1

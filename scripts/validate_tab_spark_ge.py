@@ -28,8 +28,8 @@ try:
         spark_readable_tab_input,
     )
 except ModuleNotFoundError:
-    # Direct execution (python scripts/validate_tab_spark_ge.py) places the
-    # scripts directory, rather than the project root, on sys.path.
+    # Direct execution places scripts, rather than the project root, first
+    # on sys.path; import the sibling module in that mode.
     from preprocess_tab_spark import (
         AIRCRAFT_TYPE_COLUMN,
         DEFAULT_MAX_COLUMNS,
