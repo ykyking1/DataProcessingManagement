@@ -37,9 +37,9 @@ Dashboard bölümleri:
        - Dagster asset'leri
        - Son materialization
        - Metadata
-       - Metadata Geçmişi (Postgres, asset_metadata_history):
+       - Metadata Geçmişi (Postgres, public.asset_metadata_history):
          asset / uçuş / tarih bazlı filtrelenebilir materialization
-         geçmişi — bkz. docs/postgres_asset_metadata_schema.sql
+         geçmişi — bkz. docs/postgres_pipeline_catalog_schema.sql
 
     3. Alertler
        - Başarısız Dagster run'ları
@@ -411,7 +411,7 @@ def get_clickhouse_schema() -> pd.DataFrame:
 
     except Exception as exc:
 
-        # Pipeline henüz hiç çalışmadıysa (clickhouse_telemetry asset'i
+        # Pipeline henüz hiç çalışmadıysa (clickhouse_auair_batch asset'i
         # tabloyu henüz oluşturmadıysa) ClickHouse "UNKNOWN_TABLE" /
         # "doesn't exist" hatası fırlatır. Bu, gerçek bir bağlantı/yetki
         # hatasından ayırt edilip boş şema olarak ele alınır;
@@ -452,6 +452,44 @@ def get_available_columns() -> list:
         return []
 
     return schema["kolon"].tolist()
+
+
+# AU-AIR'in kaynak şemasında boylam kolonu "longtitude" olarak yazılıyor.
+# Dashboard içinde ise anlaşılır ve standart olan "longitude" adını kullanmaya
+# devam ediyoruz. Bu eşleme sayesinde hem mevcut AU-AIR tabloları hem de ileride
+# doğru yazımla oluşturulabilecek tablolar aynı dashboard koduyla çalışır.
+CLICKHOUSE_COLUMN_ALIASES = {
+    "longitude": ("longitude", "longtitude"),
+}
+
+
+def resolve_clickhouse_column(
+    logical_name: str,
+    available_columns=None,
+) -> str | None:
+    """Mantıksal dashboard kolonunun ClickHouse'taki gerçek adını döner."""
+
+    available = set(
+        get_available_columns()
+        if available_columns is None
+        else available_columns
+    )
+
+    candidates = CLICKHOUSE_COLUMN_ALIASES.get(
+        logical_name,
+        (logical_name,),
+    )
+
+    return next(
+        (candidate for candidate in candidates if candidate in available),
+        None,
+    )
+
+
+def quote_clickhouse_identifier(identifier: str) -> str:
+    """Şemadan gelen bir ClickHouse kolon adını güvenle quote eder."""
+
+    return f"`{identifier.replace('`', '``')}`"
 
 
 # ============================================================
@@ -604,17 +642,23 @@ def get_lat_lon_bounds():
 
     columns = get_available_columns()
 
-    if "latitude" not in columns or "longitude" not in columns:
+    latitude_column = resolve_clickhouse_column("latitude", columns)
+    longitude_column = resolve_clickhouse_column("longitude", columns)
+
+    if latitude_column is None or longitude_column is None:
         return None, None, None, None
+
+    latitude_expr = quote_clickhouse_identifier(latitude_column)
+    longitude_expr = quote_clickhouse_identifier(longitude_column)
 
     client = get_clickhouse_client()
 
     query = f"""
     SELECT
-        min(latitude), max(latitude),
-        min(longitude), max(longitude)
+        min({latitude_expr}), max({latitude_expr}),
+        min({longitude_expr}), max({longitude_expr})
     FROM {get_clickhouse_source()}
-    WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+    WHERE {latitude_expr} IS NOT NULL AND {longitude_expr} IS NOT NULL
     """
 
     result = client.query(query)
@@ -1740,10 +1784,19 @@ def build_clickhouse_where(
             get_available_columns()
         )
 
-        if (
-            "latitude" in available_columns
-            and "longitude" in available_columns
-        ):
+        latitude_column = resolve_clickhouse_column(
+            "latitude",
+            available_columns,
+        )
+        longitude_column = resolve_clickhouse_column(
+            "longitude",
+            available_columns,
+        )
+
+        if latitude_column is not None and longitude_column is not None:
+
+            latitude_expr = quote_clickhouse_identifier(latitude_column)
+            longitude_expr = quote_clickhouse_identifier(longitude_column)
 
             area_conditions = []
 
@@ -1753,7 +1806,7 @@ def build_clickhouse_where(
                 lat_param = f"area_lats_{index}"
 
                 area_conditions.append(
-                    "pointInPolygon((longitude, latitude), "
+                    f"pointInPolygon(({longitude_expr}, {latitude_expr}), "
                     f"arrayZip({{{lon_param}:Array(Float64)}}, "
                     f"{{{lat_param}:Array(Float64)}}))"
                 )
@@ -1827,12 +1880,19 @@ def build_clickhouse_where(
 
                 kolon_ifadesi = f"({hesaplanan['ifade']})"
 
-            elif column in available_columns:
-
-                kolon_ifadesi = f"`{column}`"
-
             else:
-                continue
+
+                physical_column = resolve_clickhouse_column(
+                    column,
+                    available_columns,
+                )
+
+                if physical_column is None:
+                    continue
+
+                kolon_ifadesi = quote_clickhouse_identifier(
+                    physical_column
+                )
 
             if operator == RANGE_FILTER_OPERATOR:
 
@@ -1987,19 +2047,34 @@ def fetch_filtered_telemetry(
             get_available_columns()
         )
 
-        valid_columns = [
-            col
-            for col in columns
-            if col in available
-        ]
+        valid_columns = []
+
+        for logical_column in columns:
+
+            physical_column = resolve_clickhouse_column(
+                logical_column,
+                available,
+            )
+
+            if physical_column is None:
+                continue
+
+            physical_expr = quote_clickhouse_identifier(
+                physical_column
+            )
+
+            if physical_column != logical_column:
+                physical_expr += (
+                    " AS "
+                    + quote_clickhouse_identifier(logical_column)
+                )
+
+            valid_columns.append(physical_expr)
 
         if not valid_columns:
             col_expr = "*"
         else:
-            col_expr = ", ".join(
-                f"`{col}`"
-                for col in valid_columns
-            )
+            col_expr = ", ".join(valid_columns)
 
     else:
 
@@ -2221,10 +2296,10 @@ def flatten_metadata(entries):
 # POSTGRES (ASSET METADATA GEÇMİŞİ)
 # ============================================================
 #
-# dagster/metadata_store.py her asset materialize olduğunda
-# asset_metadata_history tablosuna bir satır ekler (bkz.
-# docs/postgres_asset_metadata_schema.sql). Dashboard bu tabloyu sadece
-# OKUR -- yazma işlemi tamamen Dagster tarafında olur. Bu, yukarıdaki
+# Güncel katalogdaki pipeline_asset_materializations her asset materialize
+# olduğunda public.asset_metadata_history tablosuna bir trigger ile yansıtılır
+# (bkz. docs/postgres_pipeline_catalog_schema.sql). Dashboard bu tabloyu
+# sadece OKUR. Bu, yukarıdaki
 # ASSET_CATALOG_QUERY'nin (Dagster GraphQL, sadece SON materialization)
 # aksine, asset / uçuş / tarih bazlı filtrelenebilir bir GEÇMİŞ sağlar.
 
@@ -2270,13 +2345,13 @@ def get_metadata_history_filters() -> dict:
                 return {"assets": [], "flights": []}
 
             cur.execute(
-                "SELECT DISTINCT asset_key FROM asset_metadata_history "
+                "SELECT DISTINCT asset_key FROM public.asset_metadata_history "
                 "ORDER BY asset_key"
             )
             assets = [row[0] for row in cur.fetchall()]
 
             cur.execute(
-                "SELECT DISTINCT flight_id FROM asset_metadata_history "
+                "SELECT DISTINCT flight_id FROM public.asset_metadata_history "
                 "WHERE flight_id IS NOT NULL ORDER BY flight_id"
             )
             flights = [row[0] for row in cur.fetchall()]
@@ -2345,7 +2420,7 @@ def fetch_metadata_history(
             SELECT
                 asset_key, group_name, partition_date, flight_id,
                 run_id, row_count, metadata, materialized_at
-            FROM asset_metadata_history
+            FROM public.asset_metadata_history
             {where_sql}
             ORDER BY materialized_at DESC
             LIMIT %s
@@ -2398,7 +2473,8 @@ def render_metadata_history() -> None:
         "Yukarıdaki tablo her asset'in yalnızca SON materialization'ını "
         "gösterir. Burada, her materialization'da Postgres'e kaydedilen "
         "geçmiş; asset / uçuş / tarih bazlı filtrelenebilir "
-        "(asset_metadata_history, bkz. docs/postgres_asset_metadata_schema.sql)."
+        "(public.asset_metadata_history, bkz. "
+        "docs/postgres_pipeline_catalog_schema.sql)."
     )
 
     try:
@@ -2411,9 +2487,8 @@ def render_metadata_history() -> None:
 
     if not filters["assets"]:
         st.info(
-            "Henüz metadata geçmişi yok. Pipeline en az bir kez "
-            "çalıştığında (ve POSTGRES_* ortam değişkenleri doğru "
-            "ayarlandığında) bu bölüm dolacaktır."
+            "Henüz metadata geçmişi yok. İlk başarılı asset materialization'ı "
+            "pipeline kataloğuna yazıldığında bu bölüm dolacaktır."
         )
         return
 
@@ -3189,7 +3264,7 @@ def render_alerts(
 
             show_only_active = st.toggle(
                 "🔴 Sadece aktif hatalar",
-                value=True,
+                value=False,
                 help=(
                     "Açıkken, geçmişte yaşanıp sonradan başarılı (RESOLVED) "
                     "olan adımlar listeden gizlenir."
@@ -3201,7 +3276,7 @@ def render_alerts(
             time_filter = st.radio(
                 "Zaman aralığı",
                 options=TIME_FILTER_OPTIONS,
-                index=0,
+                index=2,
                 horizontal=True,
                 key="alert_time_filter",
             )
@@ -4832,124 +4907,103 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
     return state
 
 
-def render_grid_tables_section():
-    """
-    Grid (sentetik/geniş-şemalı) verisinin basit bir önizleme/dışa
-    aktarma görünümü -- 2026-08-26'da eklendi, 2026-08-27'de uzun
-    formatı (telemetry_long) da destekleyecek şekilde güncellendi.
+@st.cache_data(ttl=60)
+def fetch_auair_batch_summary() -> pd.DataFrame:
+    """Mevcut geniş şemalı AU-AIR tablosunu batch bazında özetler."""
 
-    AŞAĞIDAKİ AU-AIR görünümünden (render_data_export'un geri kalanı)
-    KASITLI OLARAK bağımsız: AU-AIR'in filtre/harita mantığı sabit
-    17 sütuna (latitude, velocity_x, roll, ...) bağlı -- grid
-    tablolarının hiçbir ortak sütunu yok, o mantığa zorlanırsa hata
-    verir. Bu yüzden burada sadece ham SELECT + basit tablo/CSV
-    önizlemesi var, filtre yok.
+    available_columns = get_available_columns()
+    required_columns = {
+        "source_batch_id",
+        "flight_id",
+        "time",
+    }
 
-    İki kaynak destekleniyor:
-      - `telemetry_long`: TEK, sabit 5 sütunlu (flight_tag, time,
-        aircraft_type, sensor_name, value) tablo -- extended_telemetry_
-        load'ın output_format="long_sql" ile yüklediği GÜNCEL yöntem
-        (bkz. proje belleği, 2026-08-27). Seçenekler bu tablodaki
-        DISTINCT flight_tag'lerden türetilir.
-      - `telemetry_extended_grid_*`: eski, dosya/tür-başına AYRI geniş
-        tablo deseni (bkz. proje belleği) -- artık kullanılmıyor ama
-        varsa (eski bir yükleme kalmışsa) yine de gösterilsin diye
-        destekleniyor.
+    if not required_columns.issubset(available_columns):
+        return pd.DataFrame()
 
-    Eski grid telemetry denemelerinde yüklenen tablolar burada GÖRÜNMEZ;
-    bu tablolar ölçüm/doğrulama sonrası silinecek şekilde tasarlanmıştı.
-    """
+    client = get_clickhouse_client()
+    ingested_expression = (
+        "max(ingested_at)"
+        if "ingested_at" in available_columns
+        else "CAST(NULL, 'Nullable(DateTime64(3))')"
+    )
+    result = client.query(
+        f"""
+        SELECT
+            source_batch_id,
+            uniqExact(flight_id) AS flight_count,
+            count() AS row_count,
+            min(time) AS min_time,
+            max(time) AS max_time,
+            {ingested_expression} AS last_ingested_at
+        FROM {get_clickhouse_source()}
+        WHERE source_batch_id != ''
+        GROUP BY source_batch_id
+        ORDER BY last_ingested_at DESC, source_batch_id DESC
+        """
+    )
 
-    st.subheader("Grid Tabloları (Uçak Türü Bazlı)")
+    return pd.DataFrame(
+        result.result_rows,
+        columns=[
+            "Batch",
+            "Uçuş sayısı",
+            "Satır sayısı",
+            "Başlangıç",
+            "Bitiş",
+            "ClickHouse'a yüklenme",
+        ],
+    )
+
+
+def render_wide_auair_batches_section():
+    """Güncel AU-AIR ClickHouse tablosunun batch ve şema özetini gösterir."""
+
+    st.subheader("Geniş Şemalı AU-AIR Batch'leri")
     st.caption(
-        "Sentetik/geniş-şemalı grid verisi -- `extended_telemetry_load` "
-        "asset'inin yüklediği tablolar. AU-AIR şemasından bağımsız, "
-        "aşağıdaki filtreler buraya uygulanmaz."
+        "Generator tarafından üretilen yüksek kolonlu AU-AIR verisi, "
+        "Dagster'daki `clickhouse_auair_batch` asset'i tarafından tek bir "
+        f"`{get_clickhouse_database()}.{get_clickhouse_table()}` tablosuna "
+        "yüklenir. Her yükleme `source_batch_id`, her uçuş `flight_id` "
+        "ile ayrılır."
     )
 
     try:
-        client = get_clickhouse_client()
-        database = get_clickhouse_database()
-
-        # 1) Uzun format: TEK tablo, flight_tag'e göre gruplanmış satır
-        #    sayıları -- her flight_tag bir "seçenek" gibi davranıyor.
-        long_options: dict[str, tuple[str, str | None]] = {}
-        try:
-            long_result = client.query(
-                "SELECT flight_tag, count() AS row_count "
-                f"FROM `{database}`.`telemetry_long` "
-                "GROUP BY flight_tag ORDER BY flight_tag"
-            )
-            for flight_tag, row_count in long_result.result_rows:
-                label = f"{flight_tag} ({row_count:,} satır, uzun format)"
-                long_options[label] = ("telemetry_long", flight_tag)
-        except Exception:
-            # telemetry_long tablosu henüz yok -- normal, sessizce geç.
-            pass
-
-        # 2) Eski geniş-format tabloları (varsa).
-        wide_options: dict[str, tuple[str, str | None]] = {}
-        wide_result = client.query(
-            "SELECT name, total_rows FROM system.tables "
-            f"WHERE database = '{database}' "
-            "AND name LIKE 'telemetry_extended_grid_%' "
-            "ORDER BY name"
-        )
-        for name, total_rows in wide_result.result_rows:
-            label = f"{name} ({total_rows:,} satır, geniş format)"
-            wide_options[label] = (name, None)
-
+        schema = get_clickhouse_schema()
+        batch_summary = fetch_auair_batch_summary()
     except Exception as exc:
-        st.error(f"Grid tabloları listelenemedi: {exc}")
+        st.error(f"AU-AIR batch özeti okunamadı: {exc}")
         return
 
-    table_options = {**long_options, **wide_options}
-
-    if not table_options:
+    if schema.empty:
         st.info(
-            "Henüz yüklenmiş bir grid tablosu yok -- Dagster'da "
-            "`extended_telemetry_load` asset'ini materialize edin."
+            "ClickHouse AU-AIR tablosu henüz oluşturulmamış. Dagster'da "
+            "`clickhouse_auair_batch` asset'ini materialize edin."
         )
         return
 
-    selected_label = st.selectbox(
-        "Tablo/uçuş seçin",
-        options=list(table_options.keys()),
-        key="grid_table_selector",
-    )
-    selected_table, selected_flight_tag = table_options[selected_label]
-
-    preview_rows = st.slider(
-        "Önizleme satır sayısı", 10, 1000, 100, key="grid_preview_rows"
-    )
-
-    try:
-        client = get_clickhouse_client()
-        if selected_flight_tag is not None:
-            preview = client.query(
-                f"SELECT * FROM `{get_clickhouse_database()}`.`{selected_table}` "
-                "WHERE flight_tag = {flight_tag:String} "
-                f"LIMIT {preview_rows}",
-                parameters={"flight_tag": selected_flight_tag},
-            )
-        else:
-            preview = client.query(
-                f"SELECT * FROM `{get_clickhouse_database()}`.`{selected_table}` "
-                f"LIMIT {preview_rows}"
-            )
-        df = pd.DataFrame(preview.result_rows, columns=preview.column_names)
-    except Exception as exc:
-        st.error(f"Veri okunamadı: {exc}")
+    if batch_summary.empty:
+        st.info(
+            "Tablo oluşturulmuş ancak henüz yüklenmiş bir AU-AIR batch'i "
+            "yok. Dagster'da `clickhouse_auair_batch` asset'ini "
+            "materialize edin."
+        )
         return
 
-    st.dataframe(df, use_container_width=True)
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("Batch", len(batch_summary))
+    metric_columns[1].metric("Toplam satır", f"{batch_summary['Satır sayısı'].sum():,}")
+    metric_columns[2].metric("Tablo kolonu", f"{len(schema):,}")
 
-    st.download_button(
-        "CSV olarak indir (önizleme)",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{selected_flight_tag or selected_table}_preview.csv",
-        mime="text/csv",
-        key="grid_csv_download",
+    st.dataframe(
+        batch_summary,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "Batch/uçuş filtreleme, kolon seçimi, önizleme ve indirme işlemleri "
+        "aşağıdaki telemetri bölümünden yapılır."
     )
 
     st.divider()
@@ -4957,10 +5011,10 @@ def render_grid_tables_section():
 
 def render_data_export():
 
-    render_grid_tables_section()
+    render_wide_auair_batches_section()
 
     st.subheader(
-        "AU-AIR Telemetri Verisi"
+        "Geniş Şemalı AU-AIR Telemetri Verisi"
     )
 
     st.caption(
@@ -5005,7 +5059,7 @@ def render_data_export():
         st.warning(
             f"`{get_clickhouse_database()}.{get_clickhouse_table()}` "
             "tablosu henüz oluşturulmamış. Dagster pipeline'ı en az bir "
-            "kez çalışıp `clickhouse_telemetry` asset'ini materialize "
+            "kez çalışıp `clickhouse_auair_batch` asset'ini materialize "
             "ettikten sonra burada veri görünecektir."
         )
 
@@ -5030,7 +5084,7 @@ def render_data_export():
     if min_time is None or max_time is None:
 
         st.warning(
-            "İşlenmiş parquet dosyalarında veri bulunamadı."
+            "ClickHouse AU-AIR tablosunda henüz veri bulunamadı."
         )
 
         return
@@ -5957,9 +6011,16 @@ def render_data_export():
     with st.container(border=True):
 
         try:
+            available_columns = get_available_columns()
             has_lat_lon = (
-                "latitude" in get_available_columns()
-                and "longitude" in get_available_columns()
+                resolve_clickhouse_column(
+                    "latitude",
+                    available_columns,
+                ) is not None
+                and resolve_clickhouse_column(
+                    "longitude",
+                    available_columns,
+                ) is not None
             )
         except Exception:
             has_lat_lon = False
@@ -7126,8 +7187,18 @@ def render_flight_map():
 
             return
 
+        required_route_columns = {
+            "latitude",
+            "longitude",
+            "altitude",
+        }
+
+        if not required_route_columns.issubset(route_df.columns):
+            flights_without_location.append(flight_id)
+            continue
+
         route_df = route_df.dropna(
-            subset=["latitude", "longitude", "altitude"]
+            subset=list(required_route_columns)
         )
 
         if route_df.empty:
@@ -7423,12 +7494,15 @@ def main():
 
             fetch_runs.clear()
             fetch_asset_catalog.clear()
+            get_metadata_history_filters.clear()
+            fetch_metadata_history.clear()
             load_alerts.clear()
             get_available_columns.clear()
             get_numeric_columns.clear()
             get_clickhouse_schema.clear()
             get_available_classes.clear()
             get_available_flights.clear()
+            fetch_auair_batch_summary.clear()
             check_clickhouse_connection.clear()
 
             st.rerun()

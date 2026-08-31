@@ -1,7 +1,7 @@
 """Publish one validated processed batch through a stable DVC dataset pointer.
 
 Each logical dataset owns one stable pointer, for example
-``data/processed/flightdemo.dvc``. Individual batches live below the tracked
+``data/processed/auair.dvc``. Individual batches live below the tracked
 dataset directory and do not create their own DVC pointer files.
 
 The module exposes ``publish_processed_batch`` for Dagster assets and also has

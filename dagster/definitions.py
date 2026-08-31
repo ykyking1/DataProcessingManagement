@@ -1,4 +1,4 @@
-"""Dagster code location for the MinIO-backed data workflows."""
+"""Dagster code location for generated high-column AU-AIR telemetry."""
 
 import json
 import os
@@ -27,28 +27,34 @@ from alerting import alert_on_failure, clear_alert_on_success
 from postgres_catalog import record_terminal_job_run, resolve_pipeline_identity
 
 
-raw_flight_to_staged_job = define_asset_job(
-    name="raw_flight_to_staged_job",
-    selection=AssetSelection.assets(assets.staged_flight_tab),
+raw_auair_to_staged_job = define_asset_job(
+    name="raw_auair_to_staged_job",
+    selection=AssetSelection.assets(assets.staged_auair_tab),
     hooks={alert_on_failure, clear_alert_on_success},
 )
 
-staged_flight_to_published_job = define_asset_job(
-    name="staged_flight_to_published_job",
+staged_auair_to_published_job = define_asset_job(
+    name="staged_auair_to_published_job",
     selection=AssetSelection.assets(
-        assets.processed_flight_batch,
-        assets.validated_flight_batch,
-        assets.clickhouse_flight_batch,
-        assets.published_flight_dataset,
+        assets.processed_auair_batch,
+        assets.validated_auair_batch,
+        assets.clickhouse_auair_batch,
+        assets.published_auair_dataset,
     ),
     hooks={alert_on_failure, clear_alert_on_success},
 )
 
 
 MONITORED_PIPELINE_JOBS = [
-    raw_flight_to_staged_job,
-    staged_flight_to_published_job,
+    raw_auair_to_staged_job,
+    staged_auair_to_published_job,
 ]
+
+STAGED_AUAIR_FILE_PATTERN = re.compile(
+    r"^(?P<row_count>\d+)_(?P<column_count>\d+)_"
+    r"flight_[1-9]\d*_[0-9]{4}-[0-9]{2}-[0-9]{2}\.tab\.zst$",
+    flags=re.IGNORECASE,
+)
 
 
 def _record_terminal_status(context, status: str) -> None:
@@ -91,13 +97,6 @@ def postgres_run_canceled_sensor(context):
     _record_terminal_status(context, "CANCELED")
 
 
-STAGED_FLIGHT_FILE_PATTERN = re.compile(
-    r"^(?P<dataset_id>flightdemo)_"
-    r"(?P<row_count>\d+)rows(?:[_-].*)?\.tab\.zst$",
-    flags=re.IGNORECASE,
-)
-
-
 def _job_has_active_run(context, job_name: str) -> bool:
     active_statuses = [
         DagsterRunStatus.QUEUED,
@@ -119,20 +118,22 @@ def _job_has_active_run(context, job_name: str) -> bool:
 
 
 @sensor(
-    job=raw_flight_to_staged_job,
+    job=raw_auair_to_staged_job,
     minimum_interval_seconds=30,
     default_status=DefaultSensorStatus.RUNNING,
     description=(
-        "Watches raw flight .tab objects in MinIO and launches one staging run "
-        "for each new object key/ETag combination."
+        "Watches generated high-column AU-AIR .tab objects in MinIO and "
+        "launches one streaming ZSTD staging run per object key/ETag."
     ),
 )
-def raw_flight_minio_sensor(context):
-    if _job_has_active_run(context, raw_flight_to_staged_job.name):
-        return SkipReason("A raw-to-staged run is already active.")
+def raw_auair_minio_sensor(context):
+    if _job_has_active_run(context, raw_auair_to_staged_job.name):
+        return SkipReason("An AU-AIR raw-to-staged run is already active.")
 
     source_bucket = os.getenv("MINIO_RAW_BUCKET", assets.DEFAULT_RAW_BUCKET)
-    source_prefix = os.getenv("MINIO_RAW_PREFIX", "flight-tab/inbox/").strip("/")
+    source_prefix = os.getenv(
+        "MINIO_AUAIR_RAW_PREFIX", "auair-tab/inbox/"
+    ).strip("/")
     if source_prefix:
         source_prefix = f"{source_prefix}/"
 
@@ -169,19 +170,21 @@ def raw_flight_minio_sensor(context):
         observed_etags[object_identity] = source_etag
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))
         return RunRequest(
-            run_key=f"raw-minio:{object_identity}:{source_etag}",
+            run_key=f"raw-auair-minio:{object_identity}:{source_etag}",
             run_config={
                 "ops": {
-                    "staged_flight_tab": {
+                    "staged_auair_tab": {
                         "config": {
                             "source_bucket": source_bucket,
                             "source_key": item.object_name,
                             "source_etag": source_etag,
+                            "staged_prefix": assets.DEFAULT_STAGED_PREFIX,
                         }
                     }
                 }
             },
             tags={
+                "dataset_id": assets.DEFAULT_DATASET_ID,
                 "source_bucket": source_bucket,
                 "source_key": item.object_name,
                 "source_etag": source_etag,
@@ -189,28 +192,29 @@ def raw_flight_minio_sensor(context):
         )
 
     return SkipReason(
-        f"No new .tab objects under s3://{source_bucket}/{source_prefix}."
+        f"No new generated AU-AIR .tab objects under "
+        f"s3://{source_bucket}/{source_prefix}."
     )
 
 
 @sensor(
-    job=staged_flight_to_published_job,
+    job=staged_auair_to_published_job,
     minimum_interval_seconds=30,
     default_status=DefaultSensorStatus.RUNNING,
     description=(
-        "Watches staged flight .tab.zst objects in MinIO and launches the "
-        "Spark -> GE -> ClickHouse + DVC workflow for each object key/ETag pair."
+        "Watches staged generated AU-AIR .tab.zst objects and launches the "
+        "Spark -> validation -> ClickHouse -> DVC workflow."
     ),
 )
-def staged_flight_minio_sensor(context):
-    if _job_has_active_run(context, staged_flight_to_published_job.name):
-        return SkipReason("A staged-to-published run is already active.")
+def staged_auair_minio_sensor(context):
+    if _job_has_active_run(context, staged_auair_to_published_job.name):
+        return SkipReason("An AU-AIR staged-to-published run is already active.")
 
     source_bucket = os.getenv(
         "MINIO_STAGED_BUCKET", assets.DEFAULT_STAGED_BUCKET
     )
     source_prefix = os.getenv(
-        "MINIO_STAGED_PREFIX", assets.DEFAULT_STAGED_PREFIX
+        "MINIO_AUAIR_STAGED_PREFIX", assets.DEFAULT_STAGED_PREFIX
     ).strip("/")
     if source_prefix:
         source_prefix = f"{source_prefix}/"
@@ -248,10 +252,11 @@ def staged_flight_minio_sensor(context):
             continue
 
         file_name = PurePosixPath(item.object_name).name
-        match = STAGED_FLIGHT_FILE_PATTERN.fullmatch(file_name)
+        match = STAGED_AUAIR_FILE_PATTERN.fullmatch(file_name)
         if match is None:
             context.log.warning(
-                "Ignoring staged object with an unsupported name: s3://%s/%s",
+                "Ignoring staged object with an unsupported generated AU-AIR "
+                "name: s3://%s/%s",
                 source_bucket,
                 item.object_name,
             )
@@ -259,59 +264,79 @@ def staged_flight_minio_sensor(context):
             cursor_changed = True
             continue
 
-        dataset_id = match.group("dataset_id").lower()
         batch_id = file_name[: -len(".tab.zst")]
         row_count = int(match.group("row_count"))
-        column_count = assets.FLIGHT_COLUMN_COUNT
+        column_count = int(match.group("column_count"))
+        if column_count < assets.AUAIR_MIN_COLUMN_COUNT:
+            context.log.warning(
+                "Ignoring generated AU-AIR object with only %s columns: "
+                "s3://%s/%s",
+                column_count,
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
 
         observed_etags[object_identity] = source_etag
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))
+        timestamp_format = "yyyy-MM-dd'T'HH:mm:ss.SSS"
         return RunRequest(
-            run_key=f"staged-minio:{object_identity}:{source_etag}",
+            run_key=f"staged-auair-minio:{object_identity}:{source_etag}",
             run_config={
                 "ops": {
-                    "processed_flight_batch": {
+                    "processed_auair_batch": {
                         "config": {
                             "source_bucket": source_bucket,
                             "source_key": item.object_name,
                             "source_etag": source_etag,
-                            "dataset_id": dataset_id,
                             "batch_id": batch_id,
                             "row_count": row_count,
                             "column_count": column_count,
+                            "timestamp_format": timestamp_format,
                         }
-                    }
+                    },
+                    "validated_auair_batch": {
+                        "config": {
+                            "timestamp_format": timestamp_format,
+                        }
+                    },
                 }
             },
             tags={
-                "dataset_id": dataset_id,
+                "dataset_id": assets.DEFAULT_DATASET_ID,
                 "batch_id": batch_id,
                 "source_bucket": source_bucket,
                 "source_key": item.object_name,
                 "source_etag": source_etag,
+                "column_count": str(column_count),
             },
         )
 
     if cursor_changed:
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))
     return SkipReason(
-        f"No new supported .tab.zst objects under "
+        f"No new supported generated AU-AIR .tab.zst objects under "
         f"s3://{source_bucket}/{source_prefix}."
     )
 
 
 defs = Definitions(
     assets=[
-        assets.staged_flight_tab,
-        assets.processed_flight_batch,
-        assets.validated_flight_batch,
-        assets.clickhouse_flight_batch,
-        assets.published_flight_dataset,
+        assets.staged_auair_tab,
+        assets.processed_auair_batch,
+        assets.validated_auair_batch,
+        assets.clickhouse_auair_batch,
+        assets.published_auair_dataset,
     ],
-    jobs=[raw_flight_to_staged_job, staged_flight_to_published_job],
+    jobs=[
+        raw_auair_to_staged_job,
+        staged_auair_to_published_job,
+    ],
     sensors=[
-        raw_flight_minio_sensor,
-        staged_flight_minio_sensor,
+        raw_auair_minio_sensor,
+        staged_auair_minio_sensor,
         postgres_run_success_sensor,
         postgres_run_failure_sensor,
         postgres_run_canceled_sensor,

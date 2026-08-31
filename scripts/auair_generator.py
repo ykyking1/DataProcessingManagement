@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-auair_sim.py — AU-AIR benzeri sentetik İHA telemetri üreteci (.tab çıktısı)
+auair_generator.py — AU-AIR benzeri sentetik İHA telemetri üreteci
+
+Üretilen ``.tab``/``.tab.gz`` dosyalarını MinIO'daki raw bucket'a yükler,
+yüklenen nesne boyutunu doğrular ve ``--keep-local`` verilmedikçe yerel geçici
+dosyaları temizler. Varsayılan hedef ``s3://data-raw/auair-tab/inbox/``'tır.
 
 Gerçek AU-AIR (32.823 satır, 8 uçuş oturumu, 5 Hz) anotasyon dosyasından
 çıkarılan istatistiklere göre kalibre edilmiştir:
@@ -19,9 +23,9 @@ rotanın türevinden hesaplanır, yani kolonlar birbiriyle tutarlıdır.
 
 Kullanım
 --------
-    python auair_sim.py --rows 1000000 --cols 500
-    python auair_sim.py --rows 5000 --cols 30 --out-dir ./data --preview 5
-    python auair_sim.py --rows 200000 --cols 2000 --flights 12 --split-flights --gzip
+    docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 1000000 --cols 500
+    docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 5000 --cols 30 --preview 5
+    docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 200000 --cols 2000 --flights 12 --split-flights --gzip
 
 Çıktı dosyası adı:  <satır>_<sütun>_<flight_id>.tab
     tek dosya    : 1000000_500_flight_1_2019-08-29.tab   (ad, ilk uçuşun kimliği)
@@ -52,8 +56,12 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
+from minio import Minio
+from minio.error import S3Error
 
 # --------------------------------------------------------------------------
 # AU-AIR sabitleri (gerçek veri setinden ölçüldü)
@@ -97,6 +105,46 @@ STR_COLUMNS = {"flight_id", "time", "image_name", "platform"}
 
 FIXED_COLUMNS = ["flight_id", "time"]           # her zaman en solda, asla kırpılmaz
 N_BASE_TOTAL = len(FIXED_COLUMNS) + len(BASE_COLUMNS)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_WORK_DIR = PROJECT_ROOT / "local_data" / "auair_generator"
+DEFAULT_RAW_BUCKET = "data-raw"
+DEFAULT_RAW_PREFIX = "auair-tab/inbox"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalise_endpoint(endpoint: str, secure: bool) -> tuple[str, bool]:
+    """Return the host:port endpoint form expected by the MinIO client."""
+
+    if "://" not in endpoint:
+        return endpoint.rstrip("/"), secure
+
+    parsed = urlparse(endpoint)
+    if not parsed.netloc:
+        raise ValueError(f"Invalid MinIO endpoint: {endpoint}")
+    return parsed.netloc, parsed.scheme.lower() == "https"
+
+
+def _object_exists(client: Minio, bucket: str, object_name: str) -> bool:
+    try:
+        client.stat_object(bucket, object_name)
+        return True
+    except S3Error as error:
+        if error.code in {"NoSuchKey", "NoSuchObject", "NotFound"}:
+            return False
+        raise
+
+
+def _ensure_bucket(client: Minio, bucket: str) -> None:
+    if not client.bucket_exists(bucket):
+        client.make_bucket(bucket)
+        print(f"Created bucket: {bucket}", flush=True)
 
 
 
@@ -507,7 +555,7 @@ def generate(rows: int, cols: int, out_dir: str, flights: int, hz: float, seed: 
             import multiprocessing as mp
             import shutil
             import tempfile
-            tmpdir = tempfile.mkdtemp(prefix="auair_sim_")
+            tmpdir = tempfile.mkdtemp(prefix="auair_generator_")
             try:
                 tasks = [(fi, counts[fi], starts[fi].isoformat(), hz, seed, names, blocks,
                           precision, fast, chunk_size, os.path.join(tmpdir, f"part_{fi:04d}.tab"))
@@ -553,7 +601,11 @@ def generate(rows: int, cols: int, out_dir: str, flights: int, hz: float, seed: 
                 "columns": names[:64] + (["..."] if len(names) > 64 else []),
                 "source_profile": "AU-AIR 2019 (32823 satır, 8 oturum, 5 Hz)",
             }
-            with open(os.path.join(out_dir, stem + ".meta.json"), "w") as f:
+            with open(
+                os.path.join(out_dir, stem + ".meta.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
                 json.dump(meta, f, indent=2, ensure_ascii=False)
 
     elapsed = time.time() - t_begin
@@ -563,16 +615,150 @@ def generate(rows: int, cols: int, out_dir: str, flights: int, hz: float, seed: 
     return paths
 
 
+def _metadata_path(data_path: Path) -> Path:
+    name = data_path.name
+    if name.endswith(".tab.gz"):
+        stem = name[: -len(".tab.gz")]
+    elif name.endswith(".tab"):
+        stem = name[: -len(".tab")]
+    else:
+        raise ValueError(f"Unsupported generated data file: {data_path}")
+    return data_path.with_name(f"{stem}.meta.json")
+
+
+def _object_name(prefix: str, file_name: str) -> str:
+    return "/".join(part for part in (prefix.strip("/"), file_name) if part)
+
+
+def _upload_and_verify(
+    client: Minio,
+    *,
+    bucket: str,
+    object_name: str,
+    local_path: Path,
+    content_type: str,
+    overwrite: bool,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    local_size = local_path.stat().st_size
+    if not overwrite and _object_exists(client, bucket, object_name):
+        existing = client.stat_object(bucket, object_name)
+        if existing.size != local_size:
+            raise RuntimeError(
+                f"Existing object size mismatch for {object_name}: "
+                f"local={local_size}, MinIO={existing.size}; use --overwrite "
+                "to replace it"
+            )
+        print(
+            f"Verified existing object: s3://{bucket}/{object_name} "
+            f"({existing.size:,} bytes, etag={existing.etag})",
+            flush=True,
+        )
+        return
+
+    client.fput_object(
+        bucket,
+        object_name,
+        str(local_path),
+        content_type=content_type,
+        metadata=metadata,
+    )
+    uploaded = client.stat_object(bucket, object_name)
+    if uploaded.size != local_size:
+        raise RuntimeError(
+            f"Upload size mismatch for {object_name}: "
+            f"local={local_size}, MinIO={uploaded.size}"
+        )
+
+    print(
+        f"Verified: s3://{bucket}/{object_name} "
+        f"({uploaded.size:,} bytes, etag={uploaded.etag})",
+        flush=True,
+    )
+
+
+def upload_generated_files(
+    client: Minio,
+    args: argparse.Namespace,
+    generated_paths: list[str],
+) -> None:
+    """Upload generated data and optional metadata sidecars to raw MinIO."""
+
+    _ensure_bucket(client, args.bucket)
+    for generated_path in generated_paths:
+        data_path = Path(generated_path).resolve()
+        sidecar_path = _metadata_path(data_path)
+        sidecar = None
+        if sidecar_path.is_file():
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+
+        row_count = (
+            sidecar.get("rows")
+            if isinstance(sidecar, dict)
+            else data_path.name.split("_", maxsplit=1)[0]
+        )
+        object_metadata = {
+            "generator": "auair_generator",
+            "rows": str(row_count),
+            "columns": str(args.cols),
+            "flights": str(
+                len(sidecar.get("flights", []))
+                if isinstance(sidecar, dict)
+                else min(args.flights, args.rows)
+            ),
+            "sample-rate-hz": str(args.hz),
+            "generator-seed": str(args.seed),
+        }
+        data_object_name = _object_name(args.prefix, data_path.name)
+        _upload_and_verify(
+            client,
+            bucket=args.bucket,
+            object_name=data_object_name,
+            local_path=data_path,
+            content_type=(
+                "application/gzip"
+                if data_path.name.endswith(".gz")
+                else "text/tab-separated-values"
+            ),
+            overwrite=args.overwrite,
+            metadata=object_metadata,
+        )
+
+        if sidecar_path.is_file():
+            _upload_and_verify(
+                client,
+                bucket=args.bucket,
+                object_name=_object_name(args.prefix, sidecar_path.name),
+                local_path=sidecar_path,
+                content_type="application/json",
+                overwrite=args.overwrite,
+            )
+
+        if not args.keep_local:
+            data_path.unlink()
+            sidecar_path.unlink(missing_ok=True)
+
+    print("AU-AIR raw MinIO upload is ready and verified.", flush=True)
+
+
 # --------------------------------------------------------------------------
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
-        description="AU-AIR benzeri sentetik İHA telemetrisi üretir (.tab)",
+        description=(
+            "AU-AIR benzeri sentetik İHA telemetrisi üretir ve MinIO raw "
+            "bucket'ına yükler"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--rows", type=int, default=100_000, help="üretilecek satır sayısı")
     p.add_argument("--cols", type=int, default=64, help="toplam sütun sayısı (flight_id ve time dahil)")
-    p.add_argument("--out-dir", default=".", help="çıktı klasörü")
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=DEFAULT_WORK_DIR,
+        help="yükleme öncesi yerel çalışma klasörü",
+    )
     p.add_argument("--flights", type=int, default=8, help="uçuş oturumu sayısı")
     p.add_argument("--hz", type=float, default=HZ_DEFAULT, help="örnekleme frekansı")
     p.add_argument("--seed", type=int, default=42, help="rastgelelik tohumu (tekrarlanabilirlik)")
@@ -589,21 +775,103 @@ def main(argv=None) -> int:
     p.add_argument("--jobs", type=int, default=1,
                    help="paralel süreç sayısı (uçuş başına bölünür; büyük dosyalar için)")
     p.add_argument("--no-meta", action="store_true", help="yan meta.json dosyasını yazma")
+    p.add_argument(
+        "--endpoint",
+        default=os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000"),
+        help="MinIO endpoint'i (container içinde genellikle minio:9000)",
+    )
+    p.add_argument(
+        "--access-key",
+        default=(
+            os.getenv("MINIO_ACCESS_KEY")
+            or os.getenv("MINIO_ROOT_USER")
+            or "minioadmin"
+        ),
+        help="MinIO access key",
+    )
+    p.add_argument(
+        "--secret-key",
+        default=(
+            os.getenv("MINIO_SECRET_KEY")
+            or os.getenv("MINIO_ROOT_PASSWORD")
+            or "minioadmin123"
+        ),
+        help="MinIO secret key",
+    )
+    p.add_argument(
+        "--secure",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MINIO_SECURE"),
+        help="MinIO bağlantısında TLS kullan",
+    )
+    p.add_argument(
+        "--bucket",
+        default=os.getenv("MINIO_RAW_BUCKET", DEFAULT_RAW_BUCKET),
+        help="raw MinIO bucket adı",
+    )
+    p.add_argument(
+        "--prefix",
+        default=os.getenv("AUAIR_RAW_PREFIX", DEFAULT_RAW_PREFIX),
+        help="bucket içindeki AU-AIR hedef prefix'i",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="aynı isimdeki MinIO nesnelerinin üzerine yaz",
+    )
+    p.add_argument(
+        "--keep-local",
+        action="store_true",
+        help="doğrulanmış yüklemeden sonra yerel dosyaları silme",
+    )
     a = p.parse_args(argv)
 
     if a.rows <= 0:
         p.error("--rows pozitif olmalı")
     if a.flights <= 0:
         p.error("--flights pozitif olmalı")
+    if not a.bucket.strip():
+        p.error("--bucket boş olamaz")
+    if not a.endpoint.strip():
+        p.error("--endpoint boş olamaz")
 
     try:
         resolve_columns(a.cols)
     except ValueError as exc:
         p.error(str(exc))
 
-    generate(a.rows, a.cols, a.out_dir, min(a.flights, a.rows), a.hz, a.seed, a.start,
-             a.chunk_size, a.precision, not a.no_header, a.gzip, a.preview, not a.no_meta,
-             a.fast, a.jobs, a.split_flights)
+    generated_paths = generate(
+        a.rows,
+        a.cols,
+        str(a.out_dir),
+        min(a.flights, a.rows),
+        a.hz,
+        a.seed,
+        a.start,
+        a.chunk_size,
+        a.precision,
+        not a.no_header,
+        a.gzip,
+        a.preview,
+        not a.no_meta,
+        a.fast,
+        a.jobs,
+        a.split_flights,
+    )
+
+    try:
+        endpoint, secure = _normalise_endpoint(a.endpoint.strip(), a.secure)
+        client = Minio(
+            endpoint,
+            access_key=a.access_key,
+            secret_key=a.secret_key,
+            secure=secure,
+        )
+        upload_generated_files(client, a, generated_paths)
+    except (OSError, RuntimeError, ValueError, S3Error) as exc:
+        print(f"MinIO upload failed: {exc}", file=sys.stderr)
+        return 1
+
     return 0
 
 
