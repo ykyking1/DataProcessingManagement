@@ -1,2 +1,0 @@
-[AIRCRAFT_50K] 50k_100000: kaynak=13652.5MB zst=3401.7MB (4.01x) sikistir=936.8sn yukle_minio=41.22sn yukle_ch=650.9sn satir=100000 ch_disk=6153.4MB (6 parca) OK
-TEK_DOSYA_TAMAMLANDI

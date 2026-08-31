@@ -1,0 +1,5 @@
+outs:
+- md5: f52e2693193689a9359b13a4af1dcacf
+  size: 28701380
+  hash: md5
+  path: synthetic_10k_1000.tab

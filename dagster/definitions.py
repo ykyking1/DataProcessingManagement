@@ -22,6 +22,7 @@ import assets
 
 from schedules.telemetry_sensor import telemetry_sensor
 from schedules.mx_tab_sensor import mx_tab_sensor
+from schedules.own_grid_sensor import own_grid_sensor
 
 # İKİ HOOK'U DA İÇERİ AKTAR
 from alerting import alert_on_failure, clear_alert_on_success
@@ -51,9 +52,12 @@ uav_data_pipeline_job = define_asset_job(
     selection=AssetSelection.all()
     - AssetSelection.assets(
         assets.extended_telemetry_load,
+        assets.grid_telemetry_load,
         assets.spark_processed_tab,
         assets.spark_validated_tab,
         assets.dvc_published_mx_tab,
+        assets.own_tab_validated,
+        assets.own_tab_dvc_published,
     ),
     hooks={
         alert_on_failure,
@@ -70,6 +74,17 @@ mx_tab_quality_job = define_asset_job(
     ),
 )
 
+# mx_tab_quality_job ile AYNI fikir (GE + DVC), ama kendi sentetik grid
+# dosyalarımız üzerinde ve Spark'sız (bkz. assets.py::own_tab_validated
+# docstring'i -- bu ortamda JVM kurulu değil).
+own_data_quality_job = define_asset_job(
+    name="own_data_quality_job",
+    selection=AssetSelection.assets(
+        assets.own_tab_validated,
+        assets.own_tab_dvc_published,
+    ),
+)
+
 
 # ===========================================================================
 # DEFINITIONS
@@ -81,10 +96,12 @@ defs = Definitions(
     jobs=[
         uav_data_pipeline_job,
         mx_tab_quality_job,
+        own_data_quality_job,
     ],
 
     sensors=[
         telemetry_sensor,
         mx_tab_sensor,
+        own_grid_sensor,
     ],
 )
