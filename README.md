@@ -50,6 +50,48 @@ yapılmadı (bkz. plan Bölüm 5, madde 1).
 --max-row-group-rows <N>      Parquet row-group başına azami satır (varsayılan 100000)
 ```
 
+## AU-AIR sentetik raw veri üretimi
+
+AU-AIR benzeri 10.000-50.000 sütunlu sentetik `.tab` verisini üretip doğrudan
+MinIO raw bucket'ına yüklemek için çalışan Dagster container'ında:
+
+```sh
+docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 100000 --cols 10000 --chunk-size 500
+```
+
+50.000 sütun hedefinde generator belleğini sınırlamak için daha küçük üretim
+chunk'ı kullanılabilir: `--cols 50000 --chunk-size 100`.
+
+Varsayılan hedef `s3://data-raw/auair-tab/inbox/` yoludur. Yüklenen dosyanın
+boyutu MinIO üzerinden doğrulanır; doğrulama başarılıysa yerel geçici dosya
+silinir. Yerel kopyayı korumak için `--keep-local`, aynı isimli nesneyi
+değiştirmek için `--overwrite` kullanılabilir. Tüm seçenekler için `--help`
+çalıştırılabilir.
+
+Dagster'ın AU-AIR sensorleri bu yolu otomatik olarak izler ve veriyi şu akıştan
+geçirir:
+
+```text
+data-raw/auair-tab/inbox
+  → data-staged/auair-tab (.tab.zst)
+  → Spark preprocess (dinamik kolonlar korunur)
+  → Great Expectations validation raporu
+  → ClickHouse s3() bulk load (auair_telemetry, compact wide parts)
+  → DVC add + MinIO DVC remote push
+```
+
+Son iki adım sıralıdır: ClickHouse yazımı başarıyla tamamlanmadan DVC publish
+asset'i başlamaz. ClickHouse loader, 10K-50K kolonlu veriyi Yusuf'un yüksek
+kolon stratejisiyle yaklaşık 1 milyar hücrelik fiziksel satır parçalarına
+ayırır. Parçalar yalnız taşıma amacıyla geçici MinIO objeleri olarak oluşturulur,
+ClickHouse tarafından `s3()` ile bulk okunur ve yükleme denemesinin sonunda
+silinir; kalıcı MinIO dataset yayını sonraki DVC asset'ine aittir.
+
+İlk validation profili bilinçli olarak basittir: dosyada en az 17 kolon,
+beklenen satır/kolon sayısı, zorunlu `flight_id`/`time` ve temel AU-AIR
+kolonlarının doluluğu, flight ID biçimi, koordinat/irtifa ve görüntü boyutu
+aralıkları kontrol edilir. Profil adı `auair-placeholder-v1`'dir.
+
 ## PostgreSQL'den commit mesajı önerisi
 
 Başarıyla tamamlanmış ve DVC'ye publish edilmiş bir Dagster run'ı için

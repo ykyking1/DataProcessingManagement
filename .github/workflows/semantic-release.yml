@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/minio-dvc-e2e-docker
+      - "test/**"
   workflow_dispatch:
 
 permissions:

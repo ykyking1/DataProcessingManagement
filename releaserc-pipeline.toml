@@ -16,6 +16,11 @@ match = "feat/minio-dvc-e2e-docker"
 prerelease = true
 prerelease_token = "rc"
 
+[semantic_release.branches.test]
+match = "test/.+"
+prerelease = true
+prerelease_token = "test"
+
 [semantic_release.commit_parser_options]
 minor_tags = ["feat", "schema"]
 patch_tags = ["fix", "perf", "build"]

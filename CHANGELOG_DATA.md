@@ -2,6 +2,16 @@
 
 <!-- version list -->
 
+## v0.2.6-test.1 (2026-08-31)
+
+**Data processed with `pipeline-v0.5.0-dirty` (`7118ddb3b72f013772f0e8f110ed0fe5c48f9f30`)**
+
+### Data
+
+- **auair**: Publish 100_10000_flight_1_2019-08-29
+  ([`980964a`](https://github.com/ykyking1/DataProcessingManagement/commit/980964af939753c5a6763ed9d16571f839e1db21))
+
+
 ## v0.2.5 (2026-08-31)
 
 ### Data

@@ -24,7 +24,7 @@
 - Başarılı, başarısız ve iptal edilmiş terminal run durumları Dagster run-status sensor'larıyla PostgreSQL'e aktarılacaktır.
 - DVC hash'i yeniden hesaplanmayacak; `dvc add` tarafından oluşturulan küçük `.dvc` pointer dosyasından okunacaktır.
 - Commit mesajı üretimi Dagster asset'lerinin sorumluluğu değildir. `scripts/get_commit_message.py`, tam Dagster `run_id` ile yalnızca PostgreSQL kataloğunu okuyan ayrı bir developer aracıdır.
-- Araç sadece `SUCCESS` durumundaki ve aktif yayın asset'i (`published_flight_dataset`) materialization kaydı bulunan run'lar için öneri üretir; Git commit veya push komutu çalıştırmaz.
+- Araç sadece `SUCCESS` durumundaki ve aktif yayın asset'i (`published_auair_dataset`) materialization kaydı bulunan run'lar için öneri üretir; Git commit veya push komutu çalıştırmaz.
 - Dirty pipeline run'ları engellenmez. Önerilen commit mesajında `Pipeline-Git-Dirty: true` olarak açıkça belirtilir.
 - Dagster container'ı Windows host repository'sini `/workspace` altında bind mount ettiği için container Git'inde `core.autocrlf=true` kullanılacaktır. Böylece Windows CRLF checkout'u sahte repository/pipeline dirty durumu üretmez; gerçek DVC pointer ve kod değişiklikleri dirty olarak kalmaya devam eder.
 
@@ -43,3 +43,33 @@
 - Validation başarılı olduğunda veri ClickHouse `default.telemetry` MergeTree tablosuna geniş formatta ve `ZSTD(3)` codec ile yazılacaktır; dashboard sorguları aynı tabloyu doğrudan okuyacaktır.
 - ClickHouse retry idempotency'si teknik `source_batch_id` kolonu üzerinden sağlanacak; yalnız yeniden yüklenen batch silinip tekrar yazılacaktır.
 - DVC, işlenmiş flight verisini `data/processed/flightdemo.dvc` adlı tek ve kararlı dataset pointer'ı üzerinden versiyonlayacaktır.
+
+## 2026-08-31 — Yüksek kolonlu sentetik AU-AIR aktif veri hattı
+
+- 2026-08-28 tarihli sabit 17 kolonlu `flightdemo` veri hattı aktif mimari
+  olmaktan çıkarılmıştır.
+- Aktif dataset kimliği `auair`, raw prefix `auair-tab/inbox`, staged prefix
+  `auair-tab` olacaktır.
+- Generatorün dinamik kolonları Spark ve validation boyunca korunacaktır.
+- Validation sonrasında veri önce ClickHouse `auair_telemetry` tablosuna
+  yazılacak, ClickHouse asset'i başarıyla tamamlandıktan sonra DVC publish
+  başlayacaktır. ClickHouse ve DVC paralel çalışmayacaktır.
+- Aktif üretim ölçeği 10.000-50.000 kolondur. ClickHouse yazımı Yusuf'un
+  `working_pipeline_yusuf` branchinde doğrulanan wide-grid yaklaşımını kullanır:
+  yaklaşık 1 milyar hücrelik satır parçalama, geçici MinIO objelerinden `s3()`
+  bulk insert, dar AU-AIR tipleri/codec'leri, compact MergeTree partları,
+  merge-pressure throttling ve OOM query watchdog. Geçici ingest objeleri
+  ClickHouse denemesinden sonra silinir; asset sırası değişmez.
+- DVC, dataset'i `data/processed/auair.dvc` kararlı pointer'ı üzerinden MinIO
+  DVC remote'una gönderecektir.
+- `pipeline_catalog.pipeline_asset_materializations` kanonik materialization
+  geçmişi olarak kalacaktır. Dashboard uyumluluğu için
+  `public.asset_metadata_history` gerçek tablosu trigger ile bu katalogdan
+  beslenecek ve tablo yokken yazılmış eski materialization kayıtları şema
+  migrasyonunda geriye dönük doldurulacaktır.
+- Dashboard container'ına hem `POSTGRES_DATABASE` hem de PostgreSQL image
+  uyumluluğu için `POSTGRES_DB` verilecektir.
+- Dagster hook'larının yazdığı `alerts.json`, hosttaki
+  `dagster/data/alerts` klasörü üzerinden Dagster'a yazılabilir ve dashboard'a
+  salt okunur bind mount edilecektir; iki servis aynı `ALERT_FILE` yolunu
+  kullanacaktır.
