@@ -7,24 +7,32 @@ Backend:
     klasöründeki parquet dosyalarını sorgu zamanında okur — veri
     ayrıca ClickHouse'un kendi depolama motoruna INSERT edilmez)
 
-AU-AIR telemetry kolonları:
+AU-AIR telemetry kolonları (native frame şeması):
 
+    flight_id
     time
-    latitude
-    longitude
-    altitude
-    velocity_x
-    velocity_y
-    velocity_z
-    roll
-    pitch
-    yaw
     image_name
-    box_x
-    box_y
-    box_w
-    box_h
-    class
+    image_width
+    image_height
+    platform
+    longitude
+    latitude
+    altitude
+    linear_x
+    linear_y
+    linear_z
+    angle_phi
+    angle_theta
+    angle_psi
+    num_objects
+    obj_human
+    obj_car
+    obj_truck
+    obj_van
+    obj_motorbike
+    obj_bicycle
+    obj_bus
+    obj_trailer
 
 Dashboard bölümleri:
 
@@ -153,24 +161,52 @@ MAIN_TAB_LABELS = [
 # ============================================================
 
 AU_AIR_COLUMNS = [
-    "time",
-    "latitude",
-    "longitude",
-    "altitude",
-    "velocity_x",
-    "velocity_y",
-    "velocity_z",
-    "roll",
-    "pitch",
-    "yaw",
-    "image_name",
-    "box_x",
-    "box_y",
-    "box_w",
-    "box_h",
-    "class",
     "flight_id",
+    "time",
+    "image_name",
+    "image_width",
+    "image_height",
+    "platform",
+    "longitude",
+    "latitude",
+    "altitude",
+    "linear_x",
+    "linear_y",
+    "linear_z",
+    "angle_phi",
+    "angle_theta",
+    "angle_psi",
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
 ]
+
+# Native frame şemasında satır bazlı tek bir "class" etiketi YOK; onun
+# yerine her frame için nesne türü başına bir sayaç kolonu var
+# (obj_human, obj_car, ...). Panonun "Class" filtresi bu kolonlar
+# üzerinden "frame'de en az 1 X var" (obj_X > 0) şeklinde çalışır.
+# Anahtarlar (human, car, ...) BİLEREK İngilizce -- hem AU-AIR
+# etiketleriyle hem de LLM_SINIF_ESANLAMLI'nin çıktısıyla birebir
+# eşleşiyor, böylece LLM sınıf eşleştirmesi değişmeden çalışmaya devam
+# ediyor. Eski, gerçek bir `class` kolonu olan tablolarda ise (bkz.
+# get_available_classes / build_clickhouse_where) klasik `class IN (...)`
+# davranışı korunur.
+OBJ_CLASS_COLUMNS = {
+    "human": "obj_human",
+    "car": "obj_car",
+    "truck": "obj_truck",
+    "van": "obj_van",
+    "motorbike": "obj_motorbike",
+    "bicycle": "obj_bicycle",
+    "bus": "obj_bus",
+    "trailer": "obj_trailer",
+}
 
 
 # ============================================================
@@ -511,25 +547,43 @@ def get_numeric_columns() -> list:
 
 @st.cache_data(ttl=60)
 def get_available_classes() -> list:
+    """
+    "Class" filtresi için seçilebilir değerleri döner.
+
+    - Eski şema (gerçek bir `class` kolonu var): tablodaki DISTINCT
+      `class` değerleri.
+    - Native frame şeması (`class` kolonu yok ama obj_* sayaç kolonları
+      var): tabloda GERÇEKTEN bulunan nesne türleri (human, car, ...);
+      filtre bunları `obj_X > 0` olarak uygular (bkz.
+      build_clickhouse_where).
+    - Hiçbiri yoksa: boş liste (filtre bölümü gizlenir).
+    """
 
     columns = get_available_columns()
 
-    if "class" not in columns:
-        return []
+    if "class" in columns:
 
-    client = get_clickhouse_client()
+        client = get_clickhouse_client()
 
-    query = f"""
-    SELECT DISTINCT class
-    FROM {get_clickhouse_source()}
-    ORDER BY class
-    """
+        query = f"""
+        SELECT DISTINCT class
+        FROM {get_clickhouse_source()}
+        WHERE class != ''
+        ORDER BY class
+        """
 
-    result = client.query(query)
+        result = client.query(query)
 
+        return [
+            row[0]
+            for row in result.result_rows
+        ]
+
+    # class kolonu yok -- obj_* sayaç kolonlarından türet.
     return [
-        row[0]
-        for row in result.result_rows
+        class_name
+        for class_name, obj_column in OBJ_CLASS_COLUMNS.items()
+        if obj_column in columns
     ]
 
 
@@ -570,7 +624,13 @@ def get_available_flights() -> list:
 # TIME ARALIĞI
 # ============================================================
 
+@st.cache_data(ttl=60)
 def get_time_range():
+    # Kardeş yardımcılarla (get_available_columns / get_clickhouse_schema
+    # / get_lat_lon_bounds ...) aynı şekilde cache'lenir -- eskiden
+    # cache'siz olduğu için "Veri Gözat / Dışa Aktar" sekmesinin her
+    # rerun'unda (her widget etkileşiminde) ClickHouse'a fazladan bir
+    # min/max sorgusu gidiyordu. "🔄 Şimdi yenile" bu cache'i de temizler.
 
     client = get_clickhouse_client()
 
@@ -707,28 +767,28 @@ except Exception as _llm_import_exc:  # ollama kurulu değil, dosya yok vb.
 # basinc...) BİLEREK burada yok; bkz. yukarıdaki not.
 LLM_ALAN_TO_COLUMN = {
     "irtifa": "altitude",
-    "yatis_acisi": "roll",
-    "yunuslama_acisi": "pitch",
-    "sapma_acisi": "yaw",
-    "dikey_hiz": "velocity_z",
+    "yatis_acisi": "angle_phi",
+    "yunuslama_acisi": "angle_theta",
+    "sapma_acisi": "angle_psi",
+    "dikey_hiz": "linear_z",
     "enlem": "latitude",
     "boylam": "longitude",
     "hiz": "hiz",
 }
 
 # "hiz" (yer hızı / ground speed), AU-AIR'de tek bir kolon DEĞİLDİR --
-# velocity_x/velocity_y bileşenlerinden hesaplanır (dikey bileşen
-# velocity_z zaten ayrı olarak dikey_hiz'de karşılanıyor, o yüzden
-# burada yalnızca yatay bileşenler kullanılır). "ifade" alanı SABİT,
+# linear_x/linear_y bileşenlerinden hesaplanır (dikey bileşen linear_z
+# zaten ayrı olarak dikey_hiz'de karşılanıyor, o yüzden burada yalnızca
+# yatay bileşenler kullanılır). "ifade" alanı SABİT,
 # kod içinde tanımlı bir SQL ifadesidir (kullanıcı girdisinden gelmez),
 # bu yüzden build_clickhouse_where içinde parametre bağlamaya gerek
 # duymadan doğrudan sorguya eklenebilir -- injection riski taşımaz.
 COMPUTED_VALUE_COLUMNS = {
     "hiz": {
         "ifade": (
-            "sqrt(velocity_x * velocity_x + velocity_y * velocity_y)"
+            "sqrt(linear_x * linear_x + linear_y * linear_y)"
         ),
-        "gereken_kolonlar": ["velocity_x", "velocity_y"],
+        "gereken_kolonlar": ["linear_x", "linear_y"],
     },
 }
 
@@ -742,6 +802,30 @@ LLM_OPERATOR_TO_FILTER_OP = {
     "!=": "!=",
     "between": RANGE_FILTER_OPERATOR,
 }
+
+# Panonun tanıdığı kanonik operatör kümesi.
+_LLM_CANONICAL_OPERATORS = set(VALUE_FILTER_OPERATORS) | {RANGE_FILTER_OPERATOR}
+
+
+def _llm_normalize_operator(operator):
+    """
+    qwen'in operatör yazımını (==, =, >, between, ...) panonun kanonik
+    operatör kümesine ( <, <=, >, >=, =, !=, between ) indirger.
+    Tanınmıyorsa None döner.
+
+    Model bazen "==" bazen "=" döndürebiliyor; ayrıca gun_ici_saat /
+    ucus_suresi / deger filtresi yolları eskiden bunu her biri kendi
+    içinde farklı ele aldığı için "2 saate eşit" gibi bir ifade değer
+    filtresinde çalışırken uçuş süresi filtresinde sessizce
+    düşebiliyordu. Tek bir normalize noktası bu tutarsızlığı giderir.
+    """
+
+    if operator is None:
+        return None
+
+    mapped = LLM_OPERATOR_TO_FILTER_OP.get(operator, operator)
+
+    return mapped if mapped in _LLM_CANONICAL_OPERATORS else None
 
 
 def llm_gun_ici_saat_filtresini_ayikla(filtreler: list):
@@ -778,6 +862,15 @@ def llm_gun_ici_saat_filtresini_ayikla(filtreler: list):
             )
             continue
 
+        operator = _llm_normalize_operator(operator)
+
+        if operator is None:
+            uyari = (
+                f"Saat filtresi için '{f.get('operator')}' operatörü "
+                "desteklenmiyor, atlandı."
+            )
+            continue
+
         try:
 
             if operator == RANGE_FILTER_OPERATOR:
@@ -788,7 +881,7 @@ def llm_gun_ici_saat_filtresini_ayikla(filtreler: list):
                 bas, bit = int(min(deger)), int(max(deger))
                 saatler = list(range(max(bas, 0), min(bit, 23) + 1))
 
-            elif operator == "==":
+            elif operator == "=":
                 saatler = [int(deger)]
 
             elif operator in (">", ">="):
@@ -842,21 +935,21 @@ def llm_ucus_suresi_filtresini_ayikla(filtreler: list):
             kalan.append(f)
             continue
 
-        operator = f.get("operator")
+        ham_operator = f.get("operator")
         deger = f.get("deger")
 
-        if operator is None or deger is None:
+        if ham_operator is None or deger is None:
             uyari = (
                 "Uçuş süresi filtresi için net bir eşik anlaşılamadı, "
                 "atlandı."
             )
             continue
 
-        if operator not in VALUE_FILTER_OPERATORS and (
-            operator != RANGE_FILTER_OPERATOR
-        ):
+        operator = _llm_normalize_operator(ham_operator)
+
+        if operator is None:
             uyari = (
-                f"Uçuş süresi filtresi için '{operator}' operatörü "
+                f"Uçuş süresi filtresi için '{ham_operator}' operatörü "
                 "desteklenmiyor, atlandı."
             )
             continue
@@ -964,7 +1057,7 @@ def llm_filtreleri_donustur(
             )
             continue
 
-        filtre_op = LLM_OPERATOR_TO_FILTER_OP.get(operator)
+        filtre_op = _llm_normalize_operator(operator)
 
         if filtre_op is None:
             atlananlar.append(
@@ -1284,15 +1377,24 @@ LLM_KOLON_ESANLAMLI = {
     "boylam": "longitude", "lon": "longitude", "lng": "longitude",
     "irtifa": "altitude", "yükseklik": "altitude",
     "yukseklik": "altitude", "rakım": "altitude", "rakim": "altitude",
-    "yatış açısı": "roll", "yatis acisi": "roll",
-    "yunuslama açısı": "pitch", "yunuslama acisi": "pitch",
-    "sapma açısı": "yaw", "sapma acisi": "yaw",
-    "dikey hız": "velocity_z", "dikey hiz": "velocity_z",
-    "sınıf": "class", "sinif": "class",
+    "yatış açısı": "angle_phi", "yatis acisi": "angle_phi",
+    "yunuslama açısı": "angle_theta", "yunuslama acisi": "angle_theta",
+    "sapma açısı": "angle_psi", "sapma acisi": "angle_psi",
+    "dikey hız": "linear_z", "dikey hiz": "linear_z",
     "uçuş kimliği": "flight_id", "ucus kimligi": "flight_id",
     "uçuş no": "flight_id", "ucus no": "flight_id",
     "görüntü adı": "image_name", "goruntu adi": "image_name",
     "resim adı": "image_name", "resim adi": "image_name",
+    "platform": "platform",
+    "nesne sayısı": "num_objects", "nesne sayisi": "num_objects",
+    "insan sayısı": "obj_human", "insan sayisi": "obj_human",
+    "araba sayısı": "obj_car", "araba sayisi": "obj_car",
+    "kamyon sayısı": "obj_truck", "kamyon sayisi": "obj_truck",
+    "minibüs sayısı": "obj_van", "minibus sayisi": "obj_van",
+    "motosiklet sayısı": "obj_motorbike", "motosiklet sayisi": "obj_motorbike",
+    "bisiklet sayısı": "obj_bicycle", "bisiklet sayisi": "obj_bicycle",
+    "otobüs sayısı": "obj_bus", "otobus sayisi": "obj_bus",
+    "römork sayısı": "obj_trailer", "romork sayisi": "obj_trailer",
 }
 
 _LLM_KOLON_KELIMESI = re.compile(r"\bkolon(u|unu|ları|larını|lar)?\b", re.I)
@@ -1638,14 +1740,44 @@ def build_clickhouse_where(
 
     if selected_classes:
 
-        conditions.append(
-            "class IN {classes:Array(String)}"
+        available_columns = set(
+            get_available_columns()
         )
 
-        parameters["classes"] = [
-            str(x)
-            for x in selected_classes
-        ]
+        if "class" in available_columns:
+
+            # Eski şema: satır bazlı gerçek `class` etiketi.
+            conditions.append(
+                "class IN {classes:Array(String)}"
+            )
+
+            parameters["classes"] = [
+                str(x)
+                for x in selected_classes
+            ]
+
+        else:
+
+            # Native frame şeması: `class` kolonu yok -- seçilen nesne
+            # türlerinin obj_* sayaç kolonları üzerinden "frame'de en az
+            # 1 adet var" (obj_X > 0) koşulu kurulur; birden fazla tür
+            # seçilirse OR ile birleştirilir ("insan VEYA araba içeren
+            # frame'ler"). Kolon adları sabit OBJ_CLASS_COLUMNS
+            # sözlüğünden gelip tabloya karşı doğrulandığı için (kullanıcı
+            # girdisi değil) parametre bağlamaya gerek yoktur.
+            obj_conditions = []
+
+            for class_name in selected_classes:
+
+                obj_column = OBJ_CLASS_COLUMNS.get(str(class_name))
+
+                if obj_column and obj_column in available_columns:
+                    obj_conditions.append(f"`{obj_column}` > 0")
+
+            if obj_conditions:
+                conditions.append(
+                    "(" + " OR ".join(obj_conditions) + ")"
+                )
 
     if selected_flights:
 
@@ -1890,6 +2022,38 @@ def build_clickhouse_where(
 
 
 # ============================================================
+# SELECT PROJEKSİYONU (kolon listesi -> SQL)
+# ============================================================
+
+def _build_select_projection(columns=None) -> str:
+    """
+    Verilen kolon listesini `SELECT DISTINCT ...` için bir SQL
+    projeksiyonuna çevirir. `columns` boşsa ya da hiçbiri tabloda yoksa
+    "*" döner; aksi halde yalnızca tabloda GERÇEKTEN var olan kolonlar
+    backtick'lenerek döner.
+
+    Hem count_filtered_rows hem fetch_filtered_telemetry AYNI
+    projeksiyonu kullanır -- aksi halde satır sayısı `DISTINCT *`
+    üzerinden, getirilen veri ise `DISTINCT <seçili kolonlar>` üzerinden
+    hesaplanıp ikisi birbirini tutmuyordu (kolon seçimi daraltıldığında
+    "Filtreye uyan satır sayısı", sonra getirilen/indirilen satır
+    sayısından çok daha büyük çıkabiliyordu).
+    """
+
+    if not columns:
+        return "*"
+
+    available = set(get_available_columns())
+
+    valid_columns = [col for col in columns if col in available]
+
+    if not valid_columns:
+        return "*"
+
+    return ", ".join(f"`{col}`" for col in valid_columns)
+
+
+# ============================================================
 # SATIR SAYISI
 # ============================================================
 
@@ -1897,6 +2061,7 @@ def count_filtered_rows(
     start_time=None,
     end_time=None,
     selected_classes=None,
+    columns=None,
     value_filters=None,
     selected_flights=None,
     area_polygons=None,
@@ -1925,9 +2090,13 @@ def count_filtered_rows(
         flights_mode,
     )
 
+    # NOT: projeksiyon fetch_filtered_telemetry ile AYNI olmalı --
+    # yoksa gösterilen satır sayısı getirilen veriyle uyuşmaz.
+    projection = _build_select_projection(columns)
+
     query = f"""
     SELECT count() FROM (
-        SELECT DISTINCT *
+        SELECT DISTINCT {projection}
         FROM {get_clickhouse_source()}
         WHERE {where}
     )
@@ -1980,30 +2149,10 @@ def fetch_filtered_telemetry(
         flights_mode,
     )
 
-    if columns:
-
-        # Güvenlik açısından sadece mevcut kolonları kullan
-        available = set(
-            get_available_columns()
-        )
-
-        valid_columns = [
-            col
-            for col in columns
-            if col in available
-        ]
-
-        if not valid_columns:
-            col_expr = "*"
-        else:
-            col_expr = ", ".join(
-                f"`{col}`"
-                for col in valid_columns
-            )
-
-    else:
-
-        col_expr = "*"
+    # Güvenlik açısından sadece tabloda gerçekten var olan kolonlar
+    # kullanılır; count_filtered_rows ile birebir aynı projeksiyon
+    # (bkz. _build_select_projection).
+    col_expr = _build_select_projection(columns)
 
     query = f"""
     SELECT DISTINCT {col_expr}
@@ -4839,11 +4988,11 @@ def render_grid_tables_section():
     formatı (telemetry_long) da destekleyecek şekilde güncellendi.
 
     AŞAĞIDAKİ AU-AIR görünümünden (render_data_export'un geri kalanı)
-    KASITLI OLARAK bağımsız: AU-AIR'in filtre/harita mantığı sabit
-    17 sütuna (latitude, velocity_x, roll, ...) bağlı -- grid
-    tablolarının hiçbir ortak sütunu yok, o mantığa zorlanırsa hata
-    verir. Bu yüzden burada sadece ham SELECT + basit tablo/CSV
-    önizlemesi var, filtre yok.
+    KASITLI OLARAK bağımsız: AU-AIR'in filtre/harita mantığı native
+    frame şemasına (latitude, longitude, linear_x, angle_phi, ...)
+    bağlı -- grid tablolarının hiçbir ortak sütunu yok, o mantığa
+    zorlanırsa hata verir. Bu yüzden burada sadece ham SELECT + basit
+    tablo/CSV önizlemesi var, filtre yok.
 
     İki kaynak destekleniyor:
       - `telemetry_long`: TEK, sabit 5 sütunlu (flight_tag, time,
@@ -6228,6 +6377,13 @@ def render_data_export():
         except Exception:
             available_classes = []
 
+        try:
+            class_is_object_mode = (
+                "class" not in get_available_columns()
+            )
+        except Exception:
+            class_is_object_mode = False
+
         selected_classes = []
 
         if available_classes:
@@ -6243,9 +6399,17 @@ def render_data_export():
                 ]
 
             selected_classes = st.multiselect(
-                "Class",
+                "Nesne türü (frame'de en az 1 adet)"
+                if class_is_object_mode
+                else "Class",
                 options=available_classes,
-                help="Boş bırakılırsa tüm class değerleri seçilir.",
+                help=(
+                    "Seçilen nesne türlerinden en az birini içeren "
+                    "frame'ler gösterilir (obj_X > 0). Boş bırakılırsa "
+                    "tümü dahil edilir."
+                    if class_is_object_mode
+                    else "Boş bırakılırsa tüm class değerleri seçilir."
+                ),
                 key="export_selected_classes",
             )
 
@@ -6537,6 +6701,28 @@ def render_data_export():
 
         columns_mode = "exclude" if columns_mode_exclude else "include"
 
+        # "Dahil et" ve "hariç tut" listeleri anlamca zıt (birinde
+        # gösterilecek, diğerinde gizlenecek kolonlar). Aynı widget
+        # key'i kullanıldığı için, mod değiştirildiğinde Streamlit eski
+        # seçimi olduğu gibi taşıyıp yanlış listeyi doldurmuş oluyordu
+        # (ör. "sadece time+altitude göster" seçiliyken hariç-tut'a
+        # geçince "time+altitude'u gizle"ye dönüşüyordu). Mod her
+        # değiştiğinde seçim sıfırlanır ki widget moduna uygun
+        # default'la (boş / tüm AU-AIR kolonları) yeniden başlasın.
+        _prev_columns_mode_exclude = st.session_state.get(
+            "_export_columns_mode_exclude_prev"
+        )
+
+        if (
+            _prev_columns_mode_exclude is not None
+            and _prev_columns_mode_exclude != columns_mode_exclude
+        ):
+            st.session_state.pop("export_selected_columns", None)
+
+        st.session_state["_export_columns_mode_exclude_prev"] = (
+            columns_mode_exclude
+        )
+
         selected_columns = st.multiselect(
             "Hariç tutulacak kolonlar"
             if columns_mode_exclude
@@ -6605,7 +6791,11 @@ def render_data_export():
         active_filters.append(hour_label)
 
     if selected_classes:
-        active_filters.append(f"{len(selected_classes)} class")
+        active_filters.append(
+            f"{len(selected_classes)} nesne türü"
+            if class_is_object_mode
+            else f"{len(selected_classes)} class"
+        )
 
     if area_polygons:
         area_label = (
@@ -6743,6 +6933,7 @@ def render_data_export():
                     start_time=start_time,
                     end_time=end_time,
                     selected_classes=selected_classes,
+                    columns=columns,
                     value_filters=value_filters,
                     selected_flights=selected_flights,
                     area_polygons=area_polygons,
@@ -7323,6 +7514,9 @@ def main():
         "telemetri verisi ise ClickHouse üzerinden okunmaktadır."
     )
 
+    # (Kaydırma konumunu koruyan script, sekme seçimi belirlendikten
+    # SONRA aşağıda enjekte edilir -- bkz. "_scroll_reset_pending".)
+
     # ========================================================
     # SEKME SEÇİMİ + KONTROLLER (yan panel)
     # ========================================================
@@ -7355,6 +7549,7 @@ def main():
     if st.query_params.get("goto") == "runs":
 
         st.session_state["active_main_tab"] = MAIN_TAB_RUNS
+        st.session_state["_scroll_reset_pending"] = True
 
         del st.query_params["goto"]
 
@@ -7390,6 +7585,10 @@ def main():
                 use_container_width=True,
             ):
                 st.session_state["active_main_tab"] = tab_label
+                # Sekme değişiminde kaydırma konumu KORUNMAZ -- yeni
+                # sekmenin en üstünden başlanır (bkz. aşağıdaki kaydırma
+                # script'i / "_scroll_reset_pending").
+                st.session_state["_scroll_reset_pending"] = True
                 st.rerun()
 
         st.divider()
@@ -7407,7 +7606,11 @@ def main():
             list(
                 REFRESH_OPTIONS.keys()
             ),
-            index=2,
+            # Varsayılan "Kapalı": otomatik yenileme açıkken her tetikleme
+            # tam bir rerun yapıp filtre ekranını başa sardırıyor / seçim
+            # yapılırken sayfayı sıçratıyordu. Kullanıcı ihtiyaç duyarsa
+            # buradan açabilir.
+            index=0,
         )
 
         refresh_seconds = (
@@ -7429,6 +7632,9 @@ def main():
             get_clickhouse_schema.clear()
             get_available_classes.clear()
             get_available_flights.clear()
+            get_time_range.clear()
+            get_lat_lon_bounds.clear()
+            fetch_flight_route.clear()
             check_clickhouse_connection.clear()
 
             st.rerun()
@@ -7452,6 +7658,101 @@ def main():
             )
 
     active_tab = st.session_state["active_main_tab"]
+
+    # ========================================================
+    # KAYDIRMA KONUMUNU KORU
+    # ========================================================
+    #
+    # Streamlit her widget etkileşiminde tüm script'i yeniden çalıştırıp
+    # tarayıcıyı sayfanın en üstüne kaydırıyor -- çok filtreli bu ekranda
+    # bir multiselect'e dokununca "sayfa sıçradı" hissi veriyordu. Bu
+    # script kaydırma konumunu sessionStorage'da tutup her rerun'dan
+    # sonra geri yükler.
+    #
+    # Önceki sürüm tek bir requestAnimationFrame ile geri yüklüyordu;
+    # bu, tablo/harita gibi dinamik içerik daha DOM'a yerleşmeden
+    # çalıştığı için konum kısa kalıyor, sonra içerik büyüyünce sayfa
+    # yine kayıyordu. Ayrıca sekme değiştirince bile eski konuma geri
+    # dönüyordu. Bu sürüm:
+    #   - içerik yerleşene kadar kısa bir pencere boyunca (~1.2 sn)
+    #     tekrar tekrar dener, hedefe ulaşınca / sayfa daha fazla
+    #     kaydırılamayınca durur,
+    #   - geri yükleme sürerken kullanıcı elle kaydırırsa bırakır
+    #     (programatik set ile arasında >40px sapma),
+    #   - geri yükleme sürerken ara (kırpılmış) değeri KAYDETMEZ,
+    #   - sekme değişiminde (_scroll_reset_pending) konumu koruMAZ,
+    #     yeni sekmenin en üstüne gider.
+    scroll_reset_pending = st.session_state.pop(
+        "_scroll_reset_pending", False
+    )
+
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          try {{
+            var KEY = "dpm_scroll_y";
+            var RESET = {"true" if scroll_reset_pending else "false"};
+            var w = window.parent;
+            var doc = w.document;
+            var scroller = doc.scrollingElement || doc.documentElement;
+
+            if (!w.__dpmScrollHooked) {{
+              w.__dpmScrollHooked = true;
+              w.addEventListener("scroll", function () {{
+                if (w.__dpmRestoring) {{
+                  // Geri yükleme sürüyor: bizim programatik set'imizden
+                  // belirgin şekilde saparsa kullanıcı kaydırmıştır ->
+                  // geri yüklemeyi bırak, yeni konumu kaydet.
+                  if (Math.abs(scroller.scrollTop - (w.__dpmLastSet || 0)) > 40) {{
+                    w.__dpmRestoring = false;
+                  }} else {{
+                    return;
+                  }}
+                }}
+                try {{
+                  w.sessionStorage.setItem(KEY, String(scroller.scrollTop));
+                }} catch (e) {{}}
+              }}, {{ passive: true }});
+            }}
+
+            if (RESET) {{
+              w.__dpmRestoring = false;
+              try {{ w.sessionStorage.removeItem(KEY); }} catch (e) {{}}
+              w.requestAnimationFrame(function () {{ scroller.scrollTop = 0; }});
+              return;
+            }}
+
+            var saved = w.sessionStorage.getItem(KEY);
+            if (saved === null) {{ return; }}
+
+            var target = parseFloat(saved);
+            var attempts = 0;
+            w.__dpmRestoring = true;
+
+            var restore = function () {{
+              if (!w.__dpmRestoring) {{ return; }}
+              attempts += 1;
+              var maxTop = scroller.scrollHeight - scroller.clientHeight;
+              var clamped = Math.max(0, Math.min(target, maxTop));
+              w.__dpmLastSet = clamped;
+              scroller.scrollTop = clamped;
+              var reached = Math.abs(scroller.scrollTop - target) < 2;
+              var pageMaxedOut = maxTop <= target + 2;
+              if (reached || pageMaxedOut || attempts >= 20) {{
+                w.__dpmRestoring = false;
+              }} else {{
+                w.setTimeout(restore, 60);
+              }}
+            }};
+
+            w.requestAnimationFrame(restore);
+          }} catch (e) {{ /* farklı origin / storage kapalı -- sessizce geç */ }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
     # ========================================================
     # AUTO REFRESH

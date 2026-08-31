@@ -16,39 +16,67 @@ import zstandard as zstd
 from clickhouse_driver import Client
 
 
+# Native AU-AIR frame schema (dashboard-serving flight telemetry).
 FLIGHT_COLUMNS = [
-    "time",
-    "latitude",
-    "longitude",
-    "altitude",
-    "velocity_x",
-    "velocity_y",
-    "velocity_z",
-    "roll",
-    "pitch",
-    "yaw",
-    "image_name",
-    "box_x",
-    "box_y",
-    "box_w",
-    "box_h",
-    "class",
     "flight_id",
-]
-NUMERIC_COLUMNS = {
-    "latitude",
+    "time",
+    "image_name",
+    "image_width",
+    "image_height",
+    "platform",
     "longitude",
+    "latitude",
     "altitude",
-    "velocity_x",
-    "velocity_y",
-    "velocity_z",
-    "roll",
-    "pitch",
-    "yaw",
-    "box_x",
-    "box_y",
-    "box_w",
-    "box_h",
+    "linear_x",
+    "linear_y",
+    "linear_z",
+    "angle_phi",
+    "angle_theta",
+    "angle_psi",
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
+]
+FLOAT_COLUMNS = {
+    "longitude",
+    "latitude",
+    "altitude",
+    "linear_x",
+    "linear_y",
+    "linear_z",
+    "angle_phi",
+    "angle_theta",
+    "angle_psi",
+}
+INTEGER_COLUMNS = {
+    "image_width",
+    "image_height",
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
+}
+STRING_COLUMNS = {"flight_id", "image_name", "platform"}
+# ClickHouse column type per source column (technical columns handled
+# separately in _create_table).
+COLUMN_DDL_TYPE = {
+    "flight_id": "LowCardinality(String)",
+    "time": "DateTime64(3, 'UTC')",
+    "image_name": "String",
+    "platform": "LowCardinality(String)",
+    **{column: "Float64" for column in FLOAT_COLUMNS},
+    **{column: "Int32" for column in INTEGER_COLUMNS},
 }
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CLICKHOUSE_SETTINGS = {
@@ -82,31 +110,37 @@ def _clickhouse_client() -> Client:
     )
 
 
+_EXPECTED_COLUMN_SET = {*FLIGHT_COLUMNS, "source_batch_id", "ingested_at"}
+
+
 def _create_table(client: Client, database: str, table: str) -> str:
     database_name = _quote_identifier(database)
     table_name = f"{database_name}.{_quote_identifier(table)}"
     client.execute(f"CREATE DATABASE IF NOT EXISTS {database_name}")
+
+    # Şema tamamen AU-AIR frame kolonlarına geçtiği için eski tablo
+    # (velocity_x, box_*, class ...) uyumsuzdur. Kolon kümesi beklenenden
+    # farklıysa tabloyu düşür ve yeniden oluştur; batch'ler MinIO/DVC'den
+    # yeniden yüklenebilir. Kolon kümesi eşleşiyorsa DROP yapılmaz.
+    existing = client.execute(
+        "SELECT name FROM system.columns "
+        "WHERE database = %(db)s AND table = %(tbl)s",
+        {"db": database, "tbl": table},
+    )
+    if existing:
+        existing_names = {row[0] for row in existing}
+        if existing_names != _EXPECTED_COLUMN_SET:
+            client.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    column_lines = ",\n            ".join(
+        f"{_quote_identifier(column)} {COLUMN_DDL_TYPE[column]} CODEC(ZSTD(3))"
+        for column in FLIGHT_COLUMNS
+    )
     client.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {table_name}
         (
-            time DateTime64(3, 'UTC') CODEC(ZSTD(3)),
-            latitude Float64 CODEC(ZSTD(3)),
-            longitude Float64 CODEC(ZSTD(3)),
-            altitude Float64 CODEC(ZSTD(3)),
-            velocity_x Float64 CODEC(ZSTD(3)),
-            velocity_y Float64 CODEC(ZSTD(3)),
-            velocity_z Float64 CODEC(ZSTD(3)),
-            roll Float64 CODEC(ZSTD(3)),
-            pitch Float64 CODEC(ZSTD(3)),
-            yaw Float64 CODEC(ZSTD(3)),
-            image_name String CODEC(ZSTD(3)),
-            box_x Float64 CODEC(ZSTD(3)),
-            box_y Float64 CODEC(ZSTD(3)),
-            box_w Float64 CODEC(ZSTD(3)),
-            box_h Float64 CODEC(ZSTD(3)),
-            class LowCardinality(String) CODEC(ZSTD(3)),
-            flight_id LowCardinality(String) CODEC(ZSTD(3)),
+            {column_lines},
             source_batch_id LowCardinality(String) CODEC(ZSTD(3)),
             ingested_at DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(ZSTD(3))
         )
@@ -127,7 +161,9 @@ def _parse_time(value: str) -> datetime:
 
 
 def _parse_row(row: dict[str, str], batch_id: str) -> tuple:
-    missing = [column for column in FLIGHT_COLUMNS if row.get(column) in {None, ""}]
+    missing = [
+        column for column in FLIGHT_COLUMNS if row.get(column) in {None, ""}
+    ]
     if missing:
         raise ValueError(f"Flight row contains blank required fields: {missing}")
 
@@ -136,8 +172,10 @@ def _parse_row(row: dict[str, str], batch_id: str) -> tuple:
         value = row[column]
         if column == "time":
             values.append(_parse_time(value))
-        elif column in NUMERIC_COLUMNS:
+        elif column in FLOAT_COLUMNS:
             values.append(float(value))
+        elif column in INTEGER_COLUMNS:
+            values.append(int(float(value)))
         else:
             values.append(value.strip())
     values.append(batch_id)

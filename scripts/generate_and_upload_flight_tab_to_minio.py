@@ -1,9 +1,12 @@
 """Generate deterministic dashboard-ready flight telemetry and upload it to MinIO.
 
-The generated TAB schema is the contract consumed by the Streamlit dashboard:
+The generated TAB schema is the native AU-AIR frame contract consumed by the
+Streamlit dashboard:
 
-``time, latitude, longitude, altitude, velocity_x, velocity_y, velocity_z,
-roll, pitch, yaw, image_name, box_x, box_y, box_w, box_h, class, flight_id``
+``flight_id, time, image_name, image_width, image_height, platform, longitude,
+latitude, altitude, linear_x, linear_y, linear_z, angle_phi, angle_theta,
+angle_psi, num_objects, obj_human, obj_car, obj_truck, obj_van, obj_motorbike,
+obj_bicycle, obj_bus, obj_trailer``
 
 Files are produced one at a time in the ignored ``local_data`` directory. The
 local file is removed only after MinIO confirms the uploaded object size.
@@ -26,25 +29,46 @@ from minio.error import S3Error
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_ID = "flightdemo"
+# Native AU-AIR frame schema (matches preprocess_flight_tab_spark.py).
 FLIGHT_COLUMNS = [
-    "time",
-    "latitude",
-    "longitude",
-    "altitude",
-    "velocity_x",
-    "velocity_y",
-    "velocity_z",
-    "roll",
-    "pitch",
-    "yaw",
-    "image_name",
-    "box_x",
-    "box_y",
-    "box_w",
-    "box_h",
-    "class",
     "flight_id",
+    "time",
+    "image_name",
+    "image_width",
+    "image_height",
+    "platform",
+    "longitude",
+    "latitude",
+    "altitude",
+    "linear_x",
+    "linear_y",
+    "linear_z",
+    "angle_phi",
+    "angle_theta",
+    "angle_psi",
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
 ]
+OBJECT_COUNT_COLUMNS = [
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
+]
+SYNTHETIC_PLATFORM = "Synthetic UAV"
+SYNTHETIC_IMAGE_WIDTH = 1920
+SYNTHETIC_IMAGE_HEIGHT = 1080
 DEFAULT_FLIGHT_COUNT = 6
 DEFAULT_ROWS_PER_FLIGHT = 1_000
 DEFAULT_INTERVAL_SECONDS = 10
@@ -60,7 +84,6 @@ ROUTE_CENTERS = (
     ("KON", 37.8746, 32.4932),
     ("ANT", 36.8969, 30.7133),
 )
-DETECTION_CLASSES = np.array(["car", "truck", "person", "van"])
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -210,42 +233,43 @@ def _flight_chunk(
         + 1_100 * np.sin(np.pi * progress)
         + rng.normal(0, 8, row_count)
     )
-    velocity_x = 52 + 9 * np.sin(progress * 2 * np.pi + phase)
-    velocity_y = 38 + 7 * np.cos(progress * 2 * np.pi + phase)
-    velocity_z = 4.5 * np.sin(progress * 4 * np.pi)
-    roll = 8 * np.sin(progress * 5 * np.pi + phase)
-    pitch = 5 * np.cos(progress * 4 * np.pi + phase)
-    yaw = np.mod(35 + flight_index * 41 + progress * 230, 360)
+    linear_x = 52 + 9 * np.sin(progress * 2 * np.pi + phase)
+    linear_y = 38 + 7 * np.cos(progress * 2 * np.pi + phase)
+    linear_z = 4.5 * np.sin(progress * 4 * np.pi)
+    angle_phi = 8 * np.sin(progress * 5 * np.pi + phase)
+    angle_theta = 5 * np.cos(progress * 4 * np.pi + phase)
+    angle_psi = np.mod(35 + flight_index * 41 + progress * 230, 360)
 
-    box_x = 120 + np.mod(positions * 7 + flight_index * 83, 1_420)
-    box_y = 80 + np.mod(positions * 5 + flight_index * 59, 760)
-    box_w = 80 + np.mod(positions * 3 + flight_index * 17, 220)
-    box_h = 60 + np.mod(positions * 2 + flight_index * 23, 180)
-    class_indexes = rng.integers(0, len(DETECTION_CLASSES), size=row_count)
     flight_id = f"{route_code}-{batch_token}-{flight_index + 1:02d}"
+
+    object_counts = {
+        column: rng.integers(0, 6, size=row_count)
+        for column in OBJECT_COUNT_COLUMNS
+    }
+    num_objects = np.sum(list(object_counts.values()), axis=0)
 
     frame = pd.DataFrame(
         {
+            "flight_id": [flight_id] * row_count,
             "time": timestamps.strftime(OUTPUT_TIMESTAMP_FORMAT),
-            "latitude": latitude.round(6),
-            "longitude": longitude.round(6),
-            "altitude": altitude.round(3),
-            "velocity_x": velocity_x.round(3),
-            "velocity_y": velocity_y.round(3),
-            "velocity_z": velocity_z.round(3),
-            "roll": roll.round(3),
-            "pitch": pitch.round(3),
-            "yaw": yaw.round(3),
             "image_name": [
                 f"{batch_id}_{flight_index + 1:02d}_{row_number:06d}.jpg"
                 for row_number in positions
             ],
-            "box_x": box_x.astype(float),
-            "box_y": box_y.astype(float),
-            "box_w": box_w.astype(float),
-            "box_h": box_h.astype(float),
-            "class": DETECTION_CLASSES[class_indexes],
-            "flight_id": [flight_id] * row_count,
+            "image_width": SYNTHETIC_IMAGE_WIDTH,
+            "image_height": SYNTHETIC_IMAGE_HEIGHT,
+            "platform": SYNTHETIC_PLATFORM,
+            "longitude": longitude.round(6),
+            "latitude": latitude.round(6),
+            "altitude": altitude.round(3),
+            "linear_x": linear_x.round(3),
+            "linear_y": linear_y.round(3),
+            "linear_z": linear_z.round(3),
+            "angle_phi": angle_phi.round(3),
+            "angle_theta": angle_theta.round(3),
+            "angle_psi": angle_psi.round(3),
+            "num_objects": num_objects,
+            **object_counts,
         },
         columns=FLIGHT_COLUMNS,
     )

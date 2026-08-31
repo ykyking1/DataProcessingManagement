@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 from pathlib import Path, PurePosixPath
 
 from dagster import (
@@ -91,11 +90,11 @@ def postgres_run_canceled_sensor(context):
     _record_terminal_status(context, "CANCELED")
 
 
-STAGED_FLIGHT_FILE_PATTERN = re.compile(
-    r"^(?P<dataset_id>flightdemo)_"
-    r"(?P<row_count>\d+)rows(?:[_-].*)?\.tab\.zst$",
-    flags=re.IGNORECASE,
-)
+# The staged filename no longer has to encode dataset id / row count
+# (``flightdemo_<N>rows...``). staged_flight_tab now writes a
+# ``<key>.tab.zst.meta.json`` sidecar with those values, and this sensor
+# reads it -- so any ``*.tab.zst`` name is accepted.
+STAGED_FLIGHT_SIDECAR_SUFFIX = ".meta.json"
 
 
 def _job_has_active_run(context, job_name: str) -> bool:
@@ -247,11 +246,25 @@ def staged_flight_minio_sensor(context):
         if observed_etags.get(object_identity) == source_etag:
             continue
 
-        file_name = PurePosixPath(item.object_name).name
-        match = STAGED_FLIGHT_FILE_PATTERN.fullmatch(file_name)
-        if match is None:
+        # dataset id / batch id / row count / column count come from the
+        # sidecar staged_flight_tab writes, not from the filename.
+        sidecar_key = f"{item.object_name}{STAGED_FLIGHT_SIDECAR_SUFFIX}"
+        sidecar = None
+        try:
+            sidecar_response = client.get_object(source_bucket, sidecar_key)
+            try:
+                sidecar = json.loads(sidecar_response.read())
+            finally:
+                sidecar_response.close()
+                sidecar_response.release_conn()
+        except Exception:  # noqa: BLE001 - missing/corrupt sidecar handled below
+            sidecar = None
+
+        if not isinstance(sidecar, dict) or "row_count" not in sidecar:
             context.log.warning(
-                "Ignoring staged object with an unsupported name: s3://%s/%s",
+                "Skipping staged object without a usable %s sidecar: s3://%s/%s "
+                "(stage it through raw_flight_to_staged_job).",
+                STAGED_FLIGHT_SIDECAR_SUFFIX,
                 source_bucket,
                 item.object_name,
             )
@@ -259,10 +272,26 @@ def staged_flight_minio_sensor(context):
             cursor_changed = True
             continue
 
-        dataset_id = match.group("dataset_id").lower()
-        batch_id = file_name[: -len(".tab.zst")]
-        row_count = int(match.group("row_count"))
-        column_count = assets.FLIGHT_COLUMN_COUNT
+        file_name = PurePosixPath(item.object_name).name
+        dataset_id = str(
+            sidecar.get("dataset_id") or assets.DEFAULT_DATASET_ID
+        ).lower()
+        batch_id = str(sidecar.get("batch_id") or file_name[: -len(".tab.zst")])
+        try:
+            row_count = int(sidecar["row_count"])
+            column_count = int(
+                sidecar.get("column_count") or assets.FLIGHT_COLUMN_COUNT
+            )
+        except (TypeError, ValueError):
+            context.log.warning(
+                "Skipping staged object with a non-numeric sidecar count: "
+                "s3://%s/%s",
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
 
         observed_etags[object_identity] = source_etag
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))

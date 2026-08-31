@@ -572,7 +572,7 @@ def main(argv=None) -> int:
     )
     p.add_argument("--rows", type=int, default=100_000, help="üretilecek satır sayısı")
     p.add_argument("--cols", type=int, default=64, help="toplam sütun sayısı (flight_id ve time dahil)")
-    p.add_argument("--out-dir", default=".", help="çıktı klasörü")
+    p.add_argument("--out-dir", default="dagster/data/raw", help="çıktı klasörü")
     p.add_argument("--flights", type=int, default=8, help="uçuş oturumu sayısı")
     p.add_argument("--hz", type=float, default=HZ_DEFAULT, help="örnekleme frekansı")
     p.add_argument("--seed", type=int, default=42, help="rastgelelik tohumu (tekrarlanabilirlik)")

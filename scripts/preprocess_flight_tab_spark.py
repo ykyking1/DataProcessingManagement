@@ -34,40 +34,64 @@ if TYPE_CHECKING:
 
 
 TIME_COLUMN = "time"
-STRING_COLUMNS = ("image_name", "class", "flight_id")
-NUMERIC_COLUMNS = (
-    "latitude",
+
+# Dashboard-serving flight telemetry now follows the native AU-AIR frame
+# schema (the only deviation is fixing the ``longtitude`` header typo).
+# The generator (generate_and_upload_flight_tab_to_minio.py) and the AU-AIR
+# converter (convert_auair_tab.py) emit exactly these columns in this order.
+STRING_COLUMNS = ("image_name", "platform", "flight_id")
+FLOAT_COLUMNS = (
     "longitude",
+    "latitude",
     "altitude",
-    "velocity_x",
-    "velocity_y",
-    "velocity_z",
-    "roll",
-    "pitch",
-    "yaw",
-    "box_x",
-    "box_y",
-    "box_w",
-    "box_h",
+    "linear_x",
+    "linear_y",
+    "linear_z",
+    "angle_phi",
+    "angle_theta",
+    "angle_psi",
 )
+INTEGER_COLUMNS = (
+    "image_width",
+    "image_height",
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
+)
+# Kept for callers that iterate every non-timestamp numeric column.
+NUMERIC_COLUMNS = FLOAT_COLUMNS + INTEGER_COLUMNS
+REQUIRED_NUMERIC_COLUMNS = NUMERIC_COLUMNS
 FLIGHT_COLUMNS = [
-    TIME_COLUMN,
-    "latitude",
-    "longitude",
-    "altitude",
-    "velocity_x",
-    "velocity_y",
-    "velocity_z",
-    "roll",
-    "pitch",
-    "yaw",
-    "image_name",
-    "box_x",
-    "box_y",
-    "box_w",
-    "box_h",
-    "class",
     "flight_id",
+    TIME_COLUMN,
+    "image_name",
+    "image_width",
+    "image_height",
+    "platform",
+    "longitude",
+    "latitude",
+    "altitude",
+    "linear_x",
+    "linear_y",
+    "linear_z",
+    "angle_phi",
+    "angle_theta",
+    "angle_psi",
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
 ]
 
 
@@ -98,10 +122,12 @@ def preprocess_flight_dataframe(
             expressions.append(
                 f"try_to_timestamp(trim({quoted}), '{escaped_format}') AS {quoted}"
             )
-        elif column_name in NUMERIC_COLUMNS:
+        elif column_name in FLOAT_COLUMNS:
             expressions.append(f"cast(trim({quoted}) AS double) AS {quoted}")
-        elif column_name == "class":
-            expressions.append(f"lower(trim({quoted})) AS {quoted}")
+        elif column_name in INTEGER_COLUMNS:
+            expressions.append(
+                f"cast(cast(trim({quoted}) AS double) AS int) AS {quoted}"
+            )
         else:
             expressions.append(f"trim({quoted}) AS {quoted}")
     return dataframe.selectExpr(*expressions)

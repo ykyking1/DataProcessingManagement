@@ -11,7 +11,7 @@ import great_expectations as gx
 try:
     from scripts.preprocess_flight_tab_spark import (
         FLIGHT_COLUMNS,
-        NUMERIC_COLUMNS,
+        REQUIRED_NUMERIC_COLUMNS,
         create_spark_session,
         preprocess_flight_dataframe,
         read_tab_dataframe,
@@ -26,7 +26,7 @@ try:
 except ModuleNotFoundError:
     from preprocess_flight_tab_spark import (
         FLIGHT_COLUMNS,
-        NUMERIC_COLUMNS,
+        REQUIRED_NUMERIC_COLUMNS,
         create_spark_session,
         preprocess_flight_dataframe,
         read_tab_dataframe,
@@ -40,7 +40,17 @@ except ModuleNotFoundError:
     from validate_tab_spark_ge import write_validation_report
 
 
-ALLOWED_CLASSES = ["car", "truck", "person", "van"]
+OBJECT_COUNT_COLUMNS = [
+    "num_objects",
+    "obj_human",
+    "obj_car",
+    "obj_truck",
+    "obj_van",
+    "obj_motorbike",
+    "obj_bicycle",
+    "obj_bus",
+    "obj_trailer",
+]
 
 
 def validate_flight_dataframe(
@@ -69,11 +79,7 @@ def validate_flight_dataframe(
         gx.expectations.ExpectColumnValuesToNotBeNull(column="time"),
         gx.expectations.ExpectColumnValuesToNotBeNull(column="flight_id"),
         gx.expectations.ExpectColumnValuesToNotBeNull(column="image_name"),
-        gx.expectations.ExpectColumnValuesToNotBeNull(column="class"),
-        gx.expectations.ExpectColumnValuesToBeInSet(
-            column="class",
-            value_set=ALLOWED_CLASSES,
-        ),
+        gx.expectations.ExpectColumnValuesToNotBeNull(column="platform"),
         gx.expectations.ExpectColumnValuesToBeBetween(
             column="latitude",
             min_value=-90,
@@ -87,32 +93,20 @@ def validate_flight_dataframe(
         gx.expectations.ExpectColumnValuesToBeBetween(
             column="altitude",
             min_value=0,
-            max_value=20_000,
-        ),
-        gx.expectations.ExpectColumnValuesToBeBetween(
-            column="box_x",
-            min_value=0,
-            max_value=1_920,
-        ),
-        gx.expectations.ExpectColumnValuesToBeBetween(
-            column="box_y",
-            min_value=0,
-            max_value=1_080,
-        ),
-        gx.expectations.ExpectColumnValuesToBeBetween(
-            column="box_w",
-            min_value=1,
-            max_value=1_920,
-        ),
-        gx.expectations.ExpectColumnValuesToBeBetween(
-            column="box_h",
-            min_value=1,
-            max_value=1_080,
+            max_value=30_000,
         ),
     ]
     expectations.extend(
         gx.expectations.ExpectColumnValuesToNotBeNull(column=column_name)
-        for column_name in NUMERIC_COLUMNS
+        for column_name in REQUIRED_NUMERIC_COLUMNS
+    )
+    # Nesne sayıları negatif olamaz.
+    expectations.extend(
+        gx.expectations.ExpectColumnValuesToBeBetween(
+            column=column_name,
+            min_value=0,
+        )
+        for column_name in OBJECT_COUNT_COLUMNS
     )
 
     context = gx.get_context(mode="ephemeral")
@@ -147,7 +141,6 @@ def validate_flight_dataframe(
         "success": bool(ge_result["success"]),
         "statistics": ge_result["statistics"],
         "validated_columns": FLIGHT_COLUMNS,
-        "allowed_classes": ALLOWED_CLASSES,
         "result": ge_result,
     }
     written_report = write_validation_report(output, report_path)
