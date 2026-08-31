@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.2.5 (2026-08-31)
+
+### Data
+
+- Reset tracked datasets
+  ([`14b44e1`](https://github.com/ykyking1/DataProcessingManagement/commit/14b44e12fe6abb3392c2a20a1721d6c5536ca904))
+
+
 ## v0.2.4 (2026-08-31)
 
 ### Data
