@@ -3,6 +3,17 @@
 Dagster orchestration, processing, validation, reproducibility, and runtime dependency changes are recorded here.
 
 <!-- version list -->
+
+## pipeline-v0.6.0-test.1 (2026-08-31)
+
+
+### Features
+
+- **pipeline**: Unify processing around wide AU-AIR batches ([`1ef97c8`](https://github.com/ykyking1/DataProcessingManagement/commit/1ef97c8e1f67654ef96d38ea5788ceb4a86f133d))
+
+
+
+
 ## pipeline-v0.5.0-rc.3 (2026-08-27)
 
 
