@@ -1,7 +1,9 @@
 """Dagster assets for the MinIO-backed flight telemetry workflow."""
 
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,6 +21,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.stage_raw_tab import stage_raw_tab_stream
 from scripts.publish_processed_with_dvc import publish_processed_batch
+from scripts.convert_auair_tab import FLIGHT_COLUMNS as AUAIR_FRAME_COLUMNS
+from scripts.convert_auair_tab import convert as convert_auair_wide_tab
 from postgres_catalog import (
     ensure_job_run,
     record_asset_materialization,
@@ -32,7 +36,11 @@ DEFAULT_STAGED_PREFIX = "flight-tab"
 DEFAULT_MULTIPART_PART_SIZE_MIB = 128
 DEFAULT_ARTIFACT_BUCKET = "pipeline-artifacts"
 DEFAULT_DATASET_ID = "flightdemo"
-FLIGHT_COLUMN_COUNT = 17
+# Native AU-AIR frame schema: flight_id, time, image_name, image_width,
+# image_height, platform, longitude, latitude, altitude, linear_x/y/z,
+# angle_phi/theta/psi, num_objects, obj_human/car/truck/van/motorbike/
+# bicycle/bus/trailer.
+FLIGHT_COLUMN_COUNT = 24
 
 
 def _environment_flag(name: str, default: bool = False) -> bool:
@@ -87,6 +95,81 @@ def _staged_object_key(source_key: str, staged_prefix: str) -> str:
     staged_name = f"{source_name}.zst"
     prefix = staged_prefix.strip("/")
     return f"{prefix}/{staged_name}" if prefix else staged_name
+
+
+_BATCH_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitise_batch_id(name: str) -> str:
+    """Turn an arbitrary raw file stem into a filesystem-safe batch id.
+
+    The staged filename is no longer required to follow the
+    ``flightdemo_<N>rows`` convention (see staged_flight_minio_sensor);
+    the batch id is derived from whatever name the operator uploaded and
+    is used as a directory name under data/processed/flightdemo/batches/.
+    """
+
+    cleaned = _BATCH_ID_UNSAFE.sub("_", name).strip("._-")
+    return cleaned or "batch"
+
+
+def _normalise_flight_frame_tab(context, raw_path: Path, work_dir: Path) -> Path:
+    """Return a path to a .tab that follows the native 24-column frame contract.
+
+    Accepts, without a preconversion step, either:
+      * a file already in the native contract (header == AUAIR_FRAME_COLUMNS),
+        returned unchanged; or
+      * a wide AU-AIR export (one anchor frame followed by hundreds of
+        repeated ``image_name, ...`` blocks, ``longtitude`` header typo),
+        which is projected to the first frame block via convert_auair_tab.
+
+    Anything else raises, so a genuinely wrong schema still fails loudly.
+    """
+
+    with raw_path.open("r", encoding="utf-8", newline="") as handle:
+        header_line = handle.readline()
+
+    if not header_line:
+        raise Failure(description=f"Raw flight .tab is empty: {raw_path.name}")
+
+    header = [field.strip() for field in header_line.rstrip("\r\n").split("\t")]
+    fixed = ["longitude" if name == "longtitude" else name for name in header]
+    contract = list(AUAIR_FRAME_COLUMNS)
+
+    if fixed == contract:
+        return raw_path
+
+    looks_like_auair_wide = (
+        fixed[: len(contract)] == contract or "longtitude" in header
+    )
+    if looks_like_auair_wide:
+        context.log.info(
+            "Wide AU-AIR export detected (%d header columns); projecting to "
+            "the %d-column frame contract with convert_auair_tab.",
+            len(header),
+            len(contract),
+        )
+        try:
+            converted = convert_auair_wide_tab(
+                raw_path,
+                work_dir / "converted",
+                label="auair",
+                assume_utc=True,
+                limit=None,
+            )
+        except SystemExit as exc:  # convert_auair_tab uses SystemExit for errors
+            raise Failure(
+                description=f"AU-AIR wide .tab conversion failed: {exc}"
+            ) from exc
+        return Path(converted)
+
+    raise Failure(
+        description=(
+            "Raw flight .tab header is neither the native frame contract nor a "
+            "recognised wide AU-AIR export. First columns: "
+            + ", ".join(header[:6])
+        )
+    )
 
 
 class RawToStagedConfig(Config):
@@ -146,27 +229,45 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
         "zstd-level": str(config.zstd_level),
     }
 
-    source_stream = client.get_object(config.source_bucket, config.source_key)
-    staged_stream = stage_raw_tab_stream(
-        source_stream,
-        zstd_level=config.zstd_level,
-        zstd_threads=config.zstd_threads,
-    )
-    try:
-        client.put_object(
-            config.staged_bucket,
-            staged_key,
-            staged_stream,
-            length=-1,
-            part_size=multipart_part_size,
-            content_type="application/zstd",
-            metadata=object_metadata,
+    # The raw object is pulled to a temporary local file so its header can
+    # be inspected and, if it is a wide AU-AIR export, projected to the
+    # native 24-column frame contract before staging (see
+    # _normalise_flight_frame_tab). A native-contract file passes through
+    # untouched. Everything downstream still receives a strict 24-column
+    # .tab.zst, so the Spark / Great Expectations / ClickHouse guards are
+    # unchanged.
+    with tempfile.TemporaryDirectory(prefix="dpm-raw-flight-") as raw_temp_dir:
+        raw_temp_path = Path(raw_temp_dir)
+        local_raw = raw_temp_path / PurePosixPath(config.source_key).name
+        client.fget_object(
+            config.source_bucket,
+            config.source_key,
+            str(local_raw),
         )
-        result = staged_stream.result()
-    finally:
-        staged_stream.close()
-        source_stream.close()
-        source_stream.release_conn()
+
+        stage_input_path = _normalise_flight_frame_tab(
+            context, local_raw, raw_temp_path
+        )
+
+        with stage_input_path.open("rb") as source_stream:
+            staged_stream = stage_raw_tab_stream(
+                source_stream,
+                zstd_level=config.zstd_level,
+                zstd_threads=config.zstd_threads,
+            )
+            try:
+                client.put_object(
+                    config.staged_bucket,
+                    staged_key,
+                    staged_stream,
+                    length=-1,
+                    part_size=multipart_part_size,
+                    content_type="application/zstd",
+                    metadata=object_metadata,
+                )
+                result = staged_stream.result()
+            finally:
+                staged_stream.close()
 
     staged_stat = client.stat_object(config.staged_bucket, staged_key)
     if staged_stat.size != result.staged_size_bytes:
@@ -188,7 +289,35 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
     result_metadata = asdict(result)
     source_name = PurePosixPath(config.source_key).name
     dataset_id = DEFAULT_DATASET_ID
-    batch_id = source_name[: -len(".tab")]
+    batch_id = _sanitise_batch_id(
+        source_name[: -len(".tab")]
+        if source_name.lower().endswith(".tab")
+        else source_name
+    )
+
+    # Sidecar next to the staged object: staged_flight_minio_sensor reads
+    # this instead of parsing row_count / column_count / dataset / batch
+    # out of the filename, so the staged file name is now free-form.
+    sidecar_key = f"{staged_key}.meta.json"
+    sidecar_bytes = json.dumps(
+        {
+            "dataset_id": dataset_id,
+            "batch_id": batch_id,
+            "row_count": result.row_count,
+            "column_count": result.column_count,
+            "source_key": config.source_key,
+            "source_etag": actual_source_etag or "unknown",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    client.put_object(
+        config.staged_bucket,
+        sidecar_key,
+        io.BytesIO(sidecar_bytes),
+        length=len(sidecar_bytes),
+        content_type="application/json",
+    )
+
     source_uri = f"s3://{config.source_bucket}/{config.source_key}"
     staged_uri = f"s3://{config.staged_bucket}/{staged_key}"
     record_asset_materialization(
