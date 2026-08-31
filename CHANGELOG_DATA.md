@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.4 (2026-08-31)
+
+### Data
+
+- **flightdemo**: Publish 6000-row E2E batch
+  ([`64981c1`](https://github.com/ykyking1/DataProcessingManagement/commit/64981c169de81c74e628f19c052f330562d8add4))
+
+### Refactoring
+
+- **pipeline**: Consolidate active scripts
+  ([`d8fdfaf`](https://github.com/ykyking1/DataProcessingManagement/commit/d8fdfaf9655b90ae3065c537c1c716da9ba23fcf))
+
+
 ## v0.2.4-rc.2 (2026-08-28)
 
 **Data processed with `pipeline-v0.5.0-rc.3` (`b0889010b35046253f4af0e724e7a5ac76b94d9e`)**
