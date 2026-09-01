@@ -111,14 +111,16 @@ services:
       REPOSITORY_GIT_DIRTY: ${REPOSITORY_GIT_DIRTY:-false}
       PIPELINE_CONTAINER_IMAGE: dagster-local:latest
       PIPELINE_CONTAINER_IMAGE_DIGEST: ${PIPELINE_CONTAINER_IMAGE_DIGEST:-}
-      ALERT_FILE: /shared/alerts/alerts.json
+      # Alert kayıtları artık MinIO'da tek bir JSON nesnesinde tutulur
+      # (dagster/alerting.py); dashboard aynı nesneyi okur.
+      MINIO_ALERTS_BUCKET: ${MINIO_ALERTS_BUCKET:-pipeline-alerts}
+      MINIO_ALERTS_OBJECT: ${MINIO_ALERTS_OBJECT:-alerts.json}
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
       - ./:/workspace
       - dpm_dvc_cache:/workspace/.dvc/cache
       - dpm_dagster_home:/app/dagster_home
-      - ./dagster/data/alerts:/shared/alerts
     depends_on:
       minio:
         condition: service_started
@@ -150,14 +152,25 @@ services:
       POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
-      ALERT_FILE: /shared/alerts/alerts.json
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
+      # "DVC / Veri Sürümleri" sekmesi MinIO'daki pipeline-artifacts
+      # (kalite raporları) ve dvc-cache (DVC uzak deposu) bucket'larını,
+      # "🚨 Alertler" sekmesi ise pipeline-alerts bucket'ındaki JSON
+      # nesnesini okur (Dagster/alerting.py yazar).
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_SECURE: "false"
+      MINIO_ARTIFACT_BUCKET: ${CLICKHOUSE_INGEST_BUCKET:-pipeline-artifacts}
+      MINIO_ALERTS_BUCKET: ${MINIO_ALERTS_BUCKET:-pipeline-alerts}
+      MINIO_ALERTS_OBJECT: ${MINIO_ALERTS_OBJECT:-alerts.json}
+      DVC_REMOTE_URL: s3://dvc-cache
     ports:
       - "127.0.0.1:8501:8501"
-    volumes:
-      - ./dagster/data/alerts:/shared/alerts:ro
     depends_on:
+      minio:
+        condition: service_started
       postgres:
         condition: service_healthy
       clickhouse:

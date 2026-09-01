@@ -49,11 +49,22 @@ Dashboard bölümleri:
          asset / uçuş / tarih bazlı filtrelenebilir materialization
          geçmişi — bkz. docs/postgres_pipeline_catalog_schema.sql
 
-    3. Alertler
-       - Başarısız Dagster run'ları
-       - failure_hook tarafından oluşturulan alert kayıtları
+    3. DVC / Veri Sürümleri
+       - MinIO "pipeline-artifacts" bucket'ındaki Great Expectations
+         kalite raporları (validation/<dataset>/<batch>/<etag>.json)
+       - DVC uzak deposundaki (dvc-cache) .dir dizin manifestoları:
+         her veri sürümünün hangi dosyalardan oluştuğu + md5'leri
+       - Bağlantı: MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY
+         (bkz. get_minio_client)
 
-    4. Veri Gözat / Dışa Aktar
+    4. Alertler
+       - Başarısız Dagster run'ları (Dagster GraphQL)
+       - failure_hook tarafından üretilen alert kayıtları: MinIO
+         "pipeline-alerts" bucket'ındaki tek JSON nesnesi
+         (MINIO_ALERTS_BUCKET / MINIO_ALERTS_OBJECT), Dagster yazar,
+         dashboard salt-okunur çeker — bkz. load_alerts()
+
+    5. Veri Gözat / Dışa Aktar
        - ClickHouse bağlantısı
        - Time filtresi
        - Saat filtresi -- günün belirli saatlerini (0-23), tarihten/
@@ -74,7 +85,6 @@ import io
 import json
 import os
 import re
-import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -91,8 +101,21 @@ import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from folium.plugins import Draw
 from jinja2 import Template
-from streamlit_autorefresh import st_autorefresh
 from streamlit_folium import st_folium
+
+# MinIO istemcisi yalnızca "DVC / Veri Sürümleri" sekmesinde kullanılır.
+# Paket kurulu değilse (eski bir imaj / requirements) uygulamanın geri
+# kalanı çökmemeli -- bu yüzden import korumalı yapılır ve sekme, hata
+# mesajını kullanıcıya gösterir.
+try:
+    from minio import Minio
+    from minio.error import S3Error
+
+    _MINIO_IMPORT_ERROR = None
+except Exception as _minio_import_exc:  # pragma: no cover - ortam kaynaklı
+    Minio = None
+    S3Error = Exception
+    _MINIO_IMPORT_ERROR = _minio_import_exc
 
 
 # ============================================================
@@ -120,17 +143,6 @@ st.set_page_config(
 
 
 # ============================================================
-# GENEL AYARLAR
-# ============================================================
-
-REFRESH_OPTIONS = {
-    "Kapalı": 0,
-    "10 sn": 10,
-    "30 sn": 30,
-    "60 sn": 60,
-}
-
-# ============================================================
 # ANA SEKMELER
 # ============================================================
 #
@@ -144,6 +156,7 @@ REFRESH_OPTIONS = {
 
 MAIN_TAB_RUNS = "Pipeline Metrikleri"
 MAIN_TAB_CATALOG = "Katalog"
+MAIN_TAB_DVC = "📦 DVC / Veri Sürümleri"
 MAIN_TAB_ALERTS = "🚨 Alertler"
 MAIN_TAB_EXPORT = "Veri Gözat / Dışa Aktar"
 MAIN_TAB_FLIGHT_MAP = "🗺️ Uçuş Rotası"
@@ -151,6 +164,7 @@ MAIN_TAB_FLIGHT_MAP = "🗺️ Uçuş Rotası"
 MAIN_TAB_LABELS = [
     MAIN_TAB_RUNS,
     MAIN_TAB_CATALOG,
+    MAIN_TAB_DVC,
     MAIN_TAB_ALERTS,
     MAIN_TAB_EXPORT,
     MAIN_TAB_FLIGHT_MAP,
@@ -418,6 +432,102 @@ def get_clickhouse_client():
         username=get_clickhouse_user(),
         password=get_clickhouse_password(),
         database=get_clickhouse_database(),
+    )
+
+
+# ============================================================
+# MinIO / DVC ARTEFAKT AYARLARI
+# ============================================================
+#
+# "DVC / Veri Sürümleri" sekmesi, pipeline'ın MinIO'ya yazdığı JSON
+# artefaktlarını (Great Expectations kalite raporları) ve DVC uzak
+# deposundaki (dvc-cache) dizin manifestolarını okur. Aynı ortam
+# değişkeni isimleri dagster/assets.py'deki create_minio_client() ile
+# uyumludur; docker-compose.yml içinde dashboard servisine eklenir,
+# yerelde ise dashboard/.env üzerinden verilebilir.
+
+
+def get_minio_endpoint() -> str:
+    return os.environ.get(
+        "MINIO_ENDPOINT",
+        "127.0.0.1:9000",
+    ).strip()
+
+
+def get_minio_secure() -> bool:
+    return os.environ.get(
+        "MINIO_SECURE",
+        "false",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_minio_access_key() -> str:
+    return os.environ.get(
+        "MINIO_ACCESS_KEY",
+        os.environ.get("MINIO_ROOT_USER", "minioadmin"),
+    )
+
+
+def get_minio_secret_key() -> str:
+    return os.environ.get(
+        "MINIO_SECRET_KEY",
+        os.environ.get("MINIO_ROOT_PASSWORD", "minioadmin123"),
+    )
+
+
+def get_pipeline_artifacts_bucket() -> str:
+    return os.environ.get(
+        "MINIO_ARTIFACT_BUCKET",
+        "pipeline-artifacts",
+    )
+
+
+def get_validation_prefix() -> str:
+    """
+    DVC sekmesinin listeleyeceği önek. Yalnızca kalite raporu JSON'ları
+    bu önekin altındadır (validation/<dataset>/<batch>/<etag>.json);
+    _clickhouse-ingest/... altındaki geçici zstd parçaları KAPSAM DIŞI.
+    """
+    prefix = os.environ.get(
+        "MINIO_VALIDATION_PREFIX",
+        "validation/",
+    ).strip("/")
+    return f"{prefix}/" if prefix else ""
+
+
+def get_dvc_remote_bucket() -> str:
+    # dagster tarafında DVC uzak deposu s3://<bucket> biçiminde verilir
+    # (docker-compose.yml: DVC_REMOTE_URL=s3://dvc-cache).
+    remote_url = os.environ.get("DVC_REMOTE_URL", "s3://dvc-cache").strip()
+    if remote_url.startswith("s3://"):
+        remote_url = remote_url[len("s3://") :]
+    return remote_url.strip("/").split("/", 1)[0] or "dvc-cache"
+
+
+@st.cache_resource
+def get_minio_client():
+    """MinIO istemcisini oluşturur (bağlantı testi yapmaz)."""
+
+    if Minio is None:
+        raise RuntimeError(
+            "`minio` paketi kurulu değil: "
+            f"{_MINIO_IMPORT_ERROR}. dashboard/requirements.txt içine "
+            "`minio` ekleyip imajı yeniden kurun."
+        )
+
+    endpoint = get_minio_endpoint()
+    secure = get_minio_secure()
+
+    if "://" in endpoint:
+        # http://host:9000 gibi bir değer verilmişse şemayı ayıkla.
+        secure = endpoint.split("://", 1)[0].lower() == "https"
+        endpoint = endpoint.split("://", 1)[1]
+
+    return Minio(
+        endpoint.rstrip("/"),
+        access_key=get_minio_access_key(),
+        secret_key=get_minio_secret_key(),
+        secure=secure,
     )
 
 
@@ -2969,127 +3079,75 @@ def fetch_asset_catalog() -> pd.DataFrame:
 
 
 # ===========================================================================
-# ALERT DOSYASI
+# ALERT KAYITLARI (MinIO)
 # ===========================================================================
+#
+# Alertler, Dagster'ın (dagster/alerting.py) MinIO'da tek bir JSON
+# nesnesinde tuttuğu bir listedir; dashboard bu nesneyi salt-okunur
+# çeker. Eski sürümde dagster ve dashboard bind-mount edilmiş bir dosyayı
+# paylaşıyordu -- artık ortak dosya yok, kaynak MinIO.
+#
+# Bucket / nesne: MINIO_ALERTS_BUCKET / MINIO_ALERTS_OBJECT.
+# Bağlantı: get_minio_client() (MINIO_ENDPOINT / MINIO_ACCESS_KEY / ...).
 
-def get_alert_file() -> Path:
-    """
-    Alert dosyasını farklı çalışma dizinlerinde bulmaya çalışır.
+_ALERT_COLUMNS = [
+    "timestamp",
+    "job_name",
+    "step_name",
+    "error",
+    "status",
+]
 
-    Olası konumlar:
 
-        dashboard/data/alerts/alerts.json
+def get_alerts_bucket() -> str:
+    return os.environ.get("MINIO_ALERTS_BUCKET", "pipeline-alerts")
 
-        dagster/data/alerts/alerts.json
 
-    Ayrıca ALERT_FILE environment variable ile doğrudan
-    dosya yolu verilebilir.
-    """
+def get_alerts_object() -> str:
+    return os.environ.get("MINIO_ALERTS_OBJECT", "alerts.json")
 
-    explicit = os.environ.get(
-        "ALERT_FILE"
-    )
 
-    if explicit:
-
-        return Path(explicit)
-
-    current_dir = Path(__file__).resolve().parent
-
-    candidates = [
-
-        current_dir
-        / "data"
-        / "alerts"
-        / "alerts.json",
-
-        current_dir.parent
-        / "dagster"
-        / "data"
-        / "alerts"
-        / "alerts.json",
-
-        Path.cwd()
-        / "data"
-        / "alerts"
-        / "alerts.json",
-
-    ]
-
-    for candidate in candidates:
-
-        if candidate.exists():
-
-            return candidate
-
-    # Varsayılan
-    return candidates[1]
+def get_alerts_uri() -> str:
+    return f"s3://{get_alerts_bucket()}/{get_alerts_object()}"
 
 
 @st.cache_data(ttl=5)
 def load_alerts() -> pd.DataFrame:
 
-    alert_file = get_alert_file()
+    empty = pd.DataFrame(columns=_ALERT_COLUMNS)
 
-    if not alert_file.exists():
-
-        return pd.DataFrame(
-            columns=[
-                "timestamp",
-                "job_name",
-                "step_name",
-                "error",
-                "status",
-            ]
-        )
+    if Minio is None:
+        return empty
 
     try:
 
-        content = alert_file.read_text(
-            encoding="utf-8"
-        )
+        client = get_minio_client()
+        bucket = get_alerts_bucket()
 
-        alerts = json.loads(
-            content
-        )
+        if not client.bucket_exists(bucket):
+            return empty
+
+        response = client.get_object(bucket, get_alerts_object())
+
+        try:
+            raw = response.read()
+        finally:
+            response.close()
+            response.release_conn()
+
+        alerts = json.loads(raw)
 
     except Exception:
+        # MinIO erişilemez / nesne yok / bozuk JSON -- alert bölümü
+        # "kayıt yok" gösterir, dashboard çökmemeli.
+        return empty
 
-        return pd.DataFrame(
-            columns=[
-                "timestamp",
-                "job_name",
-                "step_name",
-                "error",
-                "status",
-            ]
-        )
+    if not isinstance(alerts, list) or not alerts:
+        return empty
 
-    if not isinstance(
-        alerts,
-        list,
-    ):
-
-        return pd.DataFrame()
-
-    if not alerts:
-
-        return pd.DataFrame(
-            columns=[
-                "timestamp",
-                "job_name",
-                "step_name",
-                "error",
-                "status",
-            ]
-        )
-
-    df = pd.DataFrame(
-        alerts
-    )
+    df = pd.DataFrame(alerts)
 
     if "timestamp" in df.columns:
-
         df["timestamp"] = pd.to_datetime(
             df["timestamp"],
             errors="coerce",
@@ -3557,13 +3615,11 @@ def render_alerts(
     st.divider()
 
     # -----------------------------------------------------------------------
-    # Alert dosyası bilgisi
+    # Alert kaynağı bilgisi
     # -----------------------------------------------------------------------
 
-    alert_file = get_alert_file()
-
     st.caption(
-        f"Alert kaynağı: `{alert_file}`"
+        f"Alert kaynağı: `{get_alerts_uri()}` (MinIO)"
     )
 
     # -----------------------------------------------------------------------
@@ -3685,9 +3741,9 @@ def render_alerts(
                     # dagster/alerting.py::alert_on_failure hook'u
                     # içinde -- otomatik olarak yapılıyor (en fazla 3
                     # deneme, "re-execute from failure"). Burada
-                    # sadece o otomatik sürecin alerts.json'a yazdığı
-                    # sonuç okunup gösteriliyor; kullanıcının hiçbir
-                    # işlem yapmasına gerek yok.
+                    # sadece o otomatik sürecin MinIO'daki alert
+                    # kaydına yazdığı sonuç okunup gösteriliyor;
+                    # kullanıcının hiçbir işlem yapmasına gerek yok.
 
                     auto_fix_resolved_attempt = row.get(
                         "auto_fix_resolved_attempt"
@@ -5079,112 +5135,7 @@ def _decode_export_state_from_query_params(query_params: dict) -> dict:
     return state
 
 
-@st.cache_data(ttl=60)
-def fetch_auair_batch_summary() -> pd.DataFrame:
-    """Mevcut geniş şemalı AU-AIR tablosunu batch bazında özetler."""
-
-    available_columns = get_available_columns()
-    required_columns = {
-        "source_batch_id",
-        "flight_id",
-        "time",
-    }
-
-    if not required_columns.issubset(available_columns):
-        return pd.DataFrame()
-
-    client = get_clickhouse_client()
-    ingested_expression = (
-        "max(ingested_at)"
-        if "ingested_at" in available_columns
-        else "CAST(NULL, 'Nullable(DateTime64(3))')"
-    )
-    result = client.query(
-        f"""
-        SELECT
-            source_batch_id,
-            uniqExact(flight_id) AS flight_count,
-            count() AS row_count,
-            min(time) AS min_time,
-            max(time) AS max_time,
-            {ingested_expression} AS last_ingested_at
-        FROM {get_clickhouse_source()}
-        WHERE source_batch_id != ''
-        GROUP BY source_batch_id
-        ORDER BY last_ingested_at DESC, source_batch_id DESC
-        """
-    )
-
-    return pd.DataFrame(
-        result.result_rows,
-        columns=[
-            "Batch",
-            "Uçuş sayısı",
-            "Satır sayısı",
-            "Başlangıç",
-            "Bitiş",
-            "ClickHouse'a yüklenme",
-        ],
-    )
-
-
-def render_wide_auair_batches_section():
-    """Güncel AU-AIR ClickHouse tablosunun batch ve şema özetini gösterir."""
-
-    st.subheader("Geniş Şemalı AU-AIR Batch'leri")
-    st.caption(
-        "Generator tarafından üretilen yüksek kolonlu AU-AIR verisi, "
-        "Dagster'daki `clickhouse_auair_batch` asset'i tarafından tek bir "
-        f"`{get_clickhouse_database()}.{get_clickhouse_table()}` tablosuna "
-        "yüklenir. Dashboard yalnız workflow başarıyla tamamlandıktan sonra "
-        f"`{get_clickhouse_visible_view()}` view'ında görünen kayıtları okur. "
-        "Her yükleme `source_batch_id`, her uçuş `flight_id` ile ayrılır."
-    )
-
-    try:
-        schema = get_clickhouse_schema()
-        batch_summary = fetch_auair_batch_summary()
-    except Exception as exc:
-        st.error(f"AU-AIR batch özeti okunamadı: {exc}")
-        return
-
-    if schema.empty:
-        st.info(
-            "ClickHouse AU-AIR tablosu henüz oluşturulmamış. Dagster'da "
-            "`clickhouse_auair_batch` asset'ini materialize edin."
-        )
-        return
-
-    if batch_summary.empty:
-        st.info(
-            "Tablo oluşturulmuş ancak henüz yüklenmiş bir AU-AIR batch'i "
-            "yok. Dagster'da `clickhouse_auair_batch` asset'ini "
-            "materialize edin."
-        )
-        return
-
-    metric_columns = st.columns(3)
-    metric_columns[0].metric("Batch", len(batch_summary))
-    metric_columns[1].metric("Toplam satır", f"{batch_summary['Satır sayısı'].sum():,}")
-    metric_columns[2].metric("Tablo kolonu", f"{len(schema):,}")
-
-    st.dataframe(
-        batch_summary,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.caption(
-        "Batch/uçuş filtreleme, kolon seçimi, önizleme ve indirme işlemleri "
-        "aşağıdaki telemetri bölümünden yapılır."
-    )
-
-    st.divider()
-
-
 def render_data_export():
-
-    render_wide_auair_batches_section()
 
     st.subheader(
         "Geniş Şemalı AU-AIR Telemetri Verisi"
@@ -7581,16 +7532,452 @@ def render_flight_map():
 
 
 # ============================================================
+# DVC / VERİ SÜRÜMLERİ (MinIO artefaktları)
+# ============================================================
+#
+# Pipeline (dagster/assets.py) her doğrulanmış batch için Great
+# Expectations kalite raporunu MinIO'daki "pipeline-artifacts"
+# bucket'ına şu anahtarla JSON olarak yazar:
+#
+#     validation/<dataset_id>/<batch_id>/<source_etag[:12]>.json
+#
+# batch_id (ör. "1000_10000_flight_1_2019-08-29") aynı zamanda DVC'ye
+# publish edilen veri sürümünün kimliğidir. Bu sekme o JSON dosyalarını
+# MinIO üzerinden çekip listeler/gösterir; ayrıca DVC uzak deposundaki
+# (dvc-cache) dizin manifestolarını (.dir) okuyup her sürümün hangi
+# dosyalardan oluştuğunu md5'leriyle birlikte gösterir.
+
+
+_VALIDATION_KEY_RE = re.compile(
+    r"^validation/(?P<dataset>[^/]+)/(?P<batch>[^/]+)/(?P<etag>[^/]+)\.json$"
+)
+
+
+def _human_size(num_bytes) -> str:
+    try:
+        value = float(num_bytes)
+    except (TypeError, ValueError):
+        return "-"
+
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:,.0f} {unit}" if unit == "B" else f"{value:,.1f} {unit}"
+        value /= 1024
+
+    return f"{value:,.1f} TiB"
+
+
+@st.cache_data(ttl=30)
+def list_artifact_objects() -> pd.DataFrame:
+    """
+    pipeline-artifacts bucket'ında SADECE validation/ öneki altındaki
+    kalite raporu JSON'larını listeler. validation/<dataset>/<batch>/
+    <etag>.json şemasına uymayan hiçbir nesne (ör. _clickhouse-ingest/...
+    altındaki geçici zstd parçaları) DAHİL EDİLMEZ.
+
+    Bucket yoksa boş DataFrame döner (hata fırlatmaz); bağlantı hatası
+    çağırana yükselir.
+    """
+
+    client = get_minio_client()
+    bucket = get_pipeline_artifacts_bucket()
+    prefix = get_validation_prefix()
+
+    if not client.bucket_exists(bucket):
+        return pd.DataFrame()
+
+    rows = []
+
+    for obj in client.list_objects(bucket, prefix=prefix, recursive=True):
+
+        if obj.is_dir:
+            continue
+
+        key = obj.object_name
+        match = _VALIDATION_KEY_RE.match(key)
+
+        # Şemaya uymayan / JSON olmayan nesneleri ele (güvenlik ağı --
+        # prefix zaten _clickhouse-ingest'i dışarıda bırakıyor).
+        if match is None or not key.endswith(".json"):
+            continue
+
+        rows.append(
+            {
+                "nesne": key,
+                "dataset": match.group("dataset"),
+                "batch": match.group("batch"),
+                "etag_kisa": match.group("etag"),
+                "boyut": _human_size(obj.size),
+                "boyut_bytes": obj.size,
+                "degisiklik": obj.last_modified,
+                "etag": (obj.etag or "").strip('"'),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        df = df.sort_values("degisiklik", ascending=False, ignore_index=True)
+
+    return df
+
+
+@st.cache_data(ttl=30)
+def fetch_artifact_bytes(key: str, etag: str) -> bytes:
+    """
+    Tek bir artefakt nesnesinin ham içeriğini indirir. `etag` yalnızca
+    cache anahtarını nesne değişince tazelemek için parametre edilir.
+    """
+
+    client = get_minio_client()
+    bucket = get_pipeline_artifacts_bucket()
+
+    response = client.get_object(bucket, key)
+
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
+
+
+@st.cache_data(ttl=60)
+def fetch_dvc_remote_manifests() -> dict:
+    """
+    DVC uzak deposundaki (dvc-cache) .dir manifestolarını okur. Her
+    manifest, DVC ile takip edilen bir dizinin içeriğini
+    [{"md5": ..., "relpath": ...}, ...] biçiminde JSON olarak tutar.
+
+    Döner: {"object_count", "total_bytes", "manifests": [...]}
+    """
+
+    client = get_minio_client()
+    bucket = get_dvc_remote_bucket()
+
+    if not client.bucket_exists(bucket):
+        return {"object_count": 0, "total_bytes": 0, "manifests": []}
+
+    object_count = 0
+    total_bytes = 0
+    manifest_keys = []
+
+    for obj in client.list_objects(bucket, recursive=True):
+
+        if obj.is_dir:
+            continue
+
+        object_count += 1
+        total_bytes += obj.size or 0
+
+        if obj.object_name.endswith(".dir"):
+            manifest_keys.append(obj.object_name)
+
+    manifests = []
+
+    for key in sorted(manifest_keys):
+
+        response = client.get_object(bucket, key)
+
+        try:
+            payload = json.loads(response.read())
+        except Exception:
+            payload = []
+        finally:
+            response.close()
+            response.release_conn()
+
+        # DVC md5 dizin hash'i: <2 harf>/<geri kalan>.dir
+        parts = key.split("/")
+        dir_md5 = "".join(parts[-2:]).replace(".dir", "") if len(parts) >= 2 else key
+
+        manifests.append(
+            {
+                "manifest_key": key,
+                "dir_md5": dir_md5,
+                "nfiles": len(payload) if isinstance(payload, list) else 0,
+                "files": payload if isinstance(payload, list) else [],
+            }
+        )
+
+    return {
+        "object_count": object_count,
+        "total_bytes": total_bytes,
+        "manifests": manifests,
+    }
+
+
+def _looks_like_ge_report(data) -> bool:
+    return isinstance(data, dict) and "statistics" in data and "result" in data
+
+
+def _render_ge_report(data: dict) -> None:
+
+    success = bool(data.get("success"))
+
+    if success:
+        st.success("✅ Doğrulama başarılı — tüm beklentiler karşılandı.")
+    else:
+        st.error("❌ Doğrulama başarısız — en az bir beklenti karşılanmadı.")
+
+    stats = data.get("statistics", {}) or {}
+
+    cols = st.columns(4)
+    cols[0].metric(
+        "Değerlendirilen beklenti",
+        f"{stats.get('evaluated_expectations', 0):,}",
+    )
+    cols[1].metric(
+        "Başarılı",
+        f"{stats.get('successful_expectations', 0):,}",
+    )
+    cols[2].metric(
+        "Başarısız",
+        f"{stats.get('unsuccessful_expectations', 0):,}",
+    )
+    cols[3].metric(
+        "Başarı %",
+        f"{stats.get('success_percent', 0.0):.1f}",
+    )
+
+    meta_bits = []
+
+    if data.get("rules_profile"):
+        meta_bits.append(f"**Kural profili:** `{data['rules_profile']}`")
+
+    validated_columns = data.get("validated_columns")
+    if isinstance(validated_columns, list):
+        meta_bits.append(f"**Doğrulanan kolon sayısı:** {len(validated_columns):,}")
+
+    if meta_bits:
+        st.markdown(" &nbsp;&nbsp;|&nbsp;&nbsp; ".join(meta_bits))
+
+    results = (data.get("result") or {}).get("results") or []
+
+    if results:
+
+        expectation_rows = []
+
+        for item in results:
+
+            config = item.get("expectation_config", {}) or {}
+            kwargs = config.get("kwargs", {}) or {}
+
+            column = kwargs.get("column")
+            if not column and isinstance(kwargs.get("column_list"), list):
+                column = f"<{len(kwargs['column_list']):,} kolon>"
+
+            expectation_rows.append(
+                {
+                    "beklenti": config.get("type")
+                    or config.get("expectation_type")
+                    or "-",
+                    "kolon": column or "-",
+                    "sonuç": "✅" if item.get("success") else "❌",
+                }
+            )
+
+        st.dataframe(
+            pd.DataFrame(expectation_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_dvc_artifacts() -> None:
+
+    st.subheader("DVC / Veri Sürümleri")
+
+    st.caption(
+        "Pipeline'ın her doğrulanmış batch için MinIO'ya yazdığı kalite "
+        "raporu JSON'larını (`pipeline-artifacts/validation/<dataset>/"
+        "<batch>/<etag>.json`) ve DVC uzak deposundaki (`dvc-cache`) dizin "
+        "manifestolarını gösterir. Her `batch` kimliği, DVC'ye publish "
+        "edilen bir veri sürümüne karşılık gelir."
+    )
+
+    if Minio is None:
+        st.error(
+            "`minio` paketi kurulu değil, MinIO'ya bağlanılamıyor: "
+            f"{_MINIO_IMPORT_ERROR}\n\n"
+            "`dashboard/requirements.txt` içine `minio` ekleyip dashboard "
+            "imajını yeniden kurun."
+        )
+        return
+
+    st.caption(
+        f"MinIO: `{get_minio_endpoint()}` &nbsp;·&nbsp; "
+        f"önek: `{get_pipeline_artifacts_bucket()}/{get_validation_prefix()}` "
+        f"&nbsp;·&nbsp; DVC remote bucket: `{get_dvc_remote_bucket()}` "
+        "&nbsp;·&nbsp; yeni artefaktlar için sol paneldeki **🔄 Şimdi "
+        "yenile** düğmesini kullanın."
+    )
+
+    try:
+        artifacts_df = list_artifact_objects()
+    except Exception as exc:
+        st.error(
+            f"MinIO'ya bağlanılamadı ({get_minio_endpoint()}): {exc}"
+        )
+        return
+
+    if artifacts_df.empty:
+        st.info(
+            f"`{get_pipeline_artifacts_bucket()}` bucket'ında henüz artefakt "
+            "yok. Pipeline en az bir batch'i doğrulayıp publish ettikten "
+            "sonra kalite raporları burada görünür."
+        )
+    else:
+
+        cols = st.columns(4)
+        cols[0].metric("Artefakt dosyası", f"{len(artifacts_df):,}")
+        cols[1].metric(
+            "Toplam boyut",
+            _human_size(artifacts_df["boyut_bytes"].sum()),
+        )
+        cols[2].metric(
+            "Dataset",
+            f"{artifacts_df['dataset'].dropna().nunique():,}",
+        )
+        cols[3].metric(
+            "Veri sürümü (batch)",
+            f"{artifacts_df['batch'].dropna().nunique():,}",
+        )
+
+        st.dataframe(
+            artifacts_df[
+                [
+                    "nesne",
+                    "dataset",
+                    "batch",
+                    "boyut",
+                    "degisiklik",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.divider()
+        st.markdown("### Rapor Detayı")
+
+        object_keys = artifacts_df["nesne"].tolist()
+
+        def _label_for(key: str) -> str:
+            row = artifacts_df.loc[artifacts_df["nesne"] == key].iloc[0]
+            if row["batch"]:
+                return f"{row['dataset']} / {row['batch']}  ({row['etag_kisa']})"
+            return key
+
+        selected_key = st.selectbox(
+            "Görüntülenecek artefakt",
+            options=object_keys,
+            format_func=_label_for,
+            key="dvc_selected_artifact",
+        )
+
+        if selected_key:
+
+            selected_row = artifacts_df.loc[
+                artifacts_df["nesne"] == selected_key
+            ].iloc[0]
+
+            try:
+                raw_bytes = fetch_artifact_bytes(
+                    selected_key,
+                    str(selected_row["etag"]),
+                )
+            except Exception as exc:
+                st.error(f"Artefakt indirilemedi: {exc}")
+            else:
+
+                try:
+                    data = json.loads(raw_bytes)
+                except Exception as exc:
+                    st.error(f"JSON çözümlenemedi: {exc}")
+                    st.code(
+                        raw_bytes[:5000].decode("utf-8", errors="replace")
+                    )
+                    data = None
+
+                if data is not None:
+
+                    if _looks_like_ge_report(data):
+                        _render_ge_report(data)
+
+                    st.download_button(
+                        "📥 JSON indir",
+                        data=raw_bytes,
+                        file_name=selected_key.split("/")[-1],
+                        mime="application/json",
+                        key="dvc_download_artifact",
+                    )
+
+                    # validated_columns 10.000+ öğe içerebildiği için ham
+                    # görünümde bu alan özetlenir.
+                    preview = data
+                    if (
+                        isinstance(data, dict)
+                        and isinstance(data.get("validated_columns"), list)
+                        and len(data["validated_columns"]) > 50
+                    ):
+                        preview = dict(data)
+                        preview["validated_columns"] = (
+                            f"<{len(data['validated_columns'])} kolon — "
+                            "ham dosyada listelenmiştir>"
+                        )
+
+                    with st.expander("Ham JSON"):
+                        st.json(preview, expanded=False)
+
+    st.divider()
+    st.markdown("### DVC Uzak Deposu (`dvc-cache`)")
+
+    try:
+        remote = fetch_dvc_remote_manifests()
+    except Exception as exc:
+        st.warning(f"DVC uzak deposu okunamadı: {exc}")
+        return
+
+    cols = st.columns(3)
+    cols[0].metric("Nesne sayısı", f"{remote['object_count']:,}")
+    cols[1].metric("Toplam boyut", _human_size(remote["total_bytes"]))
+    cols[2].metric("Dizin manifestosu", f"{len(remote['manifests']):,}")
+
+    if not remote["manifests"]:
+        st.caption(
+            "Henüz `.dir` manifestosu yok — DVC'ye bir dizin publish "
+            "edildiğinde burada listelenir."
+        )
+        return
+
+    for manifest in remote["manifests"]:
+
+        with st.expander(
+            f"`{manifest['dir_md5']}` — {manifest['nfiles']} dosya"
+        ):
+
+            file_rows = [
+                {
+                    "relpath": entry.get("relpath"),
+                    "md5": entry.get("md5"),
+                }
+                for entry in manifest["files"]
+            ]
+
+            st.dataframe(
+                pd.DataFrame(file_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.caption(f"Manifest anahtarı: `{manifest['manifest_key']}`")
+
+
+# ============================================================
 # ANA UYGULAMA
 # ============================================================
 
 def main():
-
-    # Bu render'ın ne kadar sürdüğü (sonunda ölçülüp
-    # "_last_render_duration_sec" olarak kaydedilir), otomatik
-    # yenileme aktifse bir SONRAKİ tetiklemenin bekleme süresinden
-    # düşülür -- bkz. aşağıdaki "AUTO REFRESH" bölümü.
-    render_started_at = time.time()
 
     # Başlığa tıklanınca "Pipeline Metrikleri" (ana) sekmesine geçilir --
     # bkz. aşağıdaki "?goto=runs" query param kontrolü.
@@ -7631,12 +8018,11 @@ def main():
     # seçilir. session_state["active_main_tab"] zaten set edilmişse
     # (kullanıcı elle başka bir sekmeye geçtiyse) bu değer
     # UYGULANMAZ -- yoksa kullanıcı sekme değiştirdikten sonra her
-    # rerun'da (örn. otomatik yenileme) URL'deki sekmeye geri dönerdi.
+    # rerun'da URL'deki sekmeye geri dönerdi.
     #
-    # Run sayısı / otomatik yenileme / "Şimdi yenile" de aynı panelde
-    # -- bunlar runs_df'i (aşağıda) ve otomatik yenilemeyi etkilediği
-    # için değerleri (run_limit, refresh_seconds) content_col'daki
-    # sekme içerikleri render edilmeden ÖNCE burada okunmalı.
+    # "Gösterilecek run sayısı" ve "🔄 Şimdi yenile" de aynı panelde --
+    # run_limit, content_col'daki sekme içerikleri render edilmeden
+    # ÖNCE burada okunmalı (runs_df'i etkiler).
 
     # Başlığa tıklanınca eklenen "?goto=runs" -- mevcut sekme ne olursa
     # olsun (aşağıdaki "active_main_tab" session_state'te zaten bir
@@ -7696,24 +8082,6 @@ def main():
             step=10,
         )
 
-        refresh_label = st.selectbox(
-            "Otomatik yenileme",
-            list(
-                REFRESH_OPTIONS.keys()
-            ),
-            # Varsayılan "Kapalı": otomatik yenileme açıkken her tetikleme
-            # tam bir rerun yapıp filtre ekranını başa sardırıyor / seçim
-            # yapılırken sayfayı sıçratıyordu. Kullanıcı ihtiyaç duyarsa
-            # buradan açabilir.
-            index=0,
-        )
-
-        refresh_seconds = (
-            REFRESH_OPTIONS[
-                refresh_label
-            ]
-        )
-
         if st.button(
             "🔄 Şimdi yenile",
             use_container_width=True,
@@ -7732,8 +8100,11 @@ def main():
             get_time_range.clear()
             get_lat_lon_bounds.clear()
             fetch_flight_route.clear()
-            fetch_auair_batch_summary.clear()
             check_clickhouse_connection.clear()
+            # "DVC / Veri Sürümleri" sekmesinin MinIO okumaları
+            list_artifact_objects.clear()
+            fetch_artifact_bytes.clear()
+            fetch_dvc_remote_manifests.clear()
 
             st.rerun()
 
@@ -7741,19 +8112,6 @@ def main():
             "Son sorgu: "
             f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
         )
-
-        _prev_render_duration = st.session_state.get(
-            "_last_render_duration_sec"
-        )
-
-        if _prev_render_duration is not None:
-
-            st.caption(
-                "Önceki render işlem süresi: "
-                f"{_prev_render_duration:.1f} sn "
-                "(gerçek otomatik yenileme aralığı, seçilen süreye "
-                "bu kadar eklenerek oluşur)"
-            )
 
     active_tab = st.session_state["active_main_tab"]
 
@@ -7851,91 +8209,6 @@ def main():
         """,
         height=0,
     )
-
-    # ========================================================
-    # AUTO REFRESH
-    # ========================================================
-
-    # "Veri Gözat / Dışa Aktar" akışında otomatik yenileme, gerçek
-    # ortamda doğrulanmış şekilde export'u bozuyordu:
-    #
-    #  1) Sadece interval değerini büyütmek (ör. 24 saate çekmek)
-    #     YETERLİ DEĞİL — streamlit_autorefresh bileşeninin JS tarafı
-    #     zaten çalışan bir zamanlayıcı varken yeni interval'i
-    #     güvenilir şekilde uygulamıyor. Bu yüzden bileşen, interval
-    #     değiştirilerek değil doğrudan HİÇ MONTE EDİLMEYEREK devre
-    #     dışı bırakılır (aşağıdaki st.empty() ile).
-    #
-    #  2) Bunu yalnızca "veri getirildikten sonra" (export_df set
-    #     edildikten sonra) yapmak da yetersizdi: otomatik yenileme
-    #     hâlâ aktifken "📥 Veriyi Getir ve Önizle" tıklaması, o anda
-    #     tetiklenen bir yenilemeyle yarışıp sunucuya hiç ulaşmamış
-    #     gibi kayboluyordu — export_df bir türlü set edilemiyor,
-    #     "3️⃣ İndir" sonsuza dek boş kalıyordu. Bu yüzden duraklatma,
-    #     satır sayısı hesaplandığı anda (export_row_count set
-    #     edilir edilmez) başlar; "Veriyi Getir ve Önizle" tıklandığı
-    #     an otomatik yenileme zaten devre dışıdır, yarış oluşmaz.
-    #     (~874k satırlık bir export ile: otomatik yenileme AÇIKKEN
-    #     asla tamamlanmadı, bu düzeltmeyle ~20-30 saniyede sorunsuz
-    #     tamamlandı.)
-    #
-    #  3) Aynı yarış, satır sayısı hesaplanmadan ÖNCE "1️⃣ Filtrele"
-    #     adımındaki Alan Bazlı Filtre haritasını (streamlit-folium/
-    #     Leaflet iframe'i) da bozuyordu: harita ekrandayken bir
-    #     otomatik yenileme rerun'u tetiklenirse, iframe'in Leaflet
-    #     içeriği tam yeniden mount olmadan komponent yeniden
-    #     boyutlandırılıyor ve iframe'in ölçülen yüksekliği 420px
-    #     yerine ~1900px'e sıçrayıp haritanın altında dev bir boş
-    #     alan bırakıyor, sayfanın geri kalanını aşağı itiyordu.
-    #     Bu yüzden duraklatma "veri getirildikten sonra" değil,
-    #     kullanıcı "Veri Gözat / Dışa Aktar" sekmesindeyken (haritayla
-    #     etkileşim satır sayısı hesaplanmadan önce olduğu için)
-    #     BAŞLAR -- export_row_count/export_df yalnızca bu sekme
-    #     aktifken render_data_export() içinden set edildiği için,
-    #     tek başına active_tab == MAIN_TAB_EXPORT kontrolü hem satır
-    #     sayısı hesaplanmadan ÖNCEKİ hem SONRAKİ tüm senaryoları
-    #     kapsar.
-    #
-    #  4) ÖNEMLİ (regresyon, düzeltildi): export_row_count/export_df
-    #     kontrolünü export_in_progress'e AYRICA eklemek (active_tab
-    #     kontrolünden bağımsız olarak) ciddi bir hataya yol açtı --
-    #     bu iki session_state anahtarı yalnızca kullanıcı Export
-    #     sekmesindeyken FİLTRELER DEĞİŞTİĞİNDE temizlenir (yukarıda,
-    #     render_data_export() içinde); kullanıcı satır sayısını
-    #     hesaplayıp/veriyi getirip filtre değiştirmeden BAŞKA bir
-    #     sekmeye geçtiğinde bu anahtarlar session_state'te KALICI
-    #     olarak set halinde kalıyordu. Sonuç: export_in_progress
-    #     sonsuza dek True kalıyor, otomatik yenileme HANGİ SEKMEDE
-    #     olursa olsun, ne kadar beklenirse beklensin bir daha asla
-    #     tetiklenmiyordu. active_tab == MAIN_TAB_EXPORT tek başına
-    #     zaten yeterli olduğu için (bkz. not 3) bu iki anahtar
-    #     kaldırıldı.
-
-    export_in_progress = active_tab == MAIN_TAB_EXPORT
-
-    autorefresh_slot = st.empty()
-
-    if refresh_seconds and not export_in_progress:
-
-        # ÖNEMLİ: interval, render'dan render'a DEĞİŞMEMELİDİR -- bkz.
-        # yukarıdaki not (1): interval'i render'ın ölçülen süresine
-        # göre dinamik ayarlayıp seçilen süreye "yakınsatmak" DENENDİ,
-        # ama tam olarak yukarıdaki notun uyardığı şekilde bozdu:
-        # otomatik yenileme tamamen durdu (asla tetiklenmedi). Bu
-        # yüzden interval burada SABİT kalır; seçilen süre yalnızca
-        # JS zamanlayıcısının TİK süresidir -- kullanıcının gördüğü
-        # gerçek döngü buna rerun'un işlem süresi (Dagster GraphQL +
-        # ClickHouse + Postgres çağrıları) eklenerek oluşur. Bu fark
-        # sol paneldeki "Önceki render işlem süresi" ile şeffaf şekilde
-        # gösterilir; kullanıcı buna göre daha büyük bir aralık
-        # seçebilir.
-
-        with autorefresh_slot:
-
-            st_autorefresh(
-                interval=refresh_seconds * 1000,
-                key="dashboard_refresh",
-            )
 
     # ========================================================
     # RUN VERİSİNİ BİR KEZ ÇEK
@@ -8036,6 +8309,14 @@ def main():
             render_metadata_history()
 
         # ========================================================
+        # DVC / VERİ SÜRÜMLERİ
+        # ========================================================
+
+        if active_tab == MAIN_TAB_DVC:
+
+            render_dvc_artifacts()
+
+        # ========================================================
         # ALERTS
         # ========================================================
 
@@ -8060,13 +8341,6 @@ def main():
         if active_tab == MAIN_TAB_FLIGHT_MAP:
 
             render_flight_map()
-
-    # Otomatik yenilemenin bir sonraki bekleme süresini telafi
-    # edebilmesi için, bu render'ın toplam süresi ölçülüp kaydedilir
-    # (bkz. yukarıdaki "AUTO REFRESH" bölümü).
-    st.session_state["_last_render_duration_sec"] = (
-        time.time() - render_started_at
-    )
 
 
 # ============================================================

@@ -1,45 +1,79 @@
 """Dagster failure notifications without automatic run retries.
 
-A failed step is logged, appended to the local alert registry, and optionally
-sent to a webhook. Failed runs are retried only when a user explicitly starts
-a re-execution from Dagster.
+A failed step is logged, appended to an alert registry kept as a single JSON
+object in MinIO, and optionally sent to a webhook. Failed runs are retried
+only when a user explicitly starts a re-execution from Dagster.
+
+The same MinIO object is read by the Streamlit dashboard ("🚨 Alertler"
+tab), so Dagster and the dashboard no longer share a bind-mounted file.
+Bucket / object are configurable with MINIO_ALERTS_BUCKET /
+MINIO_ALERTS_OBJECT; the MinIO connection settings are the same ones
+assets.create_minio_client() reads (MINIO_ENDPOINT, MINIO_ACCESS_KEY, ...).
 """
 
+import io
 import json
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 from dagster import HookContext, failure_hook, success_hook
+from minio.error import S3Error
 
+from assets import create_minio_client
 from postgres_catalog import mark_job_run_failure
 
 
-ALERT_FILE = Path(os.getenv("ALERT_FILE", "data/alerts/alerts.json"))
-ALERT_DIR = ALERT_FILE.parent
+ALERTS_BUCKET = os.getenv("MINIO_ALERTS_BUCKET", "pipeline-alerts")
+ALERTS_OBJECT = os.getenv("MINIO_ALERTS_OBJECT", "alerts.json")
+ALERTS_URI = f"s3://{ALERTS_BUCKET}/{ALERTS_OBJECT}"
+MAX_ALERTS = 500
 
 
-def _ensure_alert_file() -> None:
-    ALERT_DIR.mkdir(parents=True, exist_ok=True)
-    if not ALERT_FILE.exists():
-        ALERT_FILE.write_text("[]", encoding="utf-8")
+def _load_alerts() -> list:
+    """Return the alert list stored in MinIO ([] if bucket/object missing)."""
+
+    client = create_minio_client()
+    try:
+        response = client.get_object(ALERTS_BUCKET, ALERTS_OBJECT)
+    except S3Error as error:
+        if error.code in {"NoSuchKey", "NoSuchBucket"}:
+            return []
+        raise
+
+    try:
+        payload = json.loads(response.read())
+    finally:
+        response.close()
+        response.release_conn()
+
+    return payload if isinstance(payload, list) else []
+
+
+def _store_alerts(alerts: list) -> None:
+    """Overwrite the MinIO alert object (creating the bucket if needed)."""
+
+    client = create_minio_client()
+    if not client.bucket_exists(ALERTS_BUCKET):
+        client.make_bucket(ALERTS_BUCKET)
+
+    body = json.dumps(alerts, ensure_ascii=False, indent=2).encode("utf-8")
+    client.put_object(
+        ALERTS_BUCKET,
+        ALERTS_OBJECT,
+        io.BytesIO(body),
+        length=len(body),
+        content_type="application/json",
+    )
 
 
 def _save_alert(alert_data: dict) -> None:
-    _ensure_alert_file()
-    try:
-        existing_alerts = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
-        if not isinstance(existing_alerts, list):
-            existing_alerts = []
-    except (json.JSONDecodeError, OSError):
-        existing_alerts = []
-
-    existing_alerts.append(alert_data)
-    ALERT_FILE.write_text(
-        json.dumps(existing_alerts[-500:], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # Dosya sürümündeki gibi oku-değiştir-yaz. Eşzamanlı yazımlar için
+    # kilit yok; tek bir pipeline run'ının hook'ları pratikte sıralı
+    # çalıştığı için dosya sürümüyle aynı garanti korunur.
+    alerts = _load_alerts()
+    alerts.append(alert_data)
+    _store_alerts(alerts[-MAX_ALERTS:])
 
 
 def _send_webhook(alert_data: dict) -> None:
@@ -101,9 +135,9 @@ def alert_on_failure(context: HookContext) -> None:
 
     try:
         _save_alert(alert_data)
-        context.log.info("Alert kaydedildi: %s", ALERT_FILE)
+        context.log.info("Alert kaydedildi: %s", ALERTS_URI)
     except Exception as error:
-        context.log.error("Alert dosyasına yazılamadı: %s", error)
+        context.log.error("Alert MinIO'ya yazılamadı (%s): %s", ALERTS_URI, error)
 
     _send_webhook(alert_data)
     context.log.info(
@@ -114,9 +148,6 @@ def alert_on_failure(context: HookContext) -> None:
 @success_hook
 def clear_alert_on_success(context: HookContext) -> None:
     """Resolve ancestor-run alerts after a successful manual re-execution."""
-
-    if not ALERT_FILE.exists():
-        return
 
     job_name = context.job_name
     try:
@@ -140,8 +171,8 @@ def clear_alert_on_success(context: HookContext) -> None:
         return
 
     try:
-        existing_alerts = json.loads(ALERT_FILE.read_text(encoding="utf-8"))
-        if not isinstance(existing_alerts, list):
+        existing_alerts = _load_alerts()
+        if not existing_alerts:
             return
 
         resolved_at = datetime.now(timezone.utc).isoformat()
@@ -159,10 +190,7 @@ def clear_alert_on_success(context: HookContext) -> None:
                 is_updated = True
 
         if is_updated:
-            ALERT_FILE.write_text(
-                json.dumps(existing_alerts, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _store_alerts(existing_alerts)
             context.log.info(
                 "Geçmiş hata çözüldü: Job=%s, Step=%s",
                 job_name,
