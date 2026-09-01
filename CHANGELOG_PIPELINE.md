@@ -4,6 +4,16 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.9.0 (2026-09-01)
+
+
+### Features
+
+- **pipeline**: AU-AIR akışını tek job + tek sensöre indir ([`1240666`](https://github.com/ykyking1/DataProcessingManagement/commit/124066619c9e71aec4b7a8c32ef92fd143f8a5cb))
+
+
+
+
 ## pipeline-v0.8.0 (2026-09-01)
 
 
