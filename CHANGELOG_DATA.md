@@ -2,6 +2,9 @@
 
 <!-- version list -->
 
+## v0.2.6 (2026-09-01)
+
+
 ## v0.2.6-test.1 (2026-08-31)
 
 **Data processed with `pipeline-v0.5.0-dirty` (`7118ddb3b72f013772f0e8f110ed0fe5c48f9f30`)**
