@@ -3494,10 +3494,11 @@ def render_alerts(
 
             show_only_active = st.toggle(
                 "🔴 Sadece aktif hatalar",
-                value=False,
+                value=True,
                 help=(
                     "Açıkken, geçmişte yaşanıp sonradan başarılı (RESOLVED) "
-                    "olan adımlar listeden gizlenir."
+                    "olan adımlar listeden gizlenir. Kapatırsan çözülmüş "
+                    "geçmiş alertler de görünür."
                 ),
             )
 
@@ -3809,15 +3810,20 @@ def render_alerts(
 
                             else:
 
-                                # Ne otomatik düzeltme kaydı ne de
-                                # tükenme kaydı var -- otomatik
-                                # düzeltme devreye girmeden (ör. çok
-                                # kısa sürede) elle çözülmüş olmalı.
+                                # Alert RESOLVED ama otomatik düzeltme
+                                # kaydı (ne resolved_attempt ne
+                                # exhausted) yok. Sebep: otomatik
+                                # düzeltme kapalı/kaldırılmış, ya da
+                                # devreye girmeden elle çözülmüş, ya da
+                                # işaret alerts.json'a yazılırken
+                                # yarış (race) nedeniyle kaybolmuş
+                                # olabilir. Kesin "elle" demiyoruz.
 
                                 st.success(
-                                    "✅ Çözüldü: **elle (manuel) "
-                                    "çözüldü** — otomatik düzeltme "
-                                    "sistemi devreye girmeden, tekrar "
+                                    "✅ Çözüldü — otomatik düzeltme "
+                                    "kaydı yok (otomatik düzeltme kapalı "
+                                    "olabilir ya da adım elle yeniden "
+                                    "çalıştırılmış olabilir). Tekrar "
                                     "çalıştırmaya gerek yok."
                                     + resolved_at_suffix
                                 )
