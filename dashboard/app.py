@@ -171,6 +171,61 @@ MAIN_TAB_LABELS = [
 ]
 
 # ============================================================
+# PANELLER (Kullanıcı / Admin)
+# ============================================================
+#
+# Dashboard iki panele ayrılır; yan paneldeki parolasız bir radio ile
+# geçilir (bkz. main()).
+#
+#   - Kullanıcı Paneli: yalnızca son kullanıcıya dönük sekmeler
+#     ("Veri Gözat / Dışa Aktar" ve "Uçuş Rotası"). "Gösterilecek run
+#     sayısı" slider'ı burada GÖSTERİLMEZ.
+#   - Admin Paneli: tüm sekmeler + "Gösterilecek run sayısı" slider'ı.
+#
+# Not: parola/kimlik doğrulama YOK -- ayrım yalnızca arayüzü sadeleştirmek
+# içindir, bir güvenlik sınırı değildir.
+
+PANEL_USER = "👤 Kullanıcı Paneli"
+PANEL_ADMIN = "🛠️ Admin Paneli"
+
+PANEL_LABELS = [PANEL_USER, PANEL_ADMIN]
+
+# Seçili panel URL'de "?panel=user|admin" olarak tutulur -- başlığa
+# tıklamak (bkz. "?goto=runs") sayfayı yeniden yükleyip session_state'i
+# sıfırladığı için panel bilgisinin reload'dan sağ çıkması gerekir.
+PANEL_BY_CODE = {"user": PANEL_USER, "admin": PANEL_ADMIN}
+PANEL_CODE_BY_LABEL = {PANEL_USER: "user", PANEL_ADMIN: "admin"}
+
+# Kullanıcı panelinde görünecek sekmeler (sıra buradaki gibi çizilir).
+USER_TAB_LABELS = [
+    MAIN_TAB_EXPORT,
+    MAIN_TAB_FLIGHT_MAP,
+]
+
+
+def _tabs_for_panel(panel: str) -> list:
+    """Verilen panelde gösterilecek ana sekme etiketleri."""
+
+    if panel == PANEL_USER:
+        return USER_TAB_LABELS
+
+    return MAIN_TAB_LABELS
+
+
+def _sync_panel_to_url() -> None:
+    """Panel radio'sunun on_change callback'i: seçili paneli URL'ye yazar.
+
+    Yalnızca kullanıcı paneli elle değiştirdiğinde çalışır -- her
+    render'da URL'ye yazmak, aynı render içinde query param güncelleyen
+    başka özelliklerle (ör. "🔗 Bağlantı Olarak Paylaş") çakışıyordu.
+    """
+
+    st.query_params["panel"] = PANEL_CODE_BY_LABEL.get(
+        st.session_state.get("panel_selector"),
+        "user",
+    )
+
+# ============================================================
 # AU-AIR KOLONLARI
 # ============================================================
 
@@ -4208,9 +4263,12 @@ def render_download_section(
 
     ÖNEMLİ: Format seçildiğinde (hatta "Tüm Veri" varsayılan seçili
     geldiğinde, kullanıcı hiçbir şeye tıklamadan) dönüşümün OTOMATİK
-    başlamaması için, her format kendi alt fonksiyonunda ayrıca bir
-    "Oluştur" butonuna basılmasını bekler (bkz. _render_all_data_csv_download
-    vb.) -- dönüşüm yalnızca o butona basılınca çalışır.
+    başlamaması için, dönüşüm doğrudan indirme butonuna gömülüdür:
+    st.download_button'a `data` olarak argümansız bir callable verilir
+    (Streamlit >= 1.61) ve bu callable YALNIZCA kullanıcı butona
+    bastığında, ayrı bir thread'de çalışır (bkz.
+    _render_all_data_csv_download vb.). Böylece ayrı bir "Oluştur"
+    butonuna gerek kalmaz; tek tıkla veri hazırlanıp indirilir.
 
     share_params: mevcut filtre durumunun URL query parametresi olarak
     kodlanmış hâli (bkz. _encode_export_state_to_query_params). Burada,
@@ -4313,8 +4371,16 @@ def render_download_section(
 
             st.query_params.update(full_share_params)
 
+            # Kopyalanabilir bağlantı alıcıyı DAİMA Kullanıcı panelindeki
+            # "Veri Gözat / Dışa Aktar" sekmesine götürür -- "panel=user"
+            # yalnızca paylaşılan URL metnine eklenir; paylaşan kişinin
+            # adres çubuğundaki kendi "panel" seçimi (Admin olabilir)
+            # değiştirilmez.
+            shareable_params = dict(full_share_params)
+            shareable_params["panel"] = "user"
+
             st.session_state["export_share_query_string"] = urlencode(
-                full_share_params
+                shareable_params
             )
 
         query_string = st.session_state.get("export_share_query_string")
@@ -4434,18 +4500,11 @@ def render_download_section(
         hide_index=True,
     )
 
-    # flight_groups her render'da groupby ile yeniden oluşturulduğu için
-    # kendi id()'si her seferinde değişir; cache anahtarı bunun yerine
-    # session_state'ten gelen (dolayısıyla rerun'lar arasında sabit
-    # kalan) dataframe'in id()'sine dayanır.
-    dataframe_id = id(dataframe)
-
     if selected_format == "zip":
 
         _render_flight_zip_download(
             flight_groups,
             time_suffix,
-            dataframe_id,
             selected_file_type,
         )
 
@@ -4454,7 +4513,6 @@ def render_download_section(
         _render_flight_individual_downloads(
             flight_groups,
             time_suffix,
-            dataframe_id,
             selected_file_type,
         )
 
@@ -4463,7 +4521,6 @@ def render_download_section(
         _render_flight_merge_download(
             flight_groups,
             time_suffix,
-            dataframe_id,
             selected_file_type,
         )
 
@@ -4481,62 +4538,30 @@ def _render_all_data_csv_download(
         f"{len(dataframe):,} satır, {len(dataframe.columns)} kolon"
     )
 
-    # Dönüşüm yalnızca kullanıcı açıkça bu butona basınca çalışır --
-    # aksi halde "Tüm Veri" formatı varsayılan seçili geldiği için sekme
-    # açılır açılmaz (kullanıcı hiçbir şey yapmadan) büyük veri setinde
-    # saniyeler süren bir dönüşüm otomatik başlıyordu.
+    # Dönüşüm, download_button'ın `data` callable'ı içinde yapılır --
+    # yani YALNIZCA kullanıcı indir butonuna basınca (ayrı bir thread'de)
+    # çalışır. Böylece "Tüm Veri" formatı varsayılan seçili geldiği için
+    # sekme açılır açılmaz büyük veri setinde saniyeler süren bir dönüşüm
+    # otomatik başlamaz.
 
-    cache_key = ("all", id(dataframe), file_type)
-
-    if st.button(
-        f"{DOWNLOAD_FILE_TYPE_LABELS[file_type]} Oluştur",
+    st.download_button(
+        label=f"⬇️ Tüm Veriyi {extension.upper()} Olarak İndir",
+        data=lambda: _dataframe_to_download_bytes(dataframe, file_type),
+        file_name=f"au_air_telemetry_{time_suffix}.{extension}",
+        mime=_download_mime_type(file_type),
         type="primary",
-        key="prepare_all_data_csv",
-    ):
+        key="download_all_data_csv",
+    )
 
-        # Büyük veri setlerinde bu dönüşüm birkaç saniye sürebiliyor;
-        # spinner olmadan sekme "donmuş" gibi görünüyor ve kullanıcı bir
-        # hata olduğunu düşünebiliyordu.
-
-        with st.spinner(
-            "Veriniz indirmeye hazırlanıyor, veri miktarına bağlı olarak "
-            "bu işlem biraz sürebilir..."
-        ):
-
-            file_bytes = _dataframe_to_download_bytes(
-                dataframe,
-                file_type,
-            )
-
-        st.session_state["download_all_data_cache"] = {
-            "key": cache_key,
-            "bytes": file_bytes,
-        }
-
-    cache = st.session_state.get("download_all_data_cache")
-
-    if cache and cache["key"] == cache_key:
-
-        st.download_button(
-            label=f"⬇️ Tüm Veriyi {extension.upper()} Olarak İndir",
-            data=cache["bytes"],
-            file_name=f"au_air_telemetry_{time_suffix}.{extension}",
-            mime=_download_mime_type(file_type),
-            type="primary",
-            key="download_all_data_csv",
-        )
-
-    else:
-
-        st.caption(
-            "İndirme dosyasını oluşturmak için yukarıdaki butona basın."
-        )
+    st.caption(
+        "Butona bastığınızda dosya hazırlanıp indirilir; veri miktarına "
+        "bağlı olarak birkaç saniye sürebilir."
+    )
 
 
 def _render_flight_zip_download(
     flight_groups: dict,
     time_suffix: str,
-    dataframe_id: int,
     file_type: str,
 ) -> None:
 
@@ -4557,7 +4582,7 @@ def _render_flight_zip_download(
     if not selected_flights_to_zip:
 
         st.caption(
-            "ZIP oluşturmak için yukarıdan bir ya da daha fazla uçuş seçin."
+            "ZIP indirmek için yukarıdan bir ya da daha fazla uçuş seçin."
         )
 
         return
@@ -4568,79 +4593,53 @@ def _render_flight_zip_download(
         "satır."
     )
 
-    cache_key = (
-        "zip",
-        dataframe_id,
-        tuple(sorted(selected_flights_to_zip)),
-        file_type,
+    def _build_flight_zip() -> bytes:
+
+        # download_button'ın `data` callable'ı -- yalnızca kullanıcı
+        # butona basınca çalışır.
+
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(
+            zip_buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as zip_file:
+
+            for flight in selected_flights_to_zip:
+
+                file_bytes = _dataframe_to_download_bytes(
+                    flight_groups[flight],
+                    file_type,
+                )
+
+                zip_file.writestr(
+                    f"ucus_{flight}_{time_suffix}.{extension}",
+                    file_bytes,
+                )
+
+        return zip_buffer.getvalue()
+
+    st.download_button(
+        label=(
+            f"⬇️ Seçilen Uçuşları ZIP Olarak İndir "
+            f"({len(selected_flights_to_zip)} dosya)"
+        ),
+        data=_build_flight_zip,
+        file_name=f"ucuslar_{time_suffix}.zip",
+        mime="application/zip",
+        type="primary",
+        key="download_all_flights_zip",
     )
 
-    if st.button(
-        "📦 ZIP Oluştur",
-        type="primary",
-        key="prepare_flight_zip",
-    ):
-
-        with st.spinner(
-            f"{len(selected_flights_to_zip)} uçuş için ZIP hazırlanıyor..."
-        ):
-
-            zip_buffer = io.BytesIO()
-
-            with zipfile.ZipFile(
-                zip_buffer,
-                mode="w",
-                compression=zipfile.ZIP_DEFLATED,
-            ) as zip_file:
-
-                for flight in selected_flights_to_zip:
-
-                    file_bytes = _dataframe_to_download_bytes(
-                        flight_groups[flight],
-                        file_type,
-                    )
-
-                    zip_file.writestr(
-                        f"ucus_{flight}_{time_suffix}.{extension}",
-                        file_bytes,
-                    )
-
-        st.session_state["download_flight_zip_cache"] = {
-            "key": cache_key,
-            "bytes": zip_buffer.getvalue(),
-        }
-
-    cache = st.session_state.get("download_flight_zip_cache")
-
-    if cache and cache["key"] == cache_key:
-
-        st.download_button(
-            label=(
-                f"⬇️ Seçilen Uçuşları ZIP Olarak İndir "
-                f"({len(selected_flights_to_zip)} dosya)"
-            ),
-            data=cache["bytes"],
-            file_name=f"ucuslar_{time_suffix}.zip",
-            mime="application/zip",
-            type="primary",
-            key="download_all_flights_zip",
-        )
-
-        st.caption(
-            f"Her uçuş için ayrı bir {extension.upper()} dosyası içerir."
-        )
-
-    else:
-
-        st.caption(
-            "İndirme dosyasını oluşturmak için yukarıdaki butona basın."
-        )
+    st.caption(
+        f"Her uçuş için ayrı bir {extension.upper()} dosyası içerir."
+    )
 
 
 def _render_flight_individual_downloads(
     flight_groups: dict,
     time_suffix: str,
-    dataframe_id: int,
     file_type: str,
 ) -> None:
 
@@ -4652,9 +4651,8 @@ def _render_flight_individual_downloads(
         "İndirilecek uçuşlar",
         options=flight_options,
         help=(
-            "Yalnızca burada seçtiğiniz uçuşların dosyası hazırlanır -- "
-            "gereksiz yere tüm uçuşların dosyasını oluşturmaktan kaçınmak "
-            "için yalnızca istediklerinizi seçin."
+            "Yalnızca burada seçtiğiniz uçuşlar için indirme butonu "
+            "gösterilir; dosya, ilgili butona basıldığında hazırlanır."
         ),
         key="download_each_selected_flights",
     )
@@ -4662,53 +4660,10 @@ def _render_flight_individual_downloads(
     if not selected_flights_to_prepare:
 
         st.caption(
-            "Hazırlamak için yukarıdan bir ya da daha fazla uçuş seçin."
+            "İndirmek için yukarıdan bir ya da daha fazla uçuş seçin."
         )
 
         return
-
-    cache_key = (
-        "each",
-        dataframe_id,
-        tuple(sorted(selected_flights_to_prepare)),
-        file_type,
-    )
-
-    if st.button(
-        f"✈️ {extension.upper()}'leri Oluştur",
-        type="primary",
-        key="prepare_flight_individual_csvs",
-    ):
-
-        with st.spinner(
-            f"{len(selected_flights_to_prepare)} uçuş için "
-            f"{extension.upper()} dosyaları hazırlanıyor..."
-        ):
-
-            flight_csv_bytes = {
-                flight: _dataframe_to_download_bytes(
-                    flight_groups[flight],
-                    file_type,
-                )
-                for flight in selected_flights_to_prepare
-            }
-
-        st.session_state["download_flight_individual_cache"] = {
-            "key": cache_key,
-            "bytes": flight_csv_bytes,
-        }
-
-    cache = st.session_state.get("download_flight_individual_cache")
-
-    if not (cache and cache["key"] == cache_key):
-
-        st.caption(
-            "İndirme dosyalarını oluşturmak için yukarıdaki butona basın."
-        )
-
-        return
-
-    flight_csv_bytes = cache["bytes"]
 
     for flight in sorted(selected_flights_to_prepare):
 
@@ -4726,9 +4681,14 @@ def _render_flight_individual_downloads(
 
         with col_b:
 
+            # data callable'ı her uçuş için ayrı ayrı bağlanır (df=group_df)
+            # ve yalnızca o uçuşun butonuna basılınca çalışır.
             st.download_button(
                 label=f"{extension.upper()} indir",
-                data=flight_csv_bytes[flight],
+                data=lambda df=group_df: _dataframe_to_download_bytes(
+                    df,
+                    file_type,
+                ),
                 file_name=f"ucus_{flight}_{time_suffix}.{extension}",
                 mime=_download_mime_type(file_type),
                 key=f"download_flight_{flight}",
@@ -4738,7 +4698,6 @@ def _render_flight_individual_downloads(
 def _render_flight_merge_download(
     flight_groups: dict,
     time_suffix: str,
-    dataframe_id: int,
     file_type: str,
 ) -> None:
     """
@@ -4783,72 +4742,45 @@ def _render_flight_merge_download(
         f"{merge_row_count:,} satır birleştirilecek."
     )
 
-    cache_key = (
-        "merge",
-        dataframe_id,
-        tuple(sorted(selected_flights_to_merge)),
-        file_type,
-    )
-
-    if st.button(
-        f"🧩 Birleştirilmiş {extension.upper()} Oluştur",
-        type="primary",
-        key="prepare_flight_merge_csv",
-    ):
-
-        with st.spinner(
-            f"{len(selected_flights_to_merge)} uçuş birleştiriliyor..."
-        ):
-
-            merged_df = pd.concat(
-                [
-                    flight_groups[flight]
-                    for flight in selected_flights_to_merge
-                ],
-                ignore_index=True,
-            )
-
-            file_bytes = _dataframe_to_download_bytes(
-                merged_df,
-                file_type,
-            )
-
-        st.session_state["download_flight_merge_cache"] = {
-            "key": cache_key,
-            "bytes": file_bytes,
-        }
-
-    cache = st.session_state.get("download_flight_merge_cache")
-
-    if cache and cache["key"] == cache_key:
-
-        # Dosya adına en fazla 3 uçuşun adı eklenir; daha fazlasında
-        # dosya adı okunaksız uzayacağı için sadece sayı belirtilir.
-        if len(selected_flights_to_merge) <= 3:
-            flights_label = "_".join(sorted(selected_flights_to_merge))
-        else:
-            flights_label = f"{len(selected_flights_to_merge)}_ucus"
-
-        st.download_button(
-            label=(
-                f"⬇️ Birleştirilmiş {extension.upper()}'yi İndir "
-                f"({len(selected_flights_to_merge)} uçuş)"
-            ),
-            data=cache["bytes"],
-            file_name=(
-                f"ucuslar_birlesik_{flights_label}_{time_suffix}."
-                f"{extension}"
-            ),
-            mime=_download_mime_type(file_type),
-            type="primary",
-            key="download_flight_merge_csv",
-        )
-
+    # Dosya adına en fazla 3 uçuşun adı eklenir; daha fazlasında
+    # dosya adı okunaksız uzayacağı için sadece sayı belirtilir.
+    if len(selected_flights_to_merge) <= 3:
+        flights_label = "_".join(sorted(selected_flights_to_merge))
     else:
+        flights_label = f"{len(selected_flights_to_merge)}_ucus"
 
-        st.caption(
-            "İndirme dosyasını oluşturmak için yukarıdaki butona basın."
+    def _build_merged_file() -> bytes:
+
+        # download_button'ın `data` callable'ı -- yalnızca kullanıcı
+        # butona basınca çalışır.
+
+        merged_df = pd.concat(
+            [
+                flight_groups[flight]
+                for flight in selected_flights_to_merge
+            ],
+            ignore_index=True,
         )
+
+        return _dataframe_to_download_bytes(
+            merged_df,
+            file_type,
+        )
+
+    st.download_button(
+        label=(
+            f"⬇️ Birleştirilmiş {extension.upper()}'yi İndir "
+            f"({len(selected_flights_to_merge)} uçuş)"
+        ),
+        data=_build_merged_file,
+        file_name=(
+            f"ucuslar_birlesik_{flights_label}_{time_suffix}."
+            f"{extension}"
+        ),
+        mime=_download_mime_type(file_type),
+        type="primary",
+        key="download_flight_merge_csv",
+    )
 
 
 # ============================================================
@@ -8073,10 +8005,29 @@ def render_dvc_artifacts() -> None:
 
 def main():
 
-    # Başlığa tıklanınca "Pipeline Metrikleri" (ana) sekmesine geçilir --
-    # bkz. aşağıdaki "?goto=runs" query param kontrolü.
+    # --------------------------------------------------------
+    # PANEL DURUMU (başlıktan ÖNCE çözülür)
+    # --------------------------------------------------------
+    #
+    # Seçili panel URL'deki "?panel=user|admin" ile taşınır. Başlığa
+    # tıklamak sayfayı yeniden yükleyip session_state'i sıfırladığı için,
+    # ilk render'da (ve her reload'da) panel bu query param'dan okunur;
+    # yoksa varsayılan Kullanıcı Paneli'dir. Kullanıcı radio'yla panel
+    # değiştirdiğinde query param da güncellenir (bkz. nav_col).
+    if "panel_selector" not in st.session_state:
+        st.session_state["panel_selector"] = PANEL_BY_CODE.get(
+            st.query_params.get("panel", ""),
+            PANEL_USER,
+        )
+
+    current_panel_code = PANEL_CODE_BY_LABEL[
+        st.session_state["panel_selector"]
+    ]
+
+    # Başlığa tıklanınca bulunulan panelin ana sekmesine dönülür ve
+    # PANEL KORUNUR (?panel=... eklenir) -- bkz. "?goto=runs" kontrolü.
     st.markdown(
-        '<a href="?goto=runs" target="_self" '
+        f'<a href="?goto=runs&panel={current_panel_code}" target="_self" '
         'style="text-decoration: none; color: inherit;">'
         '<h1 style="margin: 0;">'
         "İHA Veri Platformu — Pipeline Metrikleri & Katalog"
@@ -8094,36 +8045,49 @@ def main():
     # SONRA aşağıda enjekte edilir -- bkz. "_scroll_reset_pending".)
 
     # ========================================================
-    # SEKME SEÇİMİ + KONTROLLER (yan panel)
+    # PANEL + SEKME SEÇİMİ + KONTROLLER (yan panel)
     # ========================================================
     #
-    # st.radio/st.tabs yerine, ekranın solunda dikey sıralanmış
-    # butonlarla "sekme" görünümü oluşturulur -- her buton aktif
-    # sekmeyse "primary" (dolu/renkli), değilse "secondary"
-    # (outline) tipiyle çizilir. st.button, Streamlit'in iç DOM
-    # yapısı sürüm sürüm değişse de (bkz. dashboard/requirements.txt
-    # içindeki pinlenmiş Streamlit sürümü) kararlı kalan, sade bir
-    # bileşen olduğu için CSS hack'i gerekmeden güvenilir biçimde
-    # "aktif/pasif" görünümü verir.
+    # Yan panelin en üstünde parolasız bir "Panel" radio'su vardır:
+    #   - Kullanıcı Paneli -> yalnızca USER_TAB_LABELS ("Veri Gözat /
+    #     Dışa Aktar", "Uçuş Rotası"); "Gösterilecek run sayısı" YOK.
+    #   - Admin Paneli     -> MAIN_TAB_LABELS (tüm sekmeler) +
+    #     "Gösterilecek run sayısı" slider'ı.
+    #
+    # Sekme seçimi için st.radio/st.tabs yerine dikey sıralanmış
+    # butonlar kullanılır -- her buton aktif sekmeyse "primary"
+    # (dolu/renkli), değilse "secondary" (outline) tipiyle çizilir.
+    # st.button, Streamlit'in iç DOM yapısı sürüm sürüm değişse de
+    # (bkz. dashboard/requirements.txt içindeki pinlenmiş Streamlit
+    # sürümü) kararlı kalan, sade bir bileşen olduğu için CSS hack'i
+    # gerekmeden güvenilir biçimde "aktif/pasif" görünümü verir.
     #
     # URL'de tab=export ya da herhangi bir export_* parametresi
     # varsa (paylaşılan bir bağlantı üzerinden açılmışsa), İLK
-    # render'da otomatik olarak "Veri Gözat / Dışa Aktar" sekmesi
-    # seçilir. session_state["active_main_tab"] zaten set edilmişse
-    # (kullanıcı elle başka bir sekmeye geçtiyse) bu değer
-    # UYGULANMAZ -- yoksa kullanıcı sekme değiştirdikten sonra her
-    # rerun'da URL'deki sekmeye geri dönerdi.
+    # render'da otomatik olarak Kullanıcı panelindeki "Veri Gözat /
+    # Dışa Aktar" sekmesi seçilir. session_state["active_main_tab"]
+    # zaten set edilmişse (kullanıcı elle başka bir sekmeye geçtiyse)
+    # bu değer UYGULANMAZ -- yoksa kullanıcı sekme değiştirdikten sonra
+    # her rerun'da URL'deki sekmeye geri dönerdi.
     #
     # "Gösterilecek run sayısı" ve "🔄 Şimdi yenile" de aynı panelde --
     # run_limit, content_col'daki sekme içerikleri render edilmeden
     # ÖNCE burada okunmalı (runs_df'i etkiler).
 
-    # Başlığa tıklanınca eklenen "?goto=runs" -- mevcut sekme ne olursa
-    # olsun (aşağıdaki "active_main_tab" session_state'te zaten bir
-    # değer olsa bile) doğrudan "Pipeline Metrikleri" sekmesine geçilir.
+    # Başlığa tıklanınca eklenen "?goto=runs" -- başlık, bulunulan
+    # panelin "ana sayfası"na dönen bir bağlantı gibi davranır ve PANELİ
+    # DEĞİŞTİRMEZ (panel yukarıda "?panel=..." query param'ından zaten
+    # çözüldü):
+    #   - Admin panelinde   -> "Pipeline Metrikleri" sekmesi
+    #   - Kullanıcı panelinde -> ilk kullanıcı sekmesi ("Veri Gözat /
+    #     Dışa Aktar"); "Pipeline Metrikleri" bu panelde yoktur.
     if st.query_params.get("goto") == "runs":
 
-        st.session_state["active_main_tab"] = MAIN_TAB_RUNS
+        if st.session_state["panel_selector"] == PANEL_ADMIN:
+            st.session_state["active_main_tab"] = MAIN_TAB_RUNS
+        else:
+            st.session_state["active_main_tab"] = USER_TAB_LABELS[0]
+
         st.session_state["_scroll_reset_pending"] = True
 
         del st.query_params["goto"]
@@ -8136,9 +8100,14 @@ def main():
             key.startswith("export_")
             for key in shared_query_params
         ):
+            # Paylaşılan bağlantı doğrudan Kullanıcı panelindeki "Veri
+            # Gözat / Dışa Aktar" sekmesini açar.
+            st.session_state["panel_selector"] = PANEL_USER
             st.session_state["active_main_tab"] = MAIN_TAB_EXPORT
         else:
-            st.session_state["active_main_tab"] = MAIN_TAB_RUNS
+            st.session_state["active_main_tab"] = _tabs_for_panel(
+                st.session_state["panel_selector"]
+            )[0]
 
     nav_col, content_col = st.columns(
         [1, 5],
@@ -8147,7 +8116,44 @@ def main():
 
     with nav_col:
 
-        for tab_label in MAIN_TAB_LABELS:
+        # --------------------------------------------------
+        # PANEL SEÇİCİ (parolasız)
+        # --------------------------------------------------
+        #
+        # st.radio'nun kendi key'i ("panel_selector") session_state'te
+        # tutulur; başlangıç değeri yukarıda "?panel=..." query
+        # param'ından set edilir. Seçim değişince (yalnızca o zaman --
+        # her render'da DEĞİL, aksi halde aynı render içinde URL yazan
+        # başka bir özellikle, ör. "🔗 Bağlantı Olarak Paylaş", çakışırdı)
+        # on_change ile URL'deki "panel" param'ı güncellenir; böylece
+        # başlığa tıklamak (sayfayı yeniden yükler) ya da F5 panelde
+        # kalır.
+        active_panel = st.radio(
+            "Panel",
+            options=PANEL_LABELS,
+            key="panel_selector",
+            on_change=_sync_panel_to_url,
+            help=(
+                "Kullanıcı Paneli yalnızca veri gözatma ve uçuş rotası "
+                "sekmelerini gösterir; Admin Paneli tüm sekmeleri ve "
+                "\"Gösterilecek run sayısı\" ayarını içerir. Parola "
+                "koruması yoktur."
+            ),
+        )
+
+        is_admin_panel = active_panel == PANEL_ADMIN
+
+        visible_tabs = _tabs_for_panel(active_panel)
+
+        # Aktif sekme, seçili panelde görünmüyorsa (ör. panel yeni
+        # değişti) ilk görünür sekmeye sabitle.
+        if st.session_state["active_main_tab"] not in visible_tabs:
+            st.session_state["active_main_tab"] = visible_tabs[0]
+            st.session_state["_scroll_reset_pending"] = True
+
+        st.divider()
+
+        for tab_label in visible_tabs:
 
             is_active_tab = (
                 st.session_state["active_main_tab"] == tab_label
@@ -8168,13 +8174,19 @@ def main():
 
         st.divider()
 
-        run_limit = st.slider(
-            "Gösterilecek run sayısı",
-            10,
-            200,
-            50,
-            step=10,
-        )
+        # "Gösterilecek run sayısı" yalnızca Admin panelinde gösterilir;
+        # run verisi de (fetch_runs) yalnızca orada çekilir. Kullanıcı
+        # panelinde makul bir varsayılan kullanılır.
+        if is_admin_panel:
+            run_limit = st.slider(
+                "Gösterilecek run sayısı",
+                10,
+                200,
+                50,
+                step=10,
+            )
+        else:
+            run_limit = 50
 
         if st.button(
             "🔄 Şimdi yenile",
@@ -8307,32 +8319,42 @@ def main():
     # ========================================================
     # RUN VERİSİNİ BİR KEZ ÇEK
     # ========================================================
+    #
+    # Run verisi ve alert bildirimleri yalnızca Admin panelinde
+    # kullanılır ("Pipeline Metrikleri" / "Alertler" sekmeleri) --
+    # Kullanıcı panelinde Dagster'a hiç gidilmez.
 
-    try:
+    if is_admin_panel:
 
-        runs_df = fetch_runs(
-            run_limit
+        try:
+
+            runs_df = fetch_runs(
+                run_limit
+            )
+
+        except Exception as exc:
+
+            runs_df = pd.DataFrame()
+
+            st.error(
+                f"Dagster'a bağlanılamadı: {exc}"
+            )
+
+        # ====================================================
+        # YENİ ALERT BİLDİRİMİ (TOAST)
+        # ====================================================
+        #
+        # Admin panelinde hangi sekme açık olursa olsun, yeni bir hata
+        # oluştuğunda (veya bir hata çözüldüğünde) ekranın köşesinde
+        # küçük bir bildirim gösterilir.
+
+        notify_new_alerts(
+            load_alerts()
         )
 
-    except Exception as exc:
+    else:
 
         runs_df = pd.DataFrame()
-
-        st.error(
-            f"Dagster'a bağlanılamadı: {exc}"
-        )
-
-    # ========================================================
-    # YENİ ALERT BİLDİRİMİ (TOAST)
-    # ========================================================
-    #
-    # Hangi sekme açık olursa olsun, yeni bir hata oluştuğunda (veya
-    # bir hata çözüldüğünde) ekranın köşesinde küçük bir bildirim
-    # gösterilir. Auto-refresh açıksa bu her yenilemede tetiklenir.
-
-    notify_new_alerts(
-        load_alerts()
-    )
 
     with content_col:
 
