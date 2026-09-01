@@ -160,3 +160,219 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_asset_input
         input_uri,
         input_etag
     );
+
+
+-- Dashboard compatibility/history table.
+--
+-- pipeline_asset_materializations is the canonical catalog.  The dashboard's
+-- Metadata Geçmişi section historically read public.asset_metadata_history,
+-- so keep that query contract as a synchronized projection instead of asking
+-- the dashboard to reconstruct lineage fields on every request.
+CREATE TABLE IF NOT EXISTS public.asset_metadata_history (
+    id                              BIGSERIAL PRIMARY KEY,
+    pipeline_materialization_id     BIGINT,
+    asset_key                       TEXT NOT NULL,
+    group_name                      TEXT,
+    partition_date                  DATE,
+    flight_id                       TEXT,
+    run_id                          TEXT NOT NULL,
+    row_count                       BIGINT,
+    metadata                        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    materialized_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Existing installations may still have the earlier history table shape.
+-- Add the synchronization key without discarding any old rows.
+ALTER TABLE public.asset_metadata_history
+    ADD COLUMN IF NOT EXISTS pipeline_materialization_id BIGINT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_asset_metadata_pipeline_materialization
+    ON public.asset_metadata_history (pipeline_materialization_id);
+
+CREATE INDEX IF NOT EXISTS idx_asset_metadata_asset_materialized
+    ON public.asset_metadata_history (asset_key, materialized_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_asset_metadata_flight
+    ON public.asset_metadata_history (flight_id);
+
+CREATE INDEX IF NOT EXISTS idx_asset_metadata_partition_date
+    ON public.asset_metadata_history (partition_date);
+
+
+CREATE OR REPLACE FUNCTION pipeline_catalog.sync_asset_metadata_history()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    resolved_run_id          TEXT;
+    resolved_flight_id       TEXT;
+    resolved_partition_date  DATE;
+    enriched_metadata        JSONB;
+BEGIN
+    SELECT dagster_run_id
+    INTO resolved_run_id
+    FROM pipeline_catalog.pipeline_job_runs
+    WHERE id = NEW.job_run_id;
+
+    resolved_flight_id := NULLIF(NEW.metadata ->> 'flight_id', '');
+    IF resolved_flight_id IS NULL
+       AND jsonb_typeof(NEW.metadata -> 'flight_ids') = 'array' THEN
+        resolved_flight_id := NULLIF(NEW.metadata -> 'flight_ids' ->> 0, '');
+    END IF;
+    IF resolved_flight_id IS NULL THEN
+        resolved_flight_id := substring(
+            COALESCE(NEW.batch_id, '')
+            FROM '(flight_[1-9][0-9]*_[0-9]{4}-[0-9]{2}-[0-9]{2})'
+        );
+    END IF;
+
+    IF COALESCE(NEW.metadata ->> 'partition_date', '')
+       ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
+        resolved_partition_date := (NEW.metadata ->> 'partition_date')::DATE;
+    ELSIF COALESCE(resolved_flight_id, '')
+          ~ '[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
+        resolved_partition_date := substring(
+            resolved_flight_id
+            FROM '([0-9]{4}-[0-9]{2}-[0-9]{2})$'
+        )::DATE;
+    ELSE
+        resolved_partition_date := NEW.materialized_at::DATE;
+    END IF;
+
+    enriched_metadata := jsonb_strip_nulls(
+        jsonb_build_object(
+            'dataset_id', NEW.dataset_id,
+            'batch_id', NEW.batch_id,
+            'input_uri', NEW.input_uri,
+            'input_etag', NEW.input_etag,
+            'output_uri', NEW.output_uri,
+            'output_etag', NEW.output_etag,
+            'column_count', NEW.column_count,
+            'part_count', NEW.part_count,
+            'output_size_bytes', NEW.output_size_bytes
+        )
+    ) || COALESCE(NEW.metadata, '{}'::jsonb);
+
+    INSERT INTO public.asset_metadata_history (
+        pipeline_materialization_id,
+        asset_key,
+        group_name,
+        partition_date,
+        flight_id,
+        run_id,
+        row_count,
+        metadata,
+        materialized_at
+    )
+    VALUES (
+        NEW.id,
+        NEW.asset_key,
+        NEW.asset_group,
+        resolved_partition_date,
+        resolved_flight_id,
+        resolved_run_id,
+        NEW.row_count,
+        enriched_metadata,
+        NEW.materialized_at
+    )
+    ON CONFLICT (pipeline_materialization_id) DO UPDATE SET
+        asset_key = EXCLUDED.asset_key,
+        group_name = EXCLUDED.group_name,
+        partition_date = EXCLUDED.partition_date,
+        flight_id = EXCLUDED.flight_id,
+        run_id = EXCLUDED.run_id,
+        row_count = EXCLUDED.row_count,
+        metadata = EXCLUDED.metadata,
+        materialized_at = EXCLUDED.materialized_at;
+
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_sync_asset_metadata_history'
+          AND tgrelid =
+              'pipeline_catalog.pipeline_asset_materializations'::regclass
+    ) THEN
+        CREATE TRIGGER trg_sync_asset_metadata_history
+        AFTER INSERT OR UPDATE
+        ON pipeline_catalog.pipeline_asset_materializations
+        FOR EACH ROW
+        EXECUTE FUNCTION pipeline_catalog.sync_asset_metadata_history();
+    END IF;
+END;
+$$;
+
+-- Backfill materializations that were written while the compatibility table
+-- was absent. Future writes are handled by the trigger above.
+INSERT INTO public.asset_metadata_history (
+    pipeline_materialization_id,
+    asset_key,
+    group_name,
+    partition_date,
+    flight_id,
+    run_id,
+    row_count,
+    metadata,
+    materialized_at
+)
+SELECT
+    materialization.id,
+    materialization.asset_key,
+    materialization.asset_group,
+    COALESCE(
+        CASE
+            WHEN COALESCE(materialization.metadata ->> 'partition_date', '')
+                 ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN (materialization.metadata ->> 'partition_date')::DATE
+        END,
+        CASE
+            WHEN COALESCE(materialization.batch_id, '')
+                 ~ '[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN substring(
+                materialization.batch_id
+                FROM '([0-9]{4}-[0-9]{2}-[0-9]{2})$'
+            )::DATE
+        END,
+        materialization.materialized_at::DATE
+    ),
+    COALESCE(
+        NULLIF(materialization.metadata ->> 'flight_id', ''),
+        CASE
+            WHEN jsonb_typeof(materialization.metadata -> 'flight_ids') = 'array'
+            THEN NULLIF(materialization.metadata -> 'flight_ids' ->> 0, '')
+        END,
+        substring(
+            COALESCE(materialization.batch_id, '')
+            FROM '(flight_[1-9][0-9]*_[0-9]{4}-[0-9]{2}-[0-9]{2})'
+        )
+    ),
+    job_run.dagster_run_id,
+    materialization.row_count,
+    jsonb_strip_nulls(
+        jsonb_build_object(
+            'dataset_id', materialization.dataset_id,
+            'batch_id', materialization.batch_id,
+            'input_uri', materialization.input_uri,
+            'input_etag', materialization.input_etag,
+            'output_uri', materialization.output_uri,
+            'output_etag', materialization.output_etag,
+            'column_count', materialization.column_count,
+            'part_count', materialization.part_count,
+            'output_size_bytes', materialization.output_size_bytes
+        )
+    ) || COALESCE(materialization.metadata, '{}'::jsonb),
+    materialization.materialized_at
+FROM pipeline_catalog.pipeline_asset_materializations AS materialization
+JOIN pipeline_catalog.pipeline_job_runs AS job_run
+  ON job_run.id = materialization.job_run_id
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.asset_metadata_history AS history
+    WHERE history.pipeline_materialization_id = materialization.id
+)
+ON CONFLICT (pipeline_materialization_id) DO NOTHING;

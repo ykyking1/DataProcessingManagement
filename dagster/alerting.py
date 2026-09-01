@@ -16,8 +16,8 @@ from dagster import HookContext, failure_hook, success_hook
 from postgres_catalog import mark_job_run_failure
 
 
-ALERT_DIR = Path("data/alerts")
-ALERT_FILE = ALERT_DIR / "alerts.json"
+ALERT_FILE = Path(os.getenv("ALERT_FILE", "data/alerts/alerts.json"))
+ALERT_DIR = ALERT_FILE.parent
 
 
 def _ensure_alert_file() -> None:

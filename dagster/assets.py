@@ -1,9 +1,7 @@
-"""Dagster assets for the MinIO-backed flight telemetry workflow."""
+"""Dagster assets for generated high-column AU-AIR telemetry."""
 
-import io
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -21,8 +19,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.stage_raw_tab import stage_raw_tab_stream
 from scripts.publish_processed_with_dvc import publish_processed_batch
-from scripts.convert_auair_tab import FLIGHT_COLUMNS as AUAIR_FRAME_COLUMNS
-from scripts.convert_auair_tab import convert as convert_auair_wide_tab
 from postgres_catalog import (
     ensure_job_run,
     record_asset_materialization,
@@ -32,15 +28,11 @@ from postgres_catalog import (
 
 DEFAULT_RAW_BUCKET = "data-raw"
 DEFAULT_STAGED_BUCKET = "data-staged"
-DEFAULT_STAGED_PREFIX = "flight-tab"
+DEFAULT_STAGED_PREFIX = "auair-tab"
 DEFAULT_MULTIPART_PART_SIZE_MIB = 128
 DEFAULT_ARTIFACT_BUCKET = "pipeline-artifacts"
-DEFAULT_DATASET_ID = "flightdemo"
-# Native AU-AIR frame schema: flight_id, time, image_name, image_width,
-# image_height, platform, longitude, latitude, altitude, linear_x/y/z,
-# angle_phi/theta/psi, num_objects, obj_human/car/truck/van/motorbike/
-# bicycle/bus/trailer.
-FLIGHT_COLUMN_COUNT = 24
+DEFAULT_DATASET_ID = "auair"
+AUAIR_MIN_COLUMN_COUNT = 17
 
 
 def _environment_flag(name: str, default: bool = False) -> bool:
@@ -90,90 +82,17 @@ def _staged_object_key(source_key: str, staged_prefix: str) -> str:
     if not source_name:
         raise ValueError(f"Source object key has no file name: {source_key}")
     if not source_name.lower().endswith(".tab"):
-        raise ValueError(f"Raw flight object must end with .tab: {source_key}")
+        raise ValueError(
+            f"Generated AU-AIR raw object must end with .tab: {source_key}"
+        )
 
     staged_name = f"{source_name}.zst"
     prefix = staged_prefix.strip("/")
     return f"{prefix}/{staged_name}" if prefix else staged_name
 
 
-_BATCH_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _sanitise_batch_id(name: str) -> str:
-    """Turn an arbitrary raw file stem into a filesystem-safe batch id.
-
-    The staged filename is no longer required to follow the
-    ``flightdemo_<N>rows`` convention (see staged_flight_minio_sensor);
-    the batch id is derived from whatever name the operator uploaded and
-    is used as a directory name under data/processed/flightdemo/batches/.
-    """
-
-    cleaned = _BATCH_ID_UNSAFE.sub("_", name).strip("._-")
-    return cleaned or "batch"
-
-
-def _normalise_flight_frame_tab(context, raw_path: Path, work_dir: Path) -> Path:
-    """Return a path to a .tab that follows the native 24-column frame contract.
-
-    Accepts, without a preconversion step, either:
-      * a file already in the native contract (header == AUAIR_FRAME_COLUMNS),
-        returned unchanged; or
-      * a wide AU-AIR export (one anchor frame followed by hundreds of
-        repeated ``image_name, ...`` blocks, ``longtitude`` header typo),
-        which is projected to the first frame block via convert_auair_tab.
-
-    Anything else raises, so a genuinely wrong schema still fails loudly.
-    """
-
-    with raw_path.open("r", encoding="utf-8", newline="") as handle:
-        header_line = handle.readline()
-
-    if not header_line:
-        raise Failure(description=f"Raw flight .tab is empty: {raw_path.name}")
-
-    header = [field.strip() for field in header_line.rstrip("\r\n").split("\t")]
-    fixed = ["longitude" if name == "longtitude" else name for name in header]
-    contract = list(AUAIR_FRAME_COLUMNS)
-
-    if fixed == contract:
-        return raw_path
-
-    looks_like_auair_wide = (
-        fixed[: len(contract)] == contract or "longtitude" in header
-    )
-    if looks_like_auair_wide:
-        context.log.info(
-            "Wide AU-AIR export detected (%d header columns); projecting to "
-            "the %d-column frame contract with convert_auair_tab.",
-            len(header),
-            len(contract),
-        )
-        try:
-            converted = convert_auair_wide_tab(
-                raw_path,
-                work_dir / "converted",
-                label="auair",
-                assume_utc=True,
-                limit=None,
-            )
-        except SystemExit as exc:  # convert_auair_tab uses SystemExit for errors
-            raise Failure(
-                description=f"AU-AIR wide .tab conversion failed: {exc}"
-            ) from exc
-        return Path(converted)
-
-    raise Failure(
-        description=(
-            "Raw flight .tab header is neither the native frame contract nor a "
-            "recognised wide AU-AIR export. First columns: "
-            + ", ".join(header[:6])
-        )
-    )
-
-
 class RawToStagedConfig(Config):
-    """Source object and compression settings supplied by the raw sensor."""
+    """Generated AU-AIR object and compression settings from the raw sensor."""
 
     source_bucket: str = DEFAULT_RAW_BUCKET
     source_key: str
@@ -186,16 +105,24 @@ class RawToStagedConfig(Config):
 
 
 @asset(
-    group_name="raw_to_staged",
+    group_name="auair_raw_to_staged",
     compute_kind="minio+zstd",
     description=(
-        "Streams one raw flight .tab object from MinIO, cleans whitespace and "
+        "Streams one generated AU-AIR .tab object from MinIO, cleans whitespace and "
         "delimiter artifacts, compresses it with ZSTD, and streams the "
         "result back to the staged bucket without local dataset files."
     ),
 )
-def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
-    catalog_run = _ensure_catalog_run(context)
+def staged_auair_tab(context, config: RawToStagedConfig) -> MaterializeResult:
+    dataset_id = DEFAULT_DATASET_ID
+    source_name = PurePosixPath(config.source_key).name
+    staged_key = _staged_object_key(config.source_key, config.staged_prefix)
+    batch_id = source_name[: -len(".tab")]
+    catalog_run = _ensure_catalog_run(
+        context,
+        dataset_id=dataset_id,
+        batch_id=batch_id,
+    )
     client = create_minio_client()
     source_stat = client.stat_object(config.source_bucket, config.source_key)
     actual_source_etag = _normalise_etag(source_stat.etag)
@@ -206,13 +133,12 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
             f"expected ETag {expected_source_etag}, got {actual_source_etag}."
         )
 
-    staged_key = _staged_object_key(config.source_key, config.staged_prefix)
     multipart_part_size = config.multipart_part_size_mib * 1024 * 1024
     if config.multipart_part_size_mib < 5:
         raise ValueError("multipart_part_size_mib must be at least 5 MiB.")
 
     context.log.info(
-        "Raw flight staging started: s3://%s/%s (etag=%s)",
+        "Generated AU-AIR staging started: s3://%s/%s (etag=%s)",
         config.source_bucket,
         config.source_key,
         actual_source_etag,
@@ -222,6 +148,7 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
         client.make_bucket(config.staged_bucket)
 
     object_metadata = {
+        "dataset-id": dataset_id,
         "source-bucket": config.source_bucket,
         "source-key": config.source_key,
         "source-etag": actual_source_etag or "unknown",
@@ -229,45 +156,27 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
         "zstd-level": str(config.zstd_level),
     }
 
-    # The raw object is pulled to a temporary local file so its header can
-    # be inspected and, if it is a wide AU-AIR export, projected to the
-    # native 24-column frame contract before staging (see
-    # _normalise_flight_frame_tab). A native-contract file passes through
-    # untouched. Everything downstream still receives a strict 24-column
-    # .tab.zst, so the Spark / Great Expectations / ClickHouse guards are
-    # unchanged.
-    with tempfile.TemporaryDirectory(prefix="dpm-raw-flight-") as raw_temp_dir:
-        raw_temp_path = Path(raw_temp_dir)
-        local_raw = raw_temp_path / PurePosixPath(config.source_key).name
-        client.fget_object(
-            config.source_bucket,
-            config.source_key,
-            str(local_raw),
+    source_stream = client.get_object(config.source_bucket, config.source_key)
+    staged_stream = stage_raw_tab_stream(
+        source_stream,
+        zstd_level=config.zstd_level,
+        zstd_threads=config.zstd_threads,
+    )
+    try:
+        client.put_object(
+            config.staged_bucket,
+            staged_key,
+            staged_stream,
+            length=-1,
+            part_size=multipart_part_size,
+            content_type="application/zstd",
+            metadata=object_metadata,
         )
-
-        stage_input_path = _normalise_flight_frame_tab(
-            context, local_raw, raw_temp_path
-        )
-
-        with stage_input_path.open("rb") as source_stream:
-            staged_stream = stage_raw_tab_stream(
-                source_stream,
-                zstd_level=config.zstd_level,
-                zstd_threads=config.zstd_threads,
-            )
-            try:
-                client.put_object(
-                    config.staged_bucket,
-                    staged_key,
-                    staged_stream,
-                    length=-1,
-                    part_size=multipart_part_size,
-                    content_type="application/zstd",
-                    metadata=object_metadata,
-                )
-                result = staged_stream.result()
-            finally:
-                staged_stream.close()
+        result = staged_stream.result()
+    finally:
+        staged_stream.close()
+        source_stream.close()
+        source_stream.release_conn()
 
     staged_stat = client.stat_object(config.staged_bucket, staged_key)
     if staged_stat.size != result.staged_size_bytes:
@@ -278,7 +187,8 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
 
     staged_etag = _normalise_etag(staged_stat.etag)
     context.log.info(
-        "Raw flight staging completed: s3://%s/%s (%s rows, %s columns, %.2fx).",
+        "Generated AU-AIR staging completed: "
+        "s3://%s/%s (%s rows, %s columns, %.2fx).",
         config.staged_bucket,
         staged_key,
         result.row_count,
@@ -287,44 +197,13 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
     )
 
     result_metadata = asdict(result)
-    source_name = PurePosixPath(config.source_key).name
-    dataset_id = DEFAULT_DATASET_ID
-    batch_id = _sanitise_batch_id(
-        source_name[: -len(".tab")]
-        if source_name.lower().endswith(".tab")
-        else source_name
-    )
-
-    # Sidecar next to the staged object: staged_flight_minio_sensor reads
-    # this instead of parsing row_count / column_count / dataset / batch
-    # out of the filename, so the staged file name is now free-form.
-    sidecar_key = f"{staged_key}.meta.json"
-    sidecar_bytes = json.dumps(
-        {
-            "dataset_id": dataset_id,
-            "batch_id": batch_id,
-            "row_count": result.row_count,
-            "column_count": result.column_count,
-            "source_key": config.source_key,
-            "source_etag": actual_source_etag or "unknown",
-        },
-        sort_keys=True,
-    ).encode("utf-8")
-    client.put_object(
-        config.staged_bucket,
-        sidecar_key,
-        io.BytesIO(sidecar_bytes),
-        length=len(sidecar_bytes),
-        content_type="application/json",
-    )
-
     source_uri = f"s3://{config.source_bucket}/{config.source_key}"
     staged_uri = f"s3://{config.staged_bucket}/{staged_key}"
     record_asset_materialization(
         context,
         catalog_run,
-        asset_key="staged_flight_tab",
-        asset_group="raw_to_staged",
+        asset_key="staged_auair_tab",
+        asset_group="auair_raw_to_staged",
         dataset_id=dataset_id,
         batch_id=batch_id,
         input_uri=source_uri,
@@ -351,6 +230,8 @@ def staged_flight_tab(context, config: RawToStagedConfig) -> MaterializeResult:
     )
     return MaterializeResult(
         metadata={
+            "dataset_id": dataset_id,
+            "batch_id": batch_id,
             "source_uri": source_uri,
             "source_etag": actual_source_etag or "unknown",
             "staged_uri": staged_uri,
@@ -416,52 +297,47 @@ def _run_pipeline_script(context, command: list[str], *, cwd: Path) -> None:
         )
 
 
-class StagedBatchProcessingConfig(Config):
-    """Staged MinIO object selected by the staged-data sensor."""
+class StagedAuairProcessingConfig(Config):
+    """Staged generated AU-AIR object selected by the staged-data sensor."""
 
     source_bucket: str = DEFAULT_STAGED_BUCKET
     source_key: str
     source_etag: str
-    dataset_id: str
     batch_id: str
     row_count: int
     column_count: int
     max_columns: int = 100_000
-    timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+    timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSS"
     spark_master: str = "local[2]"
     zstd_level: int = 12
 
 
 @asset(
-    group_name="staged_to_published",
+    group_name="auair_pipeline",
     compute_kind="spark",
     description=(
-        "Downloads one staged flight .tab.zst object, preprocesses it with local "
-        "Spark, and writes the batch directly into its stable DVC dataset "
-        "workspace."
+        "Downloads one staged generated AU-AIR .tab.zst object, preprocesses "
+        "its dynamic columns with local Spark, and writes ZSTD output parts."
     ),
 )
-def processed_flight_batch(
+def processed_auair_batch(
     context,
-    config: StagedBatchProcessingConfig,
+    config: StagedAuairProcessingConfig,
 ) -> MaterializeResult:
     repo_root = _dvc_repo_root()
-    expected_dataset_id = DEFAULT_DATASET_ID
+    dataset_id = DEFAULT_DATASET_ID
+    if config.column_count < AUAIR_MIN_COLUMN_COUNT:
+        raise ValueError(
+            f"Generated AU-AIR telemetry must contain at least "
+            f"{AUAIR_MIN_COLUMN_COUNT} columns; received "
+            f"{config.column_count}."
+        )
+
     catalog_run = _ensure_catalog_run(
         context,
-        dataset_id=expected_dataset_id,
+        dataset_id=dataset_id,
         batch_id=config.batch_id,
     )
-    if config.dataset_id.lower() != expected_dataset_id:
-        raise ValueError(
-            f"Dataset id {config.dataset_id!r} does not match "
-            f"the active flight dataset {expected_dataset_id!r}."
-        )
-    if config.column_count != FLIGHT_COLUMN_COUNT:
-        raise ValueError(
-            f"Flight telemetry must contain {FLIGHT_COLUMN_COUNT} columns; "
-            f"received {config.column_count}."
-        )
 
     client = create_minio_client()
     source_stat = client.stat_object(config.source_bucket, config.source_key)
@@ -476,11 +352,11 @@ def processed_flight_batch(
         repo_root
         / "data"
         / "processed"
-        / expected_dataset_id
+        / dataset_id
         / "batches"
         / config.batch_id
     )
-    script_path = repo_root / "scripts" / "preprocess_flight_tab_spark.py"
+    script_path = repo_root / "scripts" / "preprocess_auair_tab_spark.py"
     if not script_path.is_file():
         raise FileNotFoundError(f"Spark preprocessing script missing: {script_path}")
 
@@ -513,6 +389,7 @@ def processed_flight_batch(
             "--zstd-level",
             str(config.zstd_level),
         ]
+        command.extend(["--min-columns", str(AUAIR_MIN_COLUMN_COUNT)])
         _run_pipeline_script(context, command, cwd=repo_root)
 
     part_files = sorted(batch_path.glob("part-*.tab.zst"))
@@ -520,7 +397,7 @@ def processed_flight_batch(
         raise RuntimeError(f"Spark produced no ZSTD part files: {batch_path}")
     output_size = sum(path.stat().st_size for path in part_files)
     value = {
-        "dataset_id": expected_dataset_id,
+        "dataset_id": dataset_id,
         "batch_id": config.batch_id,
         "batch_path": str(batch_path),
         "source_bucket": config.source_bucket,
@@ -536,9 +413,9 @@ def processed_flight_batch(
     record_asset_materialization(
         context,
         catalog_run,
-        asset_key="processed_flight_batch",
-        asset_group="staged_to_published",
-        dataset_id=expected_dataset_id,
+        asset_key="processed_auair_batch",
+        asset_group="auair_pipeline",
+        dataset_id=dataset_id,
         batch_id=config.batch_id,
         input_uri=source_uri,
         input_etag=actual_etag,
@@ -556,7 +433,7 @@ def processed_flight_batch(
     return MaterializeResult(
         value=value,
         metadata={
-            "dataset_id": expected_dataset_id,
+            "dataset_id": dataset_id,
             "batch_id": config.batch_id,
             "source_uri": source_uri,
             "source_etag": actual_etag,
@@ -570,39 +447,39 @@ def processed_flight_batch(
     )
 
 
-class ProcessedBatchValidationConfig(Config):
-    """Great Expectations settings for the processed flight batch."""
+class ProcessedAuairValidationConfig(Config):
+    """Great Expectations settings for the processed AU-AIR batch."""
 
     artifact_bucket: str = DEFAULT_ARTIFACT_BUCKET
     result_format: str = "BASIC"
     max_columns: int = 100_000
-    timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"
+    timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSS"
     spark_master: str = "local[2]"
 
 
 @asset(
-    group_name="staged_to_published",
+    group_name="auair_pipeline",
     compute_kind="great_expectations+spark",
     description=(
-        "Validates one processed flight batch with Great Expectations on Spark "
-        "and uploads the JSON quality report to MinIO."
+        "Validates one processed generated AU-AIR batch with Great Expectations "
+        "on Spark and uploads the JSON quality report to MinIO."
     ),
 )
-def validated_flight_batch(
+def validated_auair_batch(
     context,
-    processed_flight_batch: dict,
-    config: ProcessedBatchValidationConfig,
+    processed_auair_batch: dict,
+    config: ProcessedAuairValidationConfig,
 ) -> MaterializeResult:
     repo_root = _dvc_repo_root()
-    dataset_id = processed_flight_batch["dataset_id"]
-    batch_id = processed_flight_batch["batch_id"]
+    dataset_id = processed_auair_batch["dataset_id"]
+    batch_id = processed_auair_batch["batch_id"]
     catalog_run = _ensure_catalog_run(
         context,
         dataset_id=dataset_id,
         batch_id=batch_id,
     )
-    source_etag = processed_flight_batch["source_etag"]
-    script_path = repo_root / "scripts" / "validate_flight_tab_spark_ge.py"
+    source_etag = processed_auair_batch["source_etag"]
+    script_path = repo_root / "scripts" / "validate_auair_tab_spark_ge.py"
     if not script_path.is_file():
         raise FileNotFoundError(f"GE validation script missing: {script_path}")
 
@@ -615,11 +492,11 @@ def validated_flight_batch(
             sys.executable,
             str(script_path),
             "--input",
-            processed_flight_batch["batch_path"],
+            processed_auair_batch["batch_path"],
             "--report",
             str(report_path),
             "--expected-row-count",
-            str(processed_flight_batch["row_count"]),
+            str(processed_auair_batch["row_count"]),
             "--result-format",
             config.result_format,
             "--max-columns",
@@ -629,6 +506,12 @@ def validated_flight_batch(
             "--spark-master",
             config.spark_master,
         ]
+        command.extend(
+            [
+                "--expected-column-count",
+                str(processed_auair_batch["column_count"]),
+            ]
+        )
         execution_error = None
         try:
             _run_pipeline_script(context, command, cwd=repo_root)
@@ -681,23 +564,23 @@ def validated_flight_batch(
             metadata=metadata,
         ) from execution_error
 
-    value = dict(processed_flight_batch)
+    value = dict(processed_auair_batch)
     value["report_uri"] = f"s3://{config.artifact_bucket}/{report_key}"
     value["validation_statistics"] = statistics
     record_asset_materialization(
         context,
         catalog_run,
-        asset_key="validated_flight_batch",
-        asset_group="staged_to_published",
+        asset_key="validated_auair_batch",
+        asset_group="auair_pipeline",
         dataset_id=dataset_id,
         batch_id=batch_id,
-        input_uri=Path(processed_flight_batch["batch_path"]).resolve().as_uri(),
+        input_uri=Path(processed_auair_batch["batch_path"]).resolve().as_uri(),
         input_etag=source_etag,
         output_uri=value["report_uri"],
-        row_count=processed_flight_batch["row_count"],
-        column_count=processed_flight_batch["column_count"],
-        part_count=processed_flight_batch["part_count"],
-        output_size_bytes=processed_flight_batch["output_size_bytes"],
+        row_count=processed_auair_batch["row_count"],
+        column_count=processed_auair_batch["column_count"],
+        part_count=processed_auair_batch["part_count"],
+        output_size_bytes=processed_auair_batch["output_size_bytes"],
         metadata={
             "quality_status": "passed",
             "evaluated_expectations": statistics.get(
@@ -715,51 +598,62 @@ def validated_flight_batch(
     )
     return MaterializeResult(value=value, metadata=metadata)
 
-
-class ClickHouseFlightConfig(Config):
-    """Query-serving ClickHouse settings for one validated flight batch."""
+class ClickHouseAuairConfig(Config):
+    """High-column ClickHouse destination and bulk-load safety limits."""
 
     database: str = os.getenv("CLICKHOUSE_DATABASE", "default")
-    table: str = os.getenv("CLICKHOUSE_TABLE", "telemetry")
-    insert_chunk_rows: int = int(
-        os.getenv("CLICKHOUSE_INSERT_CHUNK_ROWS", "10000")
+    table: str = os.getenv("CLICKHOUSE_AUAIR_TABLE", "auair_telemetry")
+    safe_cell_limit: int = int(
+        os.getenv("CLICKHOUSE_WIDE_SAFE_CELL_LIMIT", "1000000000")
+    )
+    max_rows_per_chunk: int = int(
+        os.getenv("CLICKHOUSE_WIDE_MAX_ROWS_PER_CHUNK", "200000")
+    )
+    row_chunk_zstd_level: int = int(
+        os.getenv("CLICKHOUSE_ROW_CHUNK_ZSTD_LEVEL", "6")
+    )
+    ingest_bucket: str = os.getenv(
+        "CLICKHOUSE_INGEST_BUCKET", DEFAULT_ARTIFACT_BUCKET
+    )
+    ingest_prefix: str = os.getenv(
+        "CLICKHOUSE_INGEST_PREFIX", "_clickhouse-ingest/auair"
     )
 
 
 @asset(
-    group_name="staged_to_published",
+    group_name="auair_pipeline",
     compute_kind="clickhouse",
     description=(
-        "Loads a successfully validated flight batch into the wide ClickHouse "
-        "telemetry table consumed directly by the dashboard."
+        "Writes a validated dynamic-column AU-AIR batch to ClickHouse before "
+        "the batch is allowed to proceed to DVC publication."
     ),
 )
-def clickhouse_flight_batch(
+def clickhouse_auair_batch(
     context,
-    validated_flight_batch: dict,
-    config: ClickHouseFlightConfig,
+    validated_auair_batch: dict,
+    config: ClickHouseAuairConfig,
 ) -> MaterializeResult:
     repo_root = _dvc_repo_root()
-    dataset_id = validated_flight_batch["dataset_id"]
-    batch_id = validated_flight_batch["batch_id"]
+    dataset_id = validated_auair_batch["dataset_id"]
+    batch_id = validated_auair_batch["batch_id"]
     catalog_run = _ensure_catalog_run(
         context,
         dataset_id=dataset_id,
         batch_id=batch_id,
     )
     script_path = (
-        repo_root / "scripts" / "load_validated_flight_to_clickhouse.py"
+        repo_root / "scripts" / "load_validated_auair_to_clickhouse.py"
     )
     if not script_path.is_file():
         raise FileNotFoundError(f"ClickHouse loader script missing: {script_path}")
 
-    with tempfile.TemporaryDirectory(prefix="dpm-clickhouse-metadata-") as temp:
+    with tempfile.TemporaryDirectory(prefix="dpm-auair-clickhouse-") as temp:
         metadata_path = Path(temp) / "clickhouse-load.json"
         command = [
             sys.executable,
             str(script_path),
             "--input",
-            validated_flight_batch["batch_path"],
+            validated_auair_batch["batch_path"],
             "--dataset-id",
             dataset_id,
             "--batch-id",
@@ -767,22 +661,32 @@ def clickhouse_flight_batch(
             "--dagster-run-id",
             context.run_id,
             "--source-etag",
-            validated_flight_batch["source_etag"],
+            validated_auair_batch["source_etag"],
             "--validation-report-uri",
-            validated_flight_batch["report_uri"],
+            validated_auair_batch["report_uri"],
             "--expected-row-count",
-            str(validated_flight_batch["row_count"]),
+            str(validated_auair_batch["row_count"]),
+            "--expected-column-count",
+            str(validated_auair_batch["column_count"]),
             "--metadata-out",
             str(metadata_path),
             "--database",
             config.database,
             "--table",
             config.table,
-            "--insert-chunk-rows",
-            str(config.insert_chunk_rows),
+            "--safe-cell-limit",
+            str(config.safe_cell_limit),
+            "--max-rows-per-chunk",
+            str(config.max_rows_per_chunk),
+            "--row-chunk-zstd-level",
+            str(config.row_chunk_zstd_level),
+            "--ingest-bucket",
+            config.ingest_bucket,
+            "--ingest-prefix",
+            config.ingest_prefix,
         ]
         context.log.info(
-            "ClickHouse flight telemetry load started: %s/%s -> %s.%s",
+            "ClickHouse AU-AIR load started: %s/%s -> %s.%s",
             dataset_id,
             batch_id,
             config.database,
@@ -795,33 +699,33 @@ def clickhouse_flight_batch(
             )
         load_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    value = dict(validated_flight_batch)
+    value = dict(validated_auair_batch)
     value["clickhouse"] = load_metadata
     record_asset_materialization(
         context,
         catalog_run,
-        asset_key="clickhouse_flight_batch",
-        asset_group="staged_to_published",
+        asset_key="clickhouse_auair_batch",
+        asset_group="auair_pipeline",
         dataset_id=dataset_id,
         batch_id=batch_id,
-        input_uri=Path(validated_flight_batch["batch_path"]).resolve().as_uri(),
-        input_etag=validated_flight_batch["source_etag"],
+        input_uri=Path(validated_auair_batch["batch_path"]).resolve().as_uri(),
+        input_etag=validated_auair_batch["source_etag"],
         output_uri=load_metadata["output_uri"],
-        row_count=load_metadata["telemetry_row_count"],
+        row_count=load_metadata["stored_row_count"],
         column_count=load_metadata["source_column_count"],
         part_count=load_metadata["input_part_count"],
         metadata={
             "clickhouse_database": load_metadata["database"],
             "clickhouse_table": load_metadata["table"],
-            "source_row_count": load_metadata["source_row_count"],
-            "source_column_count": load_metadata["source_column_count"],
-            "telemetry_row_count": load_metadata["telemetry_row_count"],
             "flight_count": load_metadata["flight_count"],
             "flight_ids": load_metadata["flight_ids"],
-            "input_part_count": load_metadata["input_part_count"],
             "insert_chunk_count": load_metadata["insert_chunk_count"],
+            "row_chunk_size": load_metadata["row_chunk_size"],
+            "safe_cell_limit": load_metadata["safe_cell_limit"],
+            "load_method": load_metadata["load_method"],
+            "storage_layout": load_metadata["storage_layout"],
             "storage_codec": load_metadata["storage_codec"],
-            "validation_report_uri": validated_flight_batch["report_uri"],
+            "validation_report_uri": validated_auair_batch["report_uri"],
         },
     )
     return MaterializeResult(
@@ -831,43 +735,48 @@ def clickhouse_flight_batch(
             "batch_id": batch_id,
             "clickhouse_database": load_metadata["database"],
             "clickhouse_table": load_metadata["table"],
-            "source_row_count": load_metadata["source_row_count"],
-            "telemetry_row_count": load_metadata["telemetry_row_count"],
+            "row_count": load_metadata["stored_row_count"],
+            "column_count": load_metadata["source_column_count"],
             "flight_count": load_metadata["flight_count"],
             "flight_ids": MetadataValue.json(load_metadata["flight_ids"]),
             "insert_chunk_count": load_metadata["insert_chunk_count"],
-            "storage_codec": load_metadata["storage_codec"],
+            "row_chunk_size": load_metadata["row_chunk_size"],
+            "safe_cell_limit": load_metadata["safe_cell_limit"],
+            "load_method": load_metadata["load_method"],
+            "storage_layout": load_metadata["storage_layout"],
             "output_uri": load_metadata["output_uri"],
         },
     )
 
 
 @asset(
-    group_name="staged_to_published",
+    group_name="auair_pipeline",
     compute_kind="dvc+minio",
     description=(
-        "Updates the logical flight telemetry DVC pointer and pushes content to the "
-        "MinIO DVC remote."
+        "Publishes the processed AU-AIR dataset to the MinIO-backed DVC remote "
+        "only after the ClickHouse write has completed successfully."
     ),
 )
-def published_flight_dataset(
+def published_auair_dataset(
     context,
-    validated_flight_batch: dict,
+    clickhouse_auair_batch: dict,
 ) -> MaterializeResult:
     repo_root = _dvc_repo_root()
+    dataset_id = clickhouse_auair_batch["dataset_id"]
+    batch_id = clickhouse_auair_batch["batch_id"]
     catalog_run = _ensure_catalog_run(
         context,
-        dataset_id=validated_flight_batch["dataset_id"],
-        batch_id=validated_flight_batch["batch_id"],
+        dataset_id=dataset_id,
+        batch_id=batch_id,
     )
     pipeline_identity = catalog_run.identity
     result = publish_processed_batch(
-        validated_flight_batch["batch_path"],
+        clickhouse_auair_batch["batch_path"],
         repo_root=repo_root,
-        dataset_id=validated_flight_batch["dataset_id"],
-        column_count=validated_flight_batch["column_count"],
-        row_count=validated_flight_batch["row_count"],
-        batch_id=validated_flight_batch["batch_id"],
+        dataset_id=dataset_id,
+        column_count=clickhouse_auair_batch["column_count"],
+        row_count=clickhouse_auair_batch["row_count"],
+        batch_id=batch_id,
         dvc_remote=os.getenv("DVC_REMOTE_NAME", "minio"),
         dvc_remote_url=os.getenv("DVC_REMOTE_URL", "s3://dvc-cache"),
         dvc_endpoint_url=os.getenv(
@@ -875,34 +784,46 @@ def published_flight_dataset(
         ),
     )
     relative_pointer = result.pointer_path.relative_to(repo_root)
+    clickhouse_uri = clickhouse_auair_batch["clickhouse"]["output_uri"]
     record_asset_materialization(
         context,
         catalog_run,
-        asset_key="published_flight_dataset",
-        asset_group="staged_to_published",
+        asset_key="published_auair_dataset",
+        asset_group="auair_pipeline",
         dataset_id=result.dataset_id,
         batch_id=result.batch_id,
-        input_uri=Path(validated_flight_batch["batch_path"]).resolve().as_uri(),
-        input_etag=validated_flight_batch["source_etag"],
+        input_uri=Path(clickhouse_auair_batch["batch_path"]).resolve().as_uri(),
+        input_etag=clickhouse_auair_batch["source_etag"],
         output_uri=relative_pointer.as_posix(),
         output_etag=result.dvc_hash,
-        row_count=validated_flight_batch["row_count"],
-        column_count=validated_flight_batch["column_count"],
+        row_count=clickhouse_auair_batch["row_count"],
+        column_count=clickhouse_auair_batch["column_count"],
         part_count=result.file_count,
         output_size_bytes=result.size_bytes,
         metadata={
+            "clickhouse_uri": clickhouse_uri,
             "dvc_pointer": relative_pointer.as_posix(),
             "dvc_remote": result.dvc_remote,
             "dvc_remote_url": result.dvc_remote_url,
             "dvc_hash_name": result.dvc_hash_name,
             "dvc_hash": result.dvc_hash,
-            "validation_report_uri": validated_flight_batch["report_uri"],
+            "validation_report_uri": clickhouse_auair_batch["report_uri"],
         },
     )
+    value = dict(clickhouse_auair_batch)
+    value["dvc"] = {
+        "pointer": relative_pointer.as_posix(),
+        "remote": result.dvc_remote,
+        "remote_url": result.dvc_remote_url,
+        "hash_name": result.dvc_hash_name,
+        "hash": result.dvc_hash,
+    }
     return MaterializeResult(
+        value=value,
         metadata={
             "dataset_id": result.dataset_id,
             "batch_id": result.batch_id,
+            "clickhouse_uri": clickhouse_uri,
             "dvc_pointer": relative_pointer.as_posix(),
             "dvc_remote": result.dvc_remote,
             "dvc_remote_url": result.dvc_remote_url,
@@ -914,6 +835,6 @@ def published_flight_dataset(
             "pipeline_git_dirty": pipeline_identity.git_dirty,
             "repository_git_sha": pipeline_identity.repository_git_sha,
             "repository_git_dirty": pipeline_identity.repository_git_dirty,
-            "validation_report_uri": validated_flight_batch["report_uri"],
-        }
+            "validation_report_uri": clickhouse_auair_batch["report_uri"],
+        },
     )
