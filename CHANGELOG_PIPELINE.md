@@ -3,7 +3,6 @@
 Dagster orchestration, processing, validation, reproducibility, and runtime dependency changes are recorded here.
 
 <!-- version list -->
-
 ## pipeline-v0.6.0-test.1 (2026-08-31)
 
 
