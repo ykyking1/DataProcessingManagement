@@ -3,6 +3,17 @@
 Dagster orchestration, processing, validation, reproducibility, and runtime dependency changes are recorded here.
 
 <!-- version list -->
+
+## pipeline-v0.7.0 (2026-09-01)
+
+
+### Features
+
+- **pipeline**: Gate ClickHouse data on workflow success ([`9be810b`](https://github.com/ykyking1/DataProcessingManagement/commit/9be810b3c37b3c0cf466a98424c73ce70c69365f))
+
+
+
+
 ## pipeline-v0.6.0-test.1 (2026-08-31)
 
 
