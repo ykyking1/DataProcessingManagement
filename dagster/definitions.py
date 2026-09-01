@@ -24,6 +24,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import assets
 from alerting import alert_on_failure, clear_alert_on_success
+from clickhouse_workflow import reconcile_auair_clickhouse_run
 from postgres_catalog import record_terminal_job_run, resolve_pipeline_identity
 
 
@@ -70,13 +71,67 @@ def _record_terminal_status(context, status: str) -> None:
     )
 
 
+def _record_and_reconcile_terminal_status(context, status: str) -> None:
+    """Persist terminal metadata and publish/rollback ClickHouse independently."""
+
+    errors: list[Exception] = []
+    try:
+        _record_terminal_status(context, status)
+    except Exception as error:
+        errors.append(error)
+        context.log.error(
+            "PostgreSQL terminal status could not be recorded: %s",
+            error,
+        )
+
+    dagster_run = context.dagster_run
+    if dagster_run.job_name == staged_auair_to_published_job.name:
+        batch_id = (dagster_run.tags or {}).get("batch_id", "").strip()
+        if not batch_id:
+            error = RuntimeError(
+                "AU-AIR terminal run is missing the batch_id tag: "
+                f"{dagster_run.run_id}"
+            )
+            errors.append(error)
+            context.log.error(str(error))
+        else:
+            try:
+                result = reconcile_auair_clickhouse_run(
+                    batch_id=batch_id,
+                    dagster_run_id=dagster_run.run_id,
+                    commit=status == "SUCCESS",
+                )
+                context.log.info(
+                    "ClickHouse workflow %s: batch=%s, run=%s, rows=%s, "
+                    "skipped=%s",
+                    result.action,
+                    result.batch_id,
+                    result.dagster_run_id,
+                    result.row_count,
+                    result.skipped,
+                )
+            except Exception as error:
+                errors.append(error)
+                context.log.error(
+                    "ClickHouse workflow reconciliation failed for status %s: %s",
+                    status,
+                    error,
+                )
+
+    if errors:
+        raise RuntimeError(
+            "Terminal workflow reconciliation did not complete: "
+            + "; ".join(str(error) for error in errors)
+        ) from errors[0]
+
+
 @run_status_sensor(
     run_status=DagsterRunStatus.SUCCESS,
     monitored_jobs=MONITORED_PIPELINE_JOBS,
     default_status=DefaultSensorStatus.RUNNING,
 )
 def postgres_run_success_sensor(context):
-    _record_terminal_status(context, "SUCCESS")
+    _record_and_reconcile_terminal_status(context, "SUCCESS")
 
 
 @run_status_sensor(
@@ -85,7 +140,7 @@ def postgres_run_success_sensor(context):
     default_status=DefaultSensorStatus.RUNNING,
 )
 def postgres_run_failure_sensor(context):
-    _record_terminal_status(context, "FAILURE")
+    _record_and_reconcile_terminal_status(context, "FAILURE")
 
 
 @run_status_sensor(
@@ -94,7 +149,7 @@ def postgres_run_failure_sensor(context):
     default_status=DefaultSensorStatus.RUNNING,
 )
 def postgres_run_canceled_sensor(context):
-    _record_terminal_status(context, "CANCELED")
+    _record_and_reconcile_terminal_status(context, "CANCELED")
 
 
 def _job_has_active_run(context, job_name: str) -> bool:

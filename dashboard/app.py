@@ -368,6 +368,15 @@ def get_clickhouse_table() -> str:
     )
 
 
+def get_clickhouse_visible_view() -> str:
+    """Return the view containing only successfully committed workflows."""
+
+    return os.environ.get(
+        "CLICKHOUSE_VISIBLE_VIEW",
+        f"{get_clickhouse_table()}_committed",
+    )
+
+
 def get_processed_files_glob() -> str:
     """
     dagster/assets/processing.py, ClickHouse'a INSERT etmeye ek olarak
@@ -393,7 +402,7 @@ def get_clickhouse_source() -> str:
     geçer.
     """
     return (
-        f"`{get_clickhouse_database()}`.`{get_clickhouse_table()}`"
+        f"`{get_clickhouse_database()}`.`{get_clickhouse_visible_view()}`"
     )
 
 
@@ -487,7 +496,12 @@ def get_available_columns() -> list:
     if schema.empty:
         return []
 
-    return schema["kolon"].tolist()
+    internal_columns = {"dagster_run_id"}
+    return [
+        column
+        for column in schema["kolon"].tolist()
+        if column not in internal_columns
+    ]
 
 
 # AU-AIR'in kaynak şemasında boylam kolonu "longtitude" olarak yazılıyor.
@@ -5122,8 +5136,9 @@ def render_wide_auair_batches_section():
         "Generator tarafından üretilen yüksek kolonlu AU-AIR verisi, "
         "Dagster'daki `clickhouse_auair_batch` asset'i tarafından tek bir "
         f"`{get_clickhouse_database()}.{get_clickhouse_table()}` tablosuna "
-        "yüklenir. Her yükleme `source_batch_id`, her uçuş `flight_id` "
-        "ile ayrılır."
+        "yüklenir. Dashboard yalnız workflow başarıyla tamamlandıktan sonra "
+        f"`{get_clickhouse_visible_view()}` view'ında görünen kayıtları okur. "
+        "Her yükleme `source_batch_id`, her uçuş `flight_id` ile ayrılır."
     )
 
     try:

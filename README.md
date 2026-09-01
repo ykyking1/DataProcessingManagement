@@ -76,8 +76,9 @@ data-raw/auair-tab/inbox
   → data-staged/auair-tab (.tab.zst)
   → Spark preprocess (dinamik kolonlar korunur)
   → Great Expectations validation raporu
-  → ClickHouse s3() bulk load (auair_telemetry, compact wide parts)
+  → ClickHouse s3() bulk load (auair_telemetry, run bazlı pending kayıtlar)
   → DVC add + MinIO DVC remote push
+  → Run SUCCESS: auair_telemetry_committed view'ında görünürlük
 ```
 
 Son iki adım sıralıdır: ClickHouse yazımı başarıyla tamamlanmadan DVC publish
@@ -86,6 +87,11 @@ kolon stratejisiyle yaklaşık 1 milyar hücrelik fiziksel satır parçalarına
 ayırır. Parçalar yalnız taşıma amacıyla geçici MinIO objeleri olarak oluşturulur,
 ClickHouse tarafından `s3()` ile bulk okunur ve yükleme denemesinin sonunda
 silinir; kalıcı MinIO dataset yayını sonraki DVC asset'ine aittir.
+
+ClickHouse'a yazılan satırlar `dagster_run_id` ile workflow tamamlanana kadar
+pending tutulur. Dashboard fiziksel tabloyu değil yalnız committed view'ı
+okur. Workflow `FAILURE` veya `CANCELED` olursa ilgili run satırları silinir;
+PostgreSQL run ve materialization metadata'sı audit amacıyla korunur.
 
 İlk validation profili bilinçli olarak basittir: dosyada en az 17 kolon,
 beklenen satır/kolon sayısı, zorunlu `flight_id`/`time` ve temel AU-AIR

@@ -18,6 +18,7 @@ import io
 import json
 import os
 import re
+import signal
 import tempfile
 import threading
 import time
@@ -64,6 +65,7 @@ DEFAULT_WIDE_SAFE_CELL_LIMIT = 1_000_000_000
 DEFAULT_MAX_ROWS_PER_CHUNK = 200_000
 DEFAULT_ROW_CHUNK_ZSTD_LEVEL = 6
 DEFAULT_SCHEMA_ALTER_CHUNK_COLUMNS = 1_000
+WORKFLOW_RUN_ID_COLUMN = "dagster_run_id"
 
 # Parallel parsing of 10K-50K-column TSV data multiplies peak memory. These are
 # the high-column ClickHouse settings used on Yusuf's branch.
@@ -287,11 +289,19 @@ def _ensure_table_schema(
     *,
     database: str,
     table: str,
+    visible_view: str,
+    commit_table: str,
     source_columns: Sequence[str],
     alter_chunk_columns: int,
 ) -> str:
     database_name = _quote_identifier(database)
     table_name = f"{database_name}.{_quote_identifier(table)}"
+    visible_view_name = f"{database_name}.{_quote_identifier(visible_view)}"
+    commit_table_name = f"{database_name}.{_quote_identifier(commit_table)}"
+    if visible_view == table:
+        raise ValueError("ClickHouse visible view and storage table must differ.")
+    if commit_table in {table, visible_view}:
+        raise ValueError("ClickHouse workflow commit table must have a unique name.")
     client.execute(f"CREATE DATABASE IF NOT EXISTS {database_name}")
 
     exists = bool(client.execute(f"EXISTS TABLE {table_name}")[0][0])
@@ -305,6 +315,7 @@ def _ensure_table_schema(
             (
                 {source_definitions},
                 source_batch_id LowCardinality(String) CODEC(ZSTD(3)),
+                dagster_run_id LowCardinality(String) DEFAULT '' CODEC(ZSTD(3)),
                 ingested_at DateTime64(3, 'UTC')
                     DEFAULT now64(3) CODEC(DoubleDelta, ZSTD(3))
             )
@@ -321,6 +332,9 @@ def _ensure_table_schema(
     required_definitions = {
         **{column: _column_definition(column) for column in source_columns},
         "source_batch_id": "source_batch_id LowCardinality(String) CODEC(ZSTD(3))",
+        WORKFLOW_RUN_ID_COLUMN: (
+            "dagster_run_id LowCardinality(String) DEFAULT '' CODEC(ZSTD(3))"
+        ),
         "ingested_at": (
             "ingested_at DateTime64(3, 'UTC') DEFAULT now64(3) "
             "CODEC(DoubleDelta, ZSTD(3))"
@@ -348,11 +362,55 @@ def _ensure_table_schema(
                 f"expected {expected_type}, found {actual_type}."
             )
 
+    workflow_run_type = described.get(WORKFLOW_RUN_ID_COLUMN)
+    if workflow_run_type not in {"LowCardinality(String)", "String"}:
+        raise ValueError(
+            "ClickHouse type mismatch for dagster_run_id: expected "
+            f"LowCardinality(String), found {workflow_run_type}."
+        )
+
     # Apply compact-part settings to tables created by the previous loader too.
     client.execute(
         f"ALTER TABLE {table_name} MODIFY SETTING "
         f"min_bytes_for_wide_part = {WIDE_PART_SETTINGS['min_bytes_for_wide_part']}, "
         f"min_rows_for_wide_part = {WIDE_PART_SETTINGS['min_rows_for_wide_part']}"
+    )
+
+    # Workflow visibility is controlled by a tiny registry instead of an
+    # UPDATE mutation over the 10K-50K-column compact parts. Existing rows
+    # receive the empty run id and remain visible until the first committed
+    # replacement for their batch is registered.
+    client.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {commit_table_name}
+        (
+            source_batch_id String,
+            dagster_run_id String,
+            committed_at DateTime64(6, 'UTC') DEFAULT now64(6)
+        )
+        ENGINE = MergeTree
+        ORDER BY (source_batch_id, committed_at, dagster_run_id)
+        """
+    )
+    client.execute(
+        f"""
+        CREATE OR REPLACE VIEW {visible_view_name} AS
+        SELECT telemetry.*
+        FROM {table_name} AS telemetry
+        LEFT JOIN
+        (
+            SELECT
+                source_batch_id,
+                argMax(dagster_run_id, committed_at) AS active_dagster_run_id
+            FROM {commit_table_name}
+            GROUP BY source_batch_id
+        ) AS committed
+            ON committed.source_batch_id = telemetry.source_batch_id
+        WHERE telemetry.dagster_run_id = ifNull(
+            committed.active_dagster_run_id,
+            ''
+        )
+        """
     )
     return table_name
 
@@ -612,12 +670,17 @@ def _bulk_insert_chunks(
     table: str,
     source_columns: Sequence[str],
     batch_id: str,
+    dagster_run_id: str,
     minio_bucket: str,
     uploaded_chunks: Sequence[dict[str, object]],
 ) -> float:
     insert_columns = ", ".join(
         _quote_identifier(column_name)
-        for column_name in [*source_columns, "source_batch_id"]
+        for column_name in [
+            *source_columns,
+            "source_batch_id",
+            WORKFLOW_RUN_ID_COLUMN,
+        ]
     )
     structure = _source_structure(source_columns)
     protocol = "https" if _env_bool("MINIO_SECURE") else "http"
@@ -645,7 +708,10 @@ def _bulk_insert_chunks(
         s3_url = f"{protocol}://{_minio_endpoint()}/{minio_bucket}/{object_key}"
         query = f"""
             INSERT INTO {table_name} ({insert_columns})
-            SELECT *, {_quote_sql_string(batch_id)}
+            SELECT
+                *,
+                {_quote_sql_string(batch_id)},
+                {_quote_sql_string(dagster_run_id)}
             FROM s3(
                 {_quote_sql_string(s3_url)},
                 {_quote_sql_string(access_key)},
@@ -680,6 +746,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--table",
         default=os.getenv("CLICKHOUSE_AUAIR_TABLE", "auair_telemetry"),
+    )
+    parser.add_argument(
+        "--visible-view",
+        default=os.getenv(
+            "CLICKHOUSE_AUAIR_VISIBLE_VIEW",
+            "auair_telemetry_committed",
+        ),
+    )
+    parser.add_argument(
+        "--commit-table",
+        default=os.getenv(
+            "CLICKHOUSE_AUAIR_COMMIT_TABLE",
+            "auair_telemetry_workflow_commits",
+        ),
     )
     parser.add_argument(
         "--safe-cell-limit",
@@ -733,11 +813,27 @@ def parse_args() -> argparse.Namespace:
         parser.error("--row-chunk-zstd-level must be between 1 and 22")
     if args.schema_alter_chunk_columns <= 0:
         parser.error("--schema-alter-chunk-columns must be greater than zero")
+    for label, value in (
+        ("--database", args.database),
+        ("--table", args.table),
+        ("--visible-view", args.visible_view),
+        ("--commit-table", args.commit_table),
+    ):
+        if not SAFE_IDENTIFIER.fullmatch(value):
+            parser.error(f"{label} must be a safe ClickHouse identifier")
     return args
 
 
 def main() -> None:
     args = parse_args()
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def _cancel_on_sigterm(signum, _frame) -> None:
+        raise KeyboardInterrupt(
+            f"ClickHouse AU-AIR load canceled by signal {signum}."
+        )
+
+    signal.signal(signal.SIGTERM, _cancel_on_sigterm)
     started = time.time()
     part_files = _part_files(args.input)
     source_columns = _read_header(part_files[0])
@@ -776,6 +872,11 @@ def main() -> None:
     )
     uploaded_chunks: list[dict[str, object]] = []
     client: Client | None = None
+    table_name: str | None = None
+    query_parameters = {
+        "batch_id": args.batch_id,
+        "dagster_run_id": args.dagster_run_id,
+    }
 
     try:
         with tempfile.TemporaryDirectory(prefix="dpm-auair-ch-ingest-") as temp:
@@ -801,17 +902,25 @@ def main() -> None:
             client,
             database=args.database,
             table=args.table,
+            visible_view=args.visible_view,
+            commit_table=args.commit_table,
             source_columns=source_columns,
             alter_chunk_columns=args.schema_alter_chunk_columns,
         )
-        query_parameters = {"batch_id": args.batch_id}
-        existing_rows = client.execute(
-            f"SELECT count() FROM {table_name} WHERE source_batch_id = %(batch_id)s",
+        # A retry of the same Dagster run starts cleanly, but an older
+        # committed run for the logical batch remains queryable until this
+        # whole workflow reaches SUCCESS.
+        retry_rows = client.execute(
+            f"SELECT count() FROM {table_name} "
+            "WHERE source_batch_id = %(batch_id)s "
+            "AND dagster_run_id = %(dagster_run_id)s",
             query_parameters,
         )[0][0]
-        if existing_rows:
+        if retry_rows:
             client.execute(
-                f"ALTER TABLE {table_name} DELETE WHERE source_batch_id = %(batch_id)s",
+                f"ALTER TABLE {table_name} DELETE "
+                "WHERE source_batch_id = %(batch_id)s "
+                "AND dagster_run_id = %(dagster_run_id)s",
                 query_parameters,
                 settings={**CLICKHOUSE_SETTINGS, "mutations_sync": 1},
             )
@@ -823,11 +932,14 @@ def main() -> None:
             table=args.table,
             source_columns=source_columns,
             batch_id=args.batch_id,
+            dagster_run_id=args.dagster_run_id,
             minio_bucket=args.ingest_bucket,
             uploaded_chunks=uploaded_chunks,
         )
         stored_rows = client.execute(
-            f"SELECT count() FROM {table_name} WHERE source_batch_id = %(batch_id)s",
+            f"SELECT count() FROM {table_name} "
+            "WHERE source_batch_id = %(batch_id)s "
+            "AND dagster_run_id = %(dagster_run_id)s",
             query_parameters,
         )[0][0]
         if stored_rows != args.expected_row_count:
@@ -839,7 +951,8 @@ def main() -> None:
             row[0]
             for row in client.execute(
                 f"SELECT DISTINCT flight_id FROM {table_name} "
-                "WHERE source_batch_id = %(batch_id)s ORDER BY flight_id",
+                "WHERE source_batch_id = %(batch_id)s "
+                "AND dagster_run_id = %(dagster_run_id)s ORDER BY flight_id",
                 query_parameters,
             )
         ]
@@ -852,6 +965,9 @@ def main() -> None:
         metadata = {
             "database": args.database,
             "table": args.table,
+            "visible_view": args.visible_view,
+            "workflow_commit_table": args.commit_table,
+            "workflow_visibility": "pending-until-run-success",
             "dataset_id": args.dataset_id,
             "batch_id": args.batch_id,
             "dagster_run_id": args.dagster_run_id,
@@ -886,7 +1002,28 @@ def main() -> None:
             encoding="utf-8",
         )
         print(json.dumps(metadata, ensure_ascii=False), flush=True)
+    except BaseException:
+        # Graceful Dagster cancellation reaches the loader as SIGTERM. Remove
+        # only this run's pending rows here; the terminal run-status sensor is
+        # an idempotent safety net for hard termination.
+        if client is not None and table_name is not None:
+            try:
+                client.execute(
+                    f"ALTER TABLE {table_name} DELETE "
+                    "WHERE source_batch_id = %(batch_id)s "
+                    "AND dagster_run_id = %(dagster_run_id)s",
+                    query_parameters,
+                    settings={**CLICKHOUSE_SETTINGS, "mutations_sync": 1},
+                )
+            except Exception as cleanup_error:
+                print(
+                    "Warning: interrupted ClickHouse run could not be rolled "
+                    f"back immediately: {cleanup_error}",
+                    flush=True,
+                )
+        raise
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
         _remove_ingest_objects(minio_client, args.ingest_bucket, uploaded_chunks)
         if client is not None:
             client.disconnect()

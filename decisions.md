@@ -1,5 +1,25 @@
 # Mimari Kararlar
 
+## 2026-09-01 — ClickHouse workflow commit ve rollback sınırı
+
+- AU-AIR ClickHouse satırları `dagster_run_id` ile fiziksel storage tablosuna
+  yazılacak, fakat Dagster workflow'u `SUCCESS` durumuna ulaşana kadar
+  dashboard sorgularına açılmayacaktır.
+- Görünürlük, geniş compact partlar üzerinde pahalı bir `UPDATE` mutation
+  yerine küçük `auair_telemetry_workflow_commits` registry tablosu ve
+  `auair_telemetry_committed` view'ı ile yönetilecektir.
+- Başarılı run-status sensorü batch/run çiftini commit registry'ye ekleyecek;
+  dashboard yalnız committed view'ı okuyacaktır.
+- `FAILURE` veya `CANCELED` terminal durumunda yalnız ilgili Dagster run'ına
+  ait ClickHouse satırları senkron mutation ile silinecek ve silme sonucu
+  doğrulanacaktır.
+- MinIO çıktıları, DVC objeleri ve PostgreSQL katalog/materialization
+  metadata'sı rollback kapsamına alınmayacaktır. PostgreSQL terminal run
+  durumunu audit kaydı olarak koruyacaktır.
+- Aynı batch'in daha eski başarılı sürümü, yeni workflow commit edilene kadar
+  görünür kalacaktır. Yeni commit sonrası eski fiziksel sürüm asenkron olarak
+  temizlenecektir.
+
 ## 2026-08-26 — MinIO kalıcı depolaması
 
 - MinIO, `dpm-minio` adlı Docker container'ında çalıştırılacaktır.

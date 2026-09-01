@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -279,20 +280,41 @@ def _ensure_catalog_run(
 
 
 def _run_pipeline_script(context, command: list[str], *, cwd: Path) -> None:
-    result = subprocess.run(
+    process = subprocess.Popen(
         command,
         cwd=cwd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=os.name == "posix",
     )
-    if result.stdout:
-        context.log.info(result.stdout.rstrip())
-    if result.stderr:
-        log_method = context.log.error if result.returncode else context.log.info
-        log_method(result.stderr.rstrip())
-    if result.returncode:
+    try:
+        stdout, stderr = process.communicate()
+    except BaseException:
+        if process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+                process.communicate(timeout=30)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                if process.poll() is None:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                    process.communicate()
+        raise
+
+    if stdout:
+        context.log.info(stdout.rstrip())
+    if stderr:
+        log_method = context.log.error if process.returncode else context.log.info
+        log_method(stderr.rstrip())
+    if process.returncode:
         raise RuntimeError(
-            f"Pipeline script failed with exit code {result.returncode}: "
+            f"Pipeline script failed with exit code {process.returncode}: "
             f"{Path(command[1]).name}"
         )
 
@@ -603,6 +625,14 @@ class ClickHouseAuairConfig(Config):
 
     database: str = os.getenv("CLICKHOUSE_DATABASE", "default")
     table: str = os.getenv("CLICKHOUSE_AUAIR_TABLE", "auair_telemetry")
+    visible_view: str = os.getenv(
+        "CLICKHOUSE_AUAIR_VISIBLE_VIEW",
+        "auair_telemetry_committed",
+    )
+    commit_table: str = os.getenv(
+        "CLICKHOUSE_AUAIR_COMMIT_TABLE",
+        "auair_telemetry_workflow_commits",
+    )
     safe_cell_limit: int = int(
         os.getenv("CLICKHOUSE_WIDE_SAFE_CELL_LIMIT", "1000000000")
     )
@@ -674,6 +704,10 @@ def clickhouse_auair_batch(
             config.database,
             "--table",
             config.table,
+            "--visible-view",
+            config.visible_view,
+            "--commit-table",
+            config.commit_table,
             "--safe-cell-limit",
             str(config.safe_cell_limit),
             "--max-rows-per-chunk",
@@ -717,6 +751,11 @@ def clickhouse_auair_batch(
         metadata={
             "clickhouse_database": load_metadata["database"],
             "clickhouse_table": load_metadata["table"],
+            "clickhouse_visible_view": load_metadata["visible_view"],
+            "clickhouse_workflow_commit_table": load_metadata[
+                "workflow_commit_table"
+            ],
+            "workflow_visibility": load_metadata["workflow_visibility"],
             "flight_count": load_metadata["flight_count"],
             "flight_ids": load_metadata["flight_ids"],
             "insert_chunk_count": load_metadata["insert_chunk_count"],
@@ -735,6 +774,8 @@ def clickhouse_auair_batch(
             "batch_id": batch_id,
             "clickhouse_database": load_metadata["database"],
             "clickhouse_table": load_metadata["table"],
+            "clickhouse_visible_view": load_metadata["visible_view"],
+            "workflow_visibility": load_metadata["workflow_visibility"],
             "row_count": load_metadata["stored_row_count"],
             "column_count": load_metadata["source_column_count"],
             "flight_count": load_metadata["flight_count"],
