@@ -23,6 +23,10 @@ rotanın türevinden hesaplanır, yani kolonlar birbiriyle tutarlıdır.
 
 Kullanım
 --------
+    # --rows / --cols verilmezse çalışırken tek tek sorulur, sonra üretilen
+    # veri seti doğrudan s3://data-raw/auair-tab/inbox/ altına yüklenir.
+    python scripts/auair_generator.py
+
     docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 1000000 --cols 500
     docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 5000 --cols 30 --preview 5
     docker compose exec dagster python /workspace/scripts/auair_generator.py --rows 200000 --cols 2000 --flights 12 --split-flights --gzip
@@ -50,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import gzip
-import json
 import math
 import os
 import sys
@@ -62,6 +65,7 @@ from urllib.parse import urlparse
 import numpy as np
 from minio import Minio
 from minio.error import S3Error
+from urllib3.exceptions import HTTPError as _Urllib3HTTPError
 
 # --------------------------------------------------------------------------
 # AU-AIR sabitleri (gerçek veri setinden ölçüldü)
@@ -517,7 +521,7 @@ def session_times(counts: list[int], start_dt: datetime, hz: float) -> list[date
 
 def generate(rows: int, cols: int, out_dir: str, flights: int, hz: float, seed: int,
              start: str, chunk_size: int, precision: int, header: bool,
-             compress: bool, preview: int, write_meta: bool, fast: bool, jobs: int,
+             compress: bool, preview: int, fast: bool, jobs: int,
              split: bool) -> list[str]:
     names, blocks = resolve_columns(cols)
     counts = [c for c in split_rows(rows, flights) if c > 0]
@@ -591,39 +595,11 @@ def generate(rows: int, cols: int, out_dir: str, flights: int, hz: float, seed: 
 
         print(f"{path}  ({n_file:,} satır x {cols:,} sütun | {size / 1e6:,.1f} MB)", file=sys.stderr)
 
-        if write_meta:
-            meta = {
-                "file": fname, "rows": n_file, "cols": cols,
-                "flights": [ids[fi] for fi in members],
-                "hz": hz, "seed": seed, "start": starts[members[0]].isoformat(),
-                "bytes": size, "format": "fast" if fast else "exact",
-                "column_blocks": len(blocks),
-                "columns": names[:64] + (["..."] if len(names) > 64 else []),
-                "source_profile": "AU-AIR 2019 (32823 satır, 8 oturum, 5 Hz)",
-            }
-            with open(
-                os.path.join(out_dir, stem + ".meta.json"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(meta, f, indent=2, ensure_ascii=False)
-
     elapsed = time.time() - t_begin
     print(f"\ntoplam {rows:,} satır x {cols:,} sütun | {len(counts)} uçuş | "
           f"{len(paths)} dosya | {elapsed:,.1f} sn | {rows / max(elapsed, 1e-9):,.0f} satır/s",
           file=sys.stderr)
     return paths
-
-
-def _metadata_path(data_path: Path) -> Path:
-    name = data_path.name
-    if name.endswith(".tab.gz"):
-        stem = name[: -len(".tab.gz")]
-    elif name.endswith(".tab"):
-        stem = name[: -len(".tab")]
-    else:
-        raise ValueError(f"Unsupported generated data file: {data_path}")
-    return data_path.with_name(f"{stem}.meta.json")
 
 
 def _object_name(prefix: str, file_name: str) -> str:
@@ -682,30 +658,17 @@ def upload_generated_files(
     args: argparse.Namespace,
     generated_paths: list[str],
 ) -> None:
-    """Upload generated data and optional metadata sidecars to raw MinIO."""
+    """Upload the generated .tab data files to the raw MinIO landing prefix."""
 
     _ensure_bucket(client, args.bucket)
     for generated_path in generated_paths:
         data_path = Path(generated_path).resolve()
-        sidecar_path = _metadata_path(data_path)
-        sidecar = None
-        if sidecar_path.is_file():
-            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
 
-        row_count = (
-            sidecar.get("rows")
-            if isinstance(sidecar, dict)
-            else data_path.name.split("_", maxsplit=1)[0]
-        )
         object_metadata = {
             "generator": "auair_generator",
-            "rows": str(row_count),
+            "rows": str(data_path.name.split("_", maxsplit=1)[0]),
             "columns": str(args.cols),
-            "flights": str(
-                len(sidecar.get("flights", []))
-                if isinstance(sidecar, dict)
-                else min(args.flights, args.rows)
-            ),
+            "flights": str(min(args.flights, args.rows)),
             "sample-rate-hz": str(args.hz),
             "generator-seed": str(args.seed),
         }
@@ -724,24 +687,41 @@ def upload_generated_files(
             metadata=object_metadata,
         )
 
-        if sidecar_path.is_file():
-            _upload_and_verify(
-                client,
-                bucket=args.bucket,
-                object_name=_object_name(args.prefix, sidecar_path.name),
-                local_path=sidecar_path,
-                content_type="application/json",
-                overwrite=args.overwrite,
-            )
-
         if not args.keep_local:
             data_path.unlink()
-            sidecar_path.unlink(missing_ok=True)
 
     print("AU-AIR raw MinIO upload is ready and verified.", flush=True)
 
 
 # --------------------------------------------------------------------------
+
+# Dagster raw sensörü 17 sütunun altındaki .tab dosyalarını sessizce atlar
+# (dagster/assets.py: AUAIR_MIN_COLUMN_COUNT). Üretim yine de serbest.
+PIPELINE_MIN_COLUMNS = 17
+
+
+def _prompt_int(label: str, *, minimum: int) -> int:
+    """Etkileşimli olarak pozitif tam sayı ister; boşluk/altçizgi/virgül tolere eder."""
+
+    while True:
+        try:
+            raw = input(f"{label}: ").strip()
+        except EOFError:
+            raise SystemExit(
+                f"'{label}' için değer bekleniyordu fakat giriş akışı kapalı. "
+                "Etkileşimli olmayan çalıştırmada --rows/--cols kullanın."
+            )
+        cleaned = raw.replace("_", "").replace(",", "").replace(" ", "")
+        try:
+            value = int(cleaned)
+        except ValueError:
+            print("  Lütfen bir tam sayı girin (ör. 100000).")
+            continue
+        if value < minimum:
+            print(f"  En az {minimum} olmalı.")
+            continue
+        return value
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
@@ -751,8 +731,11 @@ def main(argv=None) -> int:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--rows", type=int, default=100_000, help="üretilecek satır sayısı")
-    p.add_argument("--cols", type=int, default=64, help="toplam sütun sayısı (flight_id ve time dahil)")
+    p.add_argument("--rows", type=int, default=None,
+                   help="üretilecek satır sayısı (verilmezse çalışırken sorulur)")
+    p.add_argument("--cols", type=int, default=None,
+                   help="toplam sütun sayısı, flight_id ve time dahil "
+                        "(verilmezse çalışırken sorulur)")
     p.add_argument(
         "--out-dir",
         type=Path,
@@ -774,7 +757,6 @@ def main(argv=None) -> int:
                    help="her uçuşu ayrı dosyaya yaz (satır_sütun_flightid.tab)")
     p.add_argument("--jobs", type=int, default=1,
                    help="paralel süreç sayısı (uçuş başına bölünür; büyük dosyalar için)")
-    p.add_argument("--no-meta", action="store_true", help="yan meta.json dosyasını yazma")
     p.add_argument(
         "--endpoint",
         default=os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000"),
@@ -826,8 +808,31 @@ def main(argv=None) -> int:
     )
     a = p.parse_args(argv)
 
+    if a.rows is None or a.cols is None:
+        print(
+            "AU-AIR sentetik telemetri üreteci — üretilen veri seti doğrudan\n"
+            f"s3://{a.bucket}/{a.prefix.strip('/')}/ altına yüklenecek.\n",
+            file=sys.stderr,
+        )
+    if a.rows is None:
+        a.rows = _prompt_int("Satır sayısı", minimum=1)
+    if a.cols is None:
+        a.cols = _prompt_int(
+            "Sütun sayısı (flight_id + time dahil)",
+            minimum=len(FIXED_COLUMNS),
+        )
+
     if a.rows <= 0:
         p.error("--rows pozitif olmalı")
+    if a.cols < len(FIXED_COLUMNS):
+        p.error(f"--cols en az {len(FIXED_COLUMNS)} olmalı (flight_id + time)")
+    if a.cols < PIPELINE_MIN_COLUMNS:
+        print(
+            f"UYARI: {a.cols} sütun, pipeline'ın minimum {PIPELINE_MIN_COLUMNS} "
+            "sütun eşiğinin altında; dosya yüklense bile Dagster raw sensörü "
+            "onu atlar.",
+            file=sys.stderr,
+        )
     if a.flights <= 0:
         p.error("--flights pozitif olmalı")
     if not a.bucket.strip():
@@ -853,7 +858,6 @@ def main(argv=None) -> int:
         not a.no_header,
         a.gzip,
         a.preview,
-        not a.no_meta,
         a.fast,
         a.jobs,
         a.split_flights,
@@ -868,8 +872,12 @@ def main(argv=None) -> int:
             secure=secure,
         )
         upload_generated_files(client, a, generated_paths)
-    except (OSError, RuntimeError, ValueError, S3Error) as exc:
+    except (OSError, RuntimeError, ValueError, S3Error, _Urllib3HTTPError) as exc:
         print(f"MinIO upload failed: {exc}", file=sys.stderr)
+        print(
+            f"Üretilen dosyalar yerelde kaldı: {a.out_dir}",
+            file=sys.stderr,
+        )
         return 1
 
     return 0

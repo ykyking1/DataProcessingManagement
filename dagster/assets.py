@@ -229,7 +229,18 @@ def staged_auair_tab(context, config: RawToStagedConfig) -> MaterializeResult:
             "multipart_part_size_mib": config.multipart_part_size_mib,
         },
     )
+    downstream_value = {
+        "dataset_id": dataset_id,
+        "batch_id": batch_id,
+        "staged_bucket": config.staged_bucket,
+        "staged_key": staged_key,
+        "staged_uri": staged_uri,
+        "staged_etag": staged_etag or "unknown",
+        "row_count": result.row_count,
+        "column_count": result.column_count,
+    }
     return MaterializeResult(
+        value=downstream_value,
         metadata={
             "dataset_id": dataset_id,
             "batch_id": batch_id,
@@ -320,14 +331,13 @@ def _run_pipeline_script(context, command: list[str], *, cwd: Path) -> None:
 
 
 class StagedAuairProcessingConfig(Config):
-    """Staged generated AU-AIR object selected by the staged-data sensor."""
+    """Spark preprocessing knobs for the staged generated AU-AIR batch.
 
-    source_bucket: str = DEFAULT_STAGED_BUCKET
-    source_key: str
-    source_etag: str
-    batch_id: str
-    row_count: int
-    column_count: int
+    The staged object identity (bucket/key/etag) and the row/column counts now
+    arrive from the upstream ``staged_auair_tab`` asset instead of a sensor, so
+    only the tuning parameters remain configurable here.
+    """
+
     max_columns: int = 100_000
     timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSS"
     spark_master: str = "local[2]"
@@ -344,30 +354,37 @@ class StagedAuairProcessingConfig(Config):
 )
 def processed_auair_batch(
     context,
+    staged_auair_tab: dict,
     config: StagedAuairProcessingConfig,
 ) -> MaterializeResult:
     repo_root = _dvc_repo_root()
     dataset_id = DEFAULT_DATASET_ID
-    if config.column_count < AUAIR_MIN_COLUMN_COUNT:
+    batch_id = staged_auair_tab["batch_id"]
+    row_count = staged_auair_tab["row_count"]
+    column_count = staged_auair_tab["column_count"]
+    source_bucket = staged_auair_tab["staged_bucket"]
+    source_key = staged_auair_tab["staged_key"]
+    expected_etag = _normalise_etag(staged_auair_tab["staged_etag"])
+    if column_count < AUAIR_MIN_COLUMN_COUNT:
         raise ValueError(
             f"Generated AU-AIR telemetry must contain at least "
             f"{AUAIR_MIN_COLUMN_COUNT} columns; received "
-            f"{config.column_count}."
+            f"{column_count}."
         )
 
     catalog_run = _ensure_catalog_run(
         context,
         dataset_id=dataset_id,
-        batch_id=config.batch_id,
+        batch_id=batch_id,
     )
 
     client = create_minio_client()
-    source_stat = client.stat_object(config.source_bucket, config.source_key)
+    source_stat = client.stat_object(source_bucket, source_key)
     actual_etag = _normalise_etag(source_stat.etag) or "unknown"
-    if actual_etag != _normalise_etag(config.source_etag):
+    if expected_etag not in (None, "unknown") and actual_etag != expected_etag:
         raise RuntimeError(
-            "Staged object changed after the sensor observed it: "
-            f"expected {config.source_etag}, got {actual_etag}."
+            "Staged object changed after it was written: "
+            f"expected {expected_etag}, got {actual_etag}."
         )
 
     batch_path = (
@@ -376,7 +393,7 @@ def processed_auair_batch(
         / "processed"
         / dataset_id
         / "batches"
-        / config.batch_id
+        / batch_id
     )
     script_path = repo_root / "scripts" / "preprocess_auair_tab_spark.py"
     if not script_path.is_file():
@@ -384,15 +401,15 @@ def processed_auair_batch(
 
     context.log.info(
         "Spark preprocessing started: s3://%s/%s -> %s",
-        config.source_bucket,
-        config.source_key,
+        source_bucket,
+        source_key,
         batch_path,
     )
     with tempfile.TemporaryDirectory(prefix="dpm-staged-input-") as temp:
-        local_input = Path(temp) / PurePosixPath(config.source_key).name
+        local_input = Path(temp) / PurePosixPath(source_key).name
         client.fget_object(
-            config.source_bucket,
-            config.source_key,
+            source_bucket,
+            source_key,
             str(local_input),
         )
         command = [
@@ -420,30 +437,30 @@ def processed_auair_batch(
     output_size = sum(path.stat().st_size for path in part_files)
     value = {
         "dataset_id": dataset_id,
-        "batch_id": config.batch_id,
+        "batch_id": batch_id,
         "batch_path": str(batch_path),
-        "source_bucket": config.source_bucket,
-        "source_key": config.source_key,
+        "source_bucket": source_bucket,
+        "source_key": source_key,
         "source_etag": actual_etag,
-        "row_count": config.row_count,
-        "column_count": config.column_count,
+        "row_count": row_count,
+        "column_count": column_count,
         "part_count": len(part_files),
         "output_size_bytes": output_size,
         "spark_master": config.spark_master,
     }
-    source_uri = f"s3://{config.source_bucket}/{config.source_key}"
+    source_uri = f"s3://{source_bucket}/{source_key}"
     record_asset_materialization(
         context,
         catalog_run,
         asset_key="processed_auair_batch",
         asset_group="auair_pipeline",
         dataset_id=dataset_id,
-        batch_id=config.batch_id,
+        batch_id=batch_id,
         input_uri=source_uri,
         input_etag=actual_etag,
         output_uri=batch_path.as_uri(),
-        row_count=config.row_count,
-        column_count=config.column_count,
+        row_count=row_count,
+        column_count=column_count,
         part_count=len(part_files),
         output_size_bytes=output_size,
         metadata={
@@ -456,12 +473,12 @@ def processed_auair_batch(
         value=value,
         metadata={
             "dataset_id": dataset_id,
-            "batch_id": config.batch_id,
+            "batch_id": batch_id,
             "source_uri": source_uri,
             "source_etag": actual_etag,
             "processed_path": MetadataValue.path(str(batch_path)),
-            "row_count": config.row_count,
-            "column_count": config.column_count,
+            "row_count": row_count,
+            "column_count": column_count,
             "part_count": len(part_files),
             "output_size_bytes": output_size,
             "spark_master": config.spark_master,

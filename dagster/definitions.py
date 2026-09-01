@@ -28,15 +28,15 @@ from clickhouse_workflow import reconcile_auair_clickhouse_run
 from postgres_catalog import record_terminal_job_run, resolve_pipeline_identity
 
 
-raw_auair_to_staged_job = define_asset_job(
-    name="raw_auair_to_staged_job",
-    selection=AssetSelection.assets(assets.staged_auair_tab),
-    hooks={alert_on_failure, clear_alert_on_success},
-)
-
+# The whole generated AU-AIR pipeline is a single job driven by a single
+# sensor: a new raw .tab object triggers one run that stages it, then Spark
+# preprocesses, validates, loads ClickHouse and publishes to DVC. The staged
+# object identity flows between assets through the ``staged_auair_tab`` asset
+# output, so there is no separate staged-data sensor anymore.
 staged_auair_to_published_job = define_asset_job(
     name="staged_auair_to_published_job",
     selection=AssetSelection.assets(
+        assets.staged_auair_tab,
         assets.processed_auair_batch,
         assets.validated_auair_batch,
         assets.clickhouse_auair_batch,
@@ -47,13 +47,12 @@ staged_auair_to_published_job = define_asset_job(
 
 
 MONITORED_PIPELINE_JOBS = [
-    raw_auair_to_staged_job,
     staged_auair_to_published_job,
 ]
 
-STAGED_AUAIR_FILE_PATTERN = re.compile(
+RAW_AUAIR_FILE_PATTERN = re.compile(
     r"^(?P<row_count>\d+)_(?P<column_count>\d+)_"
-    r"flight_[1-9]\d*_[0-9]{4}-[0-9]{2}-[0-9]{2}\.tab\.zst$",
+    r"flight_[1-9]\d*_[0-9]{4}-[0-9]{2}-[0-9]{2}\.tab$",
     flags=re.IGNORECASE,
 )
 
@@ -173,17 +172,18 @@ def _job_has_active_run(context, job_name: str) -> bool:
 
 
 @sensor(
-    job=raw_auair_to_staged_job,
+    job=staged_auair_to_published_job,
     minimum_interval_seconds=30,
     default_status=DefaultSensorStatus.RUNNING,
     description=(
         "Watches generated high-column AU-AIR .tab objects in MinIO and "
-        "launches one streaming ZSTD staging run per object key/ETag."
+        "launches one full staging -> Spark -> validation -> ClickHouse -> DVC "
+        "run per object key/ETag."
     ),
 )
 def raw_auair_minio_sensor(context):
-    if _job_has_active_run(context, raw_auair_to_staged_job.name):
-        return SkipReason("An AU-AIR raw-to-staged run is already active.")
+    if _job_has_active_run(context, staged_auair_to_published_job.name):
+        return SkipReason("An AU-AIR pipeline run is already active.")
 
     source_bucket = os.getenv("MINIO_RAW_BUCKET", assets.DEFAULT_RAW_BUCKET)
     source_prefix = os.getenv(
@@ -216,12 +216,40 @@ def raw_auair_minio_sensor(context):
         key=lambda item: item.object_name,
     )
 
+    cursor_changed = False
     for item in candidates:
         source_etag = assets._normalise_etag(item.etag) or "unknown"
         object_identity = f"{source_bucket}/{item.object_name}"
         if observed_etags.get(object_identity) == source_etag:
             continue
 
+        file_name = PurePosixPath(item.object_name).name
+        match = RAW_AUAIR_FILE_PATTERN.fullmatch(file_name)
+        if match is None:
+            context.log.warning(
+                "Ignoring raw object with an unsupported generated AU-AIR "
+                "name: s3://%s/%s",
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
+
+        column_count = int(match.group("column_count"))
+        if column_count < assets.AUAIR_MIN_COLUMN_COUNT:
+            context.log.warning(
+                "Ignoring generated AU-AIR object with only %s columns: "
+                "s3://%s/%s",
+                column_count,
+                source_bucket,
+                item.object_name,
+            )
+            observed_etags[object_identity] = source_etag
+            cursor_changed = True
+            continue
+
+        batch_id = file_name[: -len(".tab")]
         observed_etags[object_identity] = source_etag
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))
         return RunRequest(
@@ -240,127 +268,6 @@ def raw_auair_minio_sensor(context):
             },
             tags={
                 "dataset_id": assets.DEFAULT_DATASET_ID,
-                "source_bucket": source_bucket,
-                "source_key": item.object_name,
-                "source_etag": source_etag,
-            },
-        )
-
-    return SkipReason(
-        f"No new generated AU-AIR .tab objects under "
-        f"s3://{source_bucket}/{source_prefix}."
-    )
-
-
-@sensor(
-    job=staged_auair_to_published_job,
-    minimum_interval_seconds=30,
-    default_status=DefaultSensorStatus.RUNNING,
-    description=(
-        "Watches staged generated AU-AIR .tab.zst objects and launches the "
-        "Spark -> validation -> ClickHouse -> DVC workflow."
-    ),
-)
-def staged_auair_minio_sensor(context):
-    if _job_has_active_run(context, staged_auair_to_published_job.name):
-        return SkipReason("An AU-AIR staged-to-published run is already active.")
-
-    source_bucket = os.getenv(
-        "MINIO_STAGED_BUCKET", assets.DEFAULT_STAGED_BUCKET
-    )
-    source_prefix = os.getenv(
-        "MINIO_AUAIR_STAGED_PREFIX", assets.DEFAULT_STAGED_PREFIX
-    ).strip("/")
-    if source_prefix:
-        source_prefix = f"{source_prefix}/"
-
-    client = assets.create_minio_client()
-    if not client.bucket_exists(source_bucket):
-        return SkipReason(f"MinIO bucket does not exist yet: {source_bucket}")
-
-    try:
-        observed_etags = json.loads(context.cursor) if context.cursor else {}
-    except (TypeError, json.JSONDecodeError):
-        observed_etags = {}
-    if not isinstance(observed_etags, dict):
-        observed_etags = {}
-
-    candidates = sorted(
-        (
-            item
-            for item in client.list_objects(
-                source_bucket,
-                prefix=source_prefix,
-                recursive=True,
-            )
-            if not item.is_dir
-            and item.object_name.lower().endswith(".tab.zst")
-        ),
-        key=lambda item: item.object_name,
-    )
-
-    cursor_changed = False
-    for item in candidates:
-        source_etag = assets._normalise_etag(item.etag) or "unknown"
-        object_identity = f"{source_bucket}/{item.object_name}"
-        if observed_etags.get(object_identity) == source_etag:
-            continue
-
-        file_name = PurePosixPath(item.object_name).name
-        match = STAGED_AUAIR_FILE_PATTERN.fullmatch(file_name)
-        if match is None:
-            context.log.warning(
-                "Ignoring staged object with an unsupported generated AU-AIR "
-                "name: s3://%s/%s",
-                source_bucket,
-                item.object_name,
-            )
-            observed_etags[object_identity] = source_etag
-            cursor_changed = True
-            continue
-
-        batch_id = file_name[: -len(".tab.zst")]
-        row_count = int(match.group("row_count"))
-        column_count = int(match.group("column_count"))
-        if column_count < assets.AUAIR_MIN_COLUMN_COUNT:
-            context.log.warning(
-                "Ignoring generated AU-AIR object with only %s columns: "
-                "s3://%s/%s",
-                column_count,
-                source_bucket,
-                item.object_name,
-            )
-            observed_etags[object_identity] = source_etag
-            cursor_changed = True
-            continue
-
-        observed_etags[object_identity] = source_etag
-        context.update_cursor(json.dumps(observed_etags, sort_keys=True))
-        timestamp_format = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        return RunRequest(
-            run_key=f"staged-auair-minio:{object_identity}:{source_etag}",
-            run_config={
-                "ops": {
-                    "processed_auair_batch": {
-                        "config": {
-                            "source_bucket": source_bucket,
-                            "source_key": item.object_name,
-                            "source_etag": source_etag,
-                            "batch_id": batch_id,
-                            "row_count": row_count,
-                            "column_count": column_count,
-                            "timestamp_format": timestamp_format,
-                        }
-                    },
-                    "validated_auair_batch": {
-                        "config": {
-                            "timestamp_format": timestamp_format,
-                        }
-                    },
-                }
-            },
-            tags={
-                "dataset_id": assets.DEFAULT_DATASET_ID,
                 "batch_id": batch_id,
                 "source_bucket": source_bucket,
                 "source_key": item.object_name,
@@ -372,7 +279,7 @@ def staged_auair_minio_sensor(context):
     if cursor_changed:
         context.update_cursor(json.dumps(observed_etags, sort_keys=True))
     return SkipReason(
-        f"No new supported generated AU-AIR .tab.zst objects under "
+        f"No new supported generated AU-AIR .tab objects under "
         f"s3://{source_bucket}/{source_prefix}."
     )
 
@@ -386,12 +293,10 @@ defs = Definitions(
         assets.published_auair_dataset,
     ],
     jobs=[
-        raw_auair_to_staged_job,
         staged_auair_to_published_job,
     ],
     sensors=[
         raw_auair_minio_sensor,
-        staged_auair_minio_sensor,
         postgres_run_success_sensor,
         postgres_run_failure_sensor,
         postgres_run_canceled_sensor,
