@@ -4,6 +4,16 @@ Dagster orchestration, processing, validation, reproducibility, and runtime depe
 
 <!-- version list -->
 
+## pipeline-v0.8.0 (2026-09-01)
+
+
+### Features
+
+- **dashboard**: DVC/alert artefaktları MinIO'dan, otomatik yenileme kaldırıldı ([`ef2f2e6`](https://github.com/ykyking1/DataProcessingManagement/commit/ef2f2e62b88e5c20252d2b5b965dd799151bba6b))
+
+
+
+
 ## pipeline-v0.7.0 (2026-09-01)
 
 
