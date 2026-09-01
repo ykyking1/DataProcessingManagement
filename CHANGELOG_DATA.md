@@ -4,6 +4,16 @@ Published dataset revisions are recorded here.
 
 <!-- version list -->
 
+## v0.0.3 (2026-09-01)
+
+**Data processed with `pipeline-v0.1.0` (`c8922637a086791882ed90c1ef151098672526ae`)**
+
+### Data
+
+- **auair**: Publish 5000_10000_flight_1_2019-09-03
+  ([`8622262`](https://github.com/ykyking1/DataProcessingManagement/commit/862226270034afefc7e1c40a810d4270566fe3a0))
+
+
 ## v0.0.2 (2026-09-01)
 
 **Data processed with `pipeline-v0.1.0` (`c8922637a086791882ed90c1ef151098672526ae`)**
