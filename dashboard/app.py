@@ -2632,9 +2632,28 @@ def get_metadata_history_filters() -> dict:
             )
             assets = [row[0] for row in cur.fetchall()]
 
+            # Uçuş seçenekleri iki kaynaktan birleştirilir:
+            #   1) tekil flight_id kolonu (eski, uçuş başına ayrı
+            #      materialization üreten satırlar),
+            #   2) metadata['flight_ids'] JSON dizisi (yeni birleşik
+            #      AU-AIR pipeline'ında TEK materialization tüm uçuşları
+            #      kapsar; sync trigger flight_id kolonuna yalnızca
+            #      dizinin İLK elemanını yazar -- bkz.
+            #      docs/postgres_pipeline_catalog_schema.sql
+            #      sync_asset_metadata_history()). (2) olmadan "Uçuş"
+            #      filtresi tek bir uçuş kimliğine sıkışıp kalıyordu.
             cur.execute(
-                "SELECT DISTINCT flight_id FROM public.asset_metadata_history "
-                "WHERE flight_id IS NOT NULL ORDER BY flight_id"
+                "SELECT DISTINCT fid FROM ("
+                "  SELECT flight_id AS fid "
+                "  FROM public.asset_metadata_history "
+                "  WHERE flight_id IS NOT NULL AND flight_id <> '' "
+                "  UNION "
+                "  SELECT jsonb_array_elements_text(metadata -> 'flight_ids') "
+                "  FROM public.asset_metadata_history "
+                "  WHERE jsonb_typeof(metadata -> 'flight_ids') = 'array'"
+                ") AS all_flights "
+                "WHERE fid IS NOT NULL AND fid <> '' "
+                "ORDER BY fid"
             )
             flights = [row[0] for row in cur.fetchall()]
 
@@ -2673,15 +2692,31 @@ def fetch_metadata_history(
             params.append(list(assets))
 
         if flights:
-            # flight_id = ANY(...) yerine OR flight_id IS NULL de eklenir:
-            # dvc_published_telemetry gibi belirli bir uçuşa değil, tüm
-            # partition'a ait asset'ler flight_id=NULL ile kaydediliyor
-            # (bkz. dagster/assets/publishing.py). Sadece ANY(...) ile
-            # filtrelenseydi, bir uçuş seçildiğinde bu tür asset'ler
-            # sonuçlardan tamamen kaybolurdu.
+            # Uçuş filtresi üç koşulu OR'lar:
+            #   1) tekil flight_id kolonu (eski satırlar),
+            #   2) metadata['flight_ids'] JSON dizisiyle kesişim -- yeni
+            #      birleşik AU-AIR pipeline'ında tek materialization
+            #      birden çok uçuşu kapsar ve flight_id kolonu diziye
+            #      DEĞİL yalnızca ilk elemana eşittir; bu koşul olmadan
+            #      birden çok uçuş seçilse bile sonuç tek uçuşa sıkışıyordu
+            #      (bkz. get_metadata_history_filters ve schema'daki
+            #      sync_asset_metadata_history()).
+            #   3) flight_id IS NULL -- dvc_published_telemetry gibi belirli
+            #      bir uçuşa değil tüm partition'a ait asset'ler flight_id=
+            #      NULL ile kaydediliyor; ANY(...) ile filtrelenseydi bir
+            #      uçuş seçildiğinde bunlar sonuçlardan tamamen kaybolurdu.
+            # NOT: ?| operatörü yerine eşdeğer jsonb_exists_any(...) fonksiyonu
+            # kullanılır -- '?' içeren operatörler bazı sürücü/paramstyle
+            # kombinasyonlarında placeholder ile karışabiliyor.
             clauses.append(
-                "(flight_id = ANY(%s) OR flight_id IS NULL)"
+                "("
+                "flight_id = ANY(%s) "
+                "OR (jsonb_typeof(metadata -> 'flight_ids') = 'array' "
+                "AND jsonb_exists_any(metadata -> 'flight_ids', %s)) "
+                "OR flight_id IS NULL"
+                ")"
             )
+            params.append(list(flights))
             params.append(list(flights))
 
         if start_date:
@@ -2743,6 +2778,28 @@ def _parse_metadata_date_range(date_range):
         start_date = date_range
 
     return start_date, end_date
+
+
+def _row_flight_ids(row) -> list:
+    """
+    Bir metadata-geçmişi satırının temsil ettiği TÜM uçuş kimliklerini
+    döner. Yeni birleşik AU-AIR pipeline'ında tek bir materialization
+    birden çok uçuşu kapsar ve kimlikler metadata['flight_ids'] dizisinde
+    tutulur; flight_id kolonu bu dizinin yalnızca ilk elemanıdır (bkz.
+    schema'daki sync_asset_metadata_history()). Eski satırlarda ise
+    yalnızca tekil flight_id doludur.
+    """
+
+    metadata = row.get("metadata") or {}
+    ids = metadata.get("flight_ids")
+
+    if isinstance(ids, list) and ids:
+        return [str(x) for x in ids if str(x).strip()]
+
+    if row.get("flight_id"):
+        return [str(row["flight_id"])]
+
+    return []
 
 
 def render_metadata_history() -> None:
@@ -2909,13 +2966,27 @@ def render_metadata_history() -> None:
     # Özet + sonuç tablosu
     # --------------------------------------------------------------
 
+    # Her satırın kapsadığı uçuşlar tekil flight_id kolonundan DEĞİL,
+    # metadata['flight_ids'] dizisinden çözülür (bkz. _row_flight_ids) --
+    # birleşik AU-AIR materialization'ında flight_id kolonu dizinin
+    # yalnızca ilk elemanıdır.
+    history_df = history_df.copy()
+    history_df["_flight_ids"] = history_df.apply(_row_flight_ids, axis=1)
+    history_df["Uçuş(lar)"] = history_df["_flight_ids"].apply(
+        lambda ids: ", ".join(ids) if ids else "-"
+    )
+
+    all_flight_ids = set()
+    for ids in history_df["_flight_ids"]:
+        all_flight_ids.update(ids)
+
     metric_col1, metric_col2, metric_col3 = st.columns(3)
 
     metric_col1.metric("Kayıt", len(history_df))
     metric_col2.metric("Asset", history_df["asset_key"].nunique())
     metric_col3.metric(
         "Uçuş",
-        history_df["flight_id"].dropna().nunique(),
+        len(all_flight_ids),
     )
 
     st.caption(
@@ -2927,7 +2998,7 @@ def render_metadata_history() -> None:
             "asset_key",
             "group_name",
             "partition_date",
-            "flight_id",
+            "Uçuş(lar)",
             "row_count",
             "materialized_at",
             "run_id",
@@ -2937,7 +3008,6 @@ def render_metadata_history() -> None:
             "asset_key": "Asset",
             "group_name": "Grup",
             "partition_date": "Tarih",
-            "flight_id": "Uçuş",
             "row_count": "Satır Sayısı",
             "materialized_at": "Materialize Zamanı",
             "run_id": "Run ID",
@@ -2959,8 +3029,10 @@ def render_metadata_history() -> None:
         # Uçuş bilgisi (ve diğer temel alanlar) her zaman görünür olsun
         # diye, ham JSON metadata'nın önüne eklenir -- eski kayıtlarda
         # JSON içine "flight_id" yazılmamış olsa bile burada gösterilir.
+        flight_label = row["Uçuş(lar)"]
+
         display_metadata = {
-            "flight_id": row["flight_id"] or "-",
+            "flight_ids": flight_label,
             "asset_key": row["asset_key"],
             "partition_date": row["partition_date"],
             "materialized_at": row["materialized_at"],
@@ -2971,7 +3043,7 @@ def render_metadata_history() -> None:
                 display_metadata[key] = value
 
         with st.expander(
-            f"✈️ {row['flight_id'] or '-'} — {row['asset_key']} — "
+            f"✈️ {flight_label} — {row['asset_key']} — "
             f"{row['partition_date']} — {row['materialized_at']}"
         ):
 
@@ -4146,10 +4218,13 @@ def render_download_section(
     paylaş" seçeneği için kullanılır.
     """
 
-    time_suffix = (
-        f"{start_time.strftime('%Y%m%d_%H%M%S')}_"
-        f"{end_time.strftime('%Y%m%d_%H%M%S')}"
-    )
+    if start_time is None and end_time is None:
+        time_suffix = "tum_zaman"
+    else:
+        time_suffix = (
+            f"{start_time.strftime('%Y%m%d_%H%M%S') if start_time else 'basi'}_"
+            f"{end_time.strftime('%Y%m%d_%H%M%S') if end_time else 'sonu'}"
+        )
 
     has_flight_id = "flight_id" in dataframe.columns
 
@@ -4825,10 +4900,11 @@ def _encode_export_state_to_query_params(
     columns_mode="include",
 ) -> dict:
 
-    params = {
-        "export_st": start_time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "export_et": end_time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
+    params = {}
+    if start_time is not None:
+        params["export_st"] = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+    if end_time is not None:
+        params["export_et"] = end_time.strftime("%Y-%m-%dT%H:%M:%S")
 
     if time_mode == "exclude":
         params["export_tm"] = "exclude"
@@ -6013,20 +6089,32 @@ def render_data_export():
 
         col1, col2 = st.columns(2)
 
+        # Varsayılan olarak tarih aralığı UYGULANMAZ: her iki alan da boş
+        # gelir, sorguya zaman koşulu eklenmez (tüm veri dahil). Kullanıcı
+        # bir alt/üst sınır isterse ilgili alanı doldurur; yalnızca biri
+        # doldurulursa tek yönlü sınır uygulanır (bkz. build_clickhouse_where).
         with col1:
 
             start_time = st.datetime_input(
                 "Başlangıç zamanı",
-                value=min_time,
+                value=None,
                 key="export_start_time",
+                help=(
+                    f"Boş bırakılırsa alt sınır uygulanmaz. Verinin en "
+                    f"erken zamanı: {min_time}"
+                ),
             )
 
         with col2:
 
             end_time = st.datetime_input(
                 "Bitiş zamanı",
-                value=max_time,
+                value=None,
                 key="export_end_time",
+                help=(
+                    f"Boş bırakılırsa üst sınır uygulanmaz. Verinin en "
+                    f"geç zamanı: {max_time}"
+                ),
             )
 
         if (
@@ -6804,7 +6892,7 @@ def render_data_export():
                 "otomatik olarak dahil edildi."
             )
 
-    if start_time > end_time:
+    if start_time is not None and end_time is not None and start_time > end_time:
 
         st.error(
             "Başlangıç zamanı bitiş zamanından sonra olamaz."
