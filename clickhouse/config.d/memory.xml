@@ -1,0 +1,20 @@
+<clickhouse>
+    <!--
+      Geniş (10K-50K kolon) AU-AIR INSERT ... SELECT FROM s3() yüklemesi
+      ClickHouse'u OS OOM-killer'a kadar zorluyordu; container yeniden başlayınca
+      çalışan sorgu "Code: 394 Query was cancelled" ile ölüyordu.
+
+      docker-compose.yml'deki `mem_limit` ile birlikte: ClickHouse kendini
+      cgroup bellek sınırına göre izler ve sınıra ULAŞMADAN sorguyu
+      "Code: 241 MEMORY_LIMIT_EXCEEDED" ile reddeder. Böylece süreç canlı kalır
+      ve hata anlaşılır olur.
+    -->
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+
+    <!--
+      Bellek baskısında overcommit mekanizmasının sorguyu hemen iptal etmesi
+      yerine kısa bir süre beklemesini sağlar; bu sürede merge'ler bellek
+      boşaltabilir.
+    -->
+    <global_memory_usage_overcommit_max_wait_microseconds>2000000</global_memory_usage_overcommit_max_wait_microseconds>
+</clickhouse>
