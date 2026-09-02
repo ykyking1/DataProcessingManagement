@@ -174,7 +174,7 @@ MAIN_TAB_LABELS = [
 # PANELLER (Kullanıcı / Admin)
 # ============================================================
 #
-# Dashboard iki panele ayrılır; yan paneldeki parolasız bir radio ile
+# Dashboard iki panele ayrılır; yan paneldeki parolasız iki butonla
 # geçilir (bkz. main()).
 #
 #   - Kullanıcı Paneli: yalnızca son kullanıcıya dönük sekmeler
@@ -213,11 +213,12 @@ def _tabs_for_panel(panel: str) -> list:
 
 
 def _sync_panel_to_url() -> None:
-    """Panel radio'sunun on_change callback'i: seçili paneli URL'ye yazar.
+    """Seçili paneli URL'deki "?panel=..." param'ına yazar.
 
-    Yalnızca kullanıcı paneli elle değiştirdiğinde çalışır -- her
-    render'da URL'ye yazmak, aynı render içinde query param güncelleyen
-    başka özelliklerle (ör. "🔗 Bağlantı Olarak Paylaş") çakışıyordu.
+    Panel seçici butonuna basıldığında çağrılır -- yalnızca panel elle
+    değiştirildiğinde. Her render'da URL'ye yazmak, aynı render içinde
+    query param güncelleyen başka özelliklerle (ör. "🔗 Bağlantı Olarak
+    Paylaş") çakışıyordu.
     """
 
     st.query_params["panel"] = PANEL_CODE_BY_LABEL.get(
@@ -8048,14 +8049,15 @@ def main():
     # PANEL + SEKME SEÇİMİ + KONTROLLER (yan panel)
     # ========================================================
     #
-    # Yan panelin en üstünde parolasız bir "Panel" radio'su vardır:
+    # Yan panelin en üstünde parolasız bir "Panel" seçici (iki buton)
+    # vardır:
     #   - Kullanıcı Paneli -> yalnızca USER_TAB_LABELS ("Veri Gözat /
     #     Dışa Aktar", "Uçuş Rotası"); "Gösterilecek run sayısı" YOK.
     #   - Admin Paneli     -> MAIN_TAB_LABELS (tüm sekmeler) +
     #     "Gösterilecek run sayısı" slider'ı.
     #
-    # Sekme seçimi için st.radio/st.tabs yerine dikey sıralanmış
-    # butonlar kullanılır -- her buton aktif sekmeyse "primary"
+    # Hem panel seçici hem de sekme seçimi için st.radio/st.tabs yerine
+    # dikey sıralanmış butonlar kullanılır -- her buton aktifse "primary"
     # (dolu/renkli), değilse "secondary" (outline) tipiyle çizilir.
     # st.button, Streamlit'in iç DOM yapısı sürüm sürüm değişse de
     # (bkz. dashboard/requirements.txt içindeki pinlenmiş Streamlit
@@ -8120,25 +8122,44 @@ def main():
         # PANEL SEÇİCİ (parolasız)
         # --------------------------------------------------
         #
-        # st.radio'nun kendi key'i ("panel_selector") session_state'te
-        # tutulur; başlangıç değeri yukarıda "?panel=..." query
-        # param'ından set edilir. Seçim değişince (yalnızca o zaman --
-        # her render'da DEĞİL, aksi halde aynı render içinde URL yazan
-        # başka bir özellikle, ör. "🔗 Bağlantı Olarak Paylaş", çakışırdı)
-        # on_change ile URL'deki "panel" param'ı güncellenir; böylece
-        # başlığa tıklamak (sayfayı yeniden yükler) ya da F5 panelde
-        # kalır.
-        active_panel = st.radio(
-            "Panel",
-            options=PANEL_LABELS,
-            key="panel_selector",
-            on_change=_sync_panel_to_url,
-            help=(
-                "Kullanıcı Paneli yalnızca veri gözatma ve uçuş rotası "
-                "sekmelerini gösterir; Admin Paneli tüm sekmeleri ve "
-                "\"Gösterilecek run sayısı\" ayarını içerir. Parola "
-                "koruması yoktur."
-            ),
+        # Önceden küçük bir st.radio idi; göze çarpmıyor ve dashboard'a
+        # oranla ufak kalıyordu. Artık alttaki sekme navigasyonuyla aynı
+        # dilde, tam genişlikte iki buton olarak çizilir -- aktif panel
+        # "primary" (dolu/renkli), diğeri "secondary" (outline).
+        #
+        # Seçili panel session_state["panel_selector"]'de tutulur
+        # (başlangıç değeri main() başında "?panel=..." query param'ından
+        # set edilir). Panel YALNIZCA butona basılınca değişir (her
+        # render'da DEĞİL); o an _sync_panel_to_url() ile URL'deki
+        # "panel" param'ı güncellenir, böylece başlığa tıklamak (sayfayı
+        # yeniden yükler) ya da F5 panelde kalır. Aynı render içinde URL
+        # yazan başka bir özellikle (ör. "🔗 Bağlantı Olarak Paylaş")
+        # çakışmaması için sync yalnızca bu tıklama dalında yapılır.
+        st.markdown("#### 🗂️ Panel")
+
+        for panel_label in PANEL_LABELS:
+
+            is_active_panel = (
+                st.session_state["panel_selector"] == panel_label
+            )
+
+            if st.button(
+                panel_label,
+                key=f"panel_selector_btn_{panel_label}",
+                type="primary" if is_active_panel else "secondary",
+                use_container_width=True,
+            ) and not is_active_panel:
+                st.session_state["panel_selector"] = panel_label
+                _sync_panel_to_url()
+                # Yeni panelde görünmeyen aktif sekme aşağıda ilk görünür
+                # sekmeye sabitlenir; kaydırmayı da en üste al.
+                st.session_state["_scroll_reset_pending"] = True
+                st.rerun()
+
+        active_panel = st.session_state["panel_selector"]
+
+        st.caption(
+            "Kullanıcı Paneli: sade görünüm · Admin Paneli: tüm sekmeler"
         )
 
         is_admin_panel = active_panel == PANEL_ADMIN

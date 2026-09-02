@@ -32,7 +32,7 @@ from collections import defaultdict
 import ollama
 
 
-MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:1.7b")
+MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:4b")
 SON_ISLEM = True
 
 
