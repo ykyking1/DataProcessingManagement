@@ -935,7 +935,7 @@ RANGE_FILTER_OPERATOR = "between"
 # ============================================================
 #
 # "🤖 Doğal Dil ile Filtrele" kutusuna yazılan Türkçe sorgu, yerelde
-# çalışan Ollama üzerinden qwen3:1.7b modeline gönderilir (bkz.
+# çalışan Ollama üzerinden qwen3.5:4b modeline gönderilir (bkz.
 # qwen_benchmark.py -- SYSTEM_PROMPT, sorgula(), son_islem()). Modelin
 # döndürdüğü {"filtreler": [...], "mantik": ..., "zaman_araligi": ...}
 # JSON'u burada, panonun TÜM elle doldurulan bölümlerinin karşılık
@@ -1482,7 +1482,7 @@ def llm_zaman_araligini_coz(ifade: str, referans: datetime):
 # SINIF (class) VE UÇUŞ (flight_id) EŞLEŞTİRME
 # ------------------------------------------------------------
 #
-# Bu ikisi, qwen3:1.7b'nin önceden BİLEMEYECEĞİ, veri setine özgü
+# Bu ikisi, qwen3.5:4b'nin önceden BİLEMEYECEĞİ, veri setine özgü
 # kapalı kelime listeleridir (class değerleri AU-AIR etiketleridir,
 # flight_id'ler ingestion sırasında dosya adından türetilir -- bkz.
 # ingestion.py). Modele bunları "tahmin ettirmek" yerine, sorgu
@@ -5276,7 +5276,7 @@ def render_data_export():
 
         st.caption(
             "Filtreleri elle kurmak yerine aradığınızı Türkçe yazın; "
-            "yerelde çalışan Qwen3:1.7B modeli sorguyu ayrıştırıp "
+            "yerelde çalışan Qwen3.5:4B modeli sorguyu ayrıştırıp "
             "aşağıdaki bölümleri sizin yerinize doldurur: zaman "
             "aralığı, günün saati, uçuş süresi, class ve uçuş seçimi, "
             "değer bazlı filtreler. Uygulandığında, önceki değer "

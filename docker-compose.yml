@@ -153,7 +153,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:1.7b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:4b}
       # "DVC / Veri Sürümleri" sekmesi MinIO'daki pipeline-artifacts
       # (kalite raporları) ve dvc-cache (DVC uzak deposu) bucket'larını,
       # "🚨 Alertler" sekmesi ise pipeline-alerts bucket'ındaki JSON

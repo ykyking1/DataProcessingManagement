@@ -1,5 +1,7 @@
 """
-Qwen3:1.7B telemetri sorgu ayristirma - v6
+Qwen3.5:4B telemetri sorgu ayristirma - v6
+(varsayilan model qwen3.5:4b; asagidaki v5/v6 notlari 1.7B ile yapilan
+olcumlere aittir)
 
 v5'in dersi: prompt uzadikca ILGISIZ kategoriler bozuluyor.
 operator_netlik, o kategoriye dair hicbir sey degistirilmedigi halde
