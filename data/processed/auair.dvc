@@ -1,6 +1,6 @@
 outs:
-- md5: b3bc3abcc2a2493a02f997cb12770dcd.dir
-  size: 4493021362
-  nfiles: 167
+- md5: acbb8d8f1cb5a065b80c1edc437ef3bf.dir
+  size: 343134367
+  nfiles: 11
   hash: md5
   path: auair

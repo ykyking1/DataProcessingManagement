@@ -141,6 +141,21 @@ services:
       clickhouse:
         condition: service_healthy
 
+  # Dashboard'un kullandigi yerel LLM servisi. Model agirliklari image'in
+  # icine gomulmez; offline ortama ayrica tasinabilen kalici volume'da tutulur.
+  ollama:
+    image: ollama/ollama:0.33.2
+    container_name: dpm-ollama
+    restart: unless-stopped
+    volumes:
+      - dpm_ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   dashboard:
     build:
       context: ./dashboard
@@ -164,7 +179,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DATABASE:-postgres}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-HalukPG123!}
-      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:4b}
       # "DVC / Veri Sürümleri" sekmesi MinIO'daki pipeline-artifacts
       # (kalite raporları) ve dvc-cache (DVC uzak deposu) bucket'larını,
@@ -189,6 +204,8 @@ services:
         condition: service_healthy
       dagster:
         condition: service_started
+      ollama:
+        condition: service_healthy
 
 volumes:
   dpm_minio_data:
@@ -201,3 +218,5 @@ volumes:
     name: dpm_dvc_cache
   dpm_dagster_home:
     name: dpm_dagster_home
+  dpm_ollama_data:
+    name: dpm_ollama_data

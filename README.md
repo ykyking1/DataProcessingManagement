@@ -74,12 +74,43 @@ geçirir:
 ```text
 data-raw/auair-tab/inbox
   → data-staged/auair-tab (.tab.zst)
-  → Spark preprocess (dinamik kolonlar korunur)
+  → Polars preprocess (dinamik kolonlar korunur)
   → Great Expectations validation raporu
   → ClickHouse s3() bulk load (auair_telemetry, run bazlı pending kayıtlar)
   → DVC add + MinIO DVC remote push
   → Run SUCCESS: auair_telemetry_committed view'ında görünürlük
 ```
+
+## Offline yerel LLM (Ollama)
+
+Dashboard'un doğal dil filtresi, Compose içindeki ayrı `ollama` servisine
+`http://ollama:11434` adresinden bağlanır. Kullanılan model
+`qwen3.5:4b`'dir. Model ağırlıkları uygulama image'ına gömülmez;
+`dpm_ollama_data` adlı kalıcı Docker volume'unda tutulur.
+
+İnternet erişimi olan hazırlık makinesinde image'ı indirip volume'u modelle
+doldurmak için:
+
+```sh
+docker compose pull ollama
+docker compose up -d ollama
+docker compose exec ollama ollama pull qwen3.5:4b
+docker compose exec ollama ollama show qwen3.5:4b
+```
+
+Offline ortama geçerken `ollama/ollama:0.33.2` image'ı `docker save` /
+`docker load` ile, `dpm_ollama_data` volume'unun içeriği ise ayrı bir arşiv
+olarak taşınmalıdır. Yalnızca Docker image'ını taşımak modeli taşımaz. Volume
+geri yüklendikten sonra internet bağlantısı olmadan tüm servisler normal şekilde
+başlatılabilir:
+
+```sh
+docker compose up -d
+docker compose exec ollama ollama show qwen3.5:4b
+```
+
+Model adı gerekirse `OLLAMA_MODEL` environment değişkeniyle değiştirilebilir;
+dashboard ve hazırlanan volume aynı model etiketini kullanmalıdır.
 
 Son iki adım sıralıdır: ClickHouse yazımı başarıyla tamamlanmadan DVC publish
 asset'i başlamaz. ClickHouse loader, 10K-50K kolonlu veriyi Yusuf'un yüksek
