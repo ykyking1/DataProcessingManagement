@@ -284,6 +284,19 @@ OBJ_CLASS_COLUMNS = {
 # DAGSTER GRAPHQL
 # ============================================================
 
+# Otomatik düzeltme (bkz. dagster/alerting.py) bir hatayı "re-execute from
+# failure" ile en fazla 3 kez yeniden çalıştırır; her deneme AYRI bir Dagster
+# run'ıdır ve aşağıdaki tag'leri taşır. "Pipeline Metrikleri" sekmesi bu
+# denemeleri kök run başına TEK bir satıra indirger (bkz.
+# _collapse_auto_fix_runs).
+AUTO_FIX_ATTEMPT_TAG = "auto_fix_attempt"
+AUTO_FIX_ROOT_RUN_TAG = "auto_fix_root_run_id"
+
+# ``start`` alanı tz-aware (UTC) ya da None olabilir; sıralamada None yerine
+# kullanılacak sentinel de tz-aware olmalı (naive/aware karşılaştırması
+# TypeError verir).
+_MIN_AWARE_DT = datetime.min.replace(tzinfo=timezone.utc)
+
 RUNS_QUERY = """
 query RecentRuns($limit: Int!) {
   runsOrError(limit: $limit) {
@@ -296,6 +309,10 @@ query RecentRuns($limit: Int!) {
         status
         startTime
         endTime
+        tags {
+          key
+          value
+        }
       }
     }
 
@@ -2532,6 +2549,11 @@ def fetch_runs(
                 end - start
             ).total_seconds()
 
+        tags = {
+            tag["key"]: tag["value"]
+            for tag in (run.get("tags") or [])
+        }
+
         rows.append(
             {
                 "run_id": run["runId"],
@@ -2544,10 +2566,144 @@ def fetch_runs(
                     if duration is not None
                     else None
                 ),
+                "auto_fix_root_run_id": tags.get(
+                    AUTO_FIX_ROOT_RUN_TAG
+                ),
+                "auto_fix_attempt": tags.get(
+                    AUTO_FIX_ATTEMPT_TAG
+                ),
             }
         )
 
-    return pd.DataFrame(rows)
+    return _collapse_auto_fix_runs(rows)
+
+
+def _collapse_auto_fix_runs(
+    rows: list,
+) -> pd.DataFrame:
+    """Otomatik düzeltme denemelerini kök run başına tek satıra indir.
+
+    Bir hata alındığında ``alerting.py`` aynı run'ı "re-execute from failure"
+    ile en fazla 3 kez yeniden çalıştırır. Her deneme ayrı bir Dagster
+    run'ıdır, dolayısıyla ham liste tek bir mantıksal çalışma için 3 satır
+    içerir. Burada bu denemeler ``auto_fix_root_run_id`` tag'ine (yoksa
+    run'ın kendi id'sine) göre gruplanır ve grup başına TEK bir satır
+    döndürülür:
+
+    * ``run_id`` / ``job`` / ``start`` -> kök (ilk) çalışmadan,
+    * ``status``  -> herhangi bir deneme başarılıysa ``SUCCESS``, aksi
+      halde en son denemenin durumu,
+    * ``end``     -> zincirdeki en geç bitiş,
+    * ``duration_sn`` -> kök başlangıçtan son bitişe kadar geçen süre.
+
+    Kök çalışma getirilen pencerede yoksa gruplama yine paylaşılan
+    ``auto_fix_root_run_id`` değeriyle yapılır ve mevcut en erken deneme
+    kök satır olarak kullanılır.
+    """
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "job",
+                "status",
+                "start",
+                "end",
+                "duration_sn",
+                "auto_fix_root_run_id",
+                "auto_fix_attempt",
+            ]
+        )
+
+    by_id = {
+        row["run_id"]: row
+        for row in rows
+    }
+
+    groups = {}
+
+    for row in rows:
+
+        # Denemeler paylaşılan auto_fix_root_run_id ile gruplanır; kök
+        # çalışmanın kendisinde bu tag yoktur, kendi id'siyle anahtarlanır.
+        root_id = (
+            row.get("auto_fix_root_run_id")
+            or row["run_id"]
+        )
+
+        groups.setdefault(
+            root_id,
+            [],
+        ).append(row)
+
+    def _sort_key(row):
+        # Kök çalışmanın deneme numarası yoktur -> en başa.
+        attempt = row.get("auto_fix_attempt")
+        try:
+            attempt_no = int(attempt)
+        except (TypeError, ValueError):
+            attempt_no = -1
+        return (
+            attempt_no,
+            row["start"] or _MIN_AWARE_DT,
+        )
+
+    collapsed = []
+
+    for root_id, members in groups.items():
+
+        # Tek çalışma (otomatik düzeltme yok) -> olduğu gibi geç.
+        if len(members) == 1:
+            collapsed.append(members[0])
+            continue
+
+        ordered = sorted(
+            members,
+            key=_sort_key,
+        )
+
+        base = dict(by_id.get(root_id, ordered[0]))
+        last = ordered[-1]
+
+        succeeded = any(
+            member["status"] == "SUCCESS"
+            for member in members
+        )
+
+        base["status"] = (
+            "SUCCESS"
+            if succeeded
+            else last["status"]
+        )
+
+        ends = [
+            member["end"]
+            for member in members
+            if member["end"] is not None
+        ]
+        base["end"] = max(ends) if ends else None
+
+        if base["start"] and base["end"]:
+            base["duration_sn"] = round(
+                (
+                    base["end"] - base["start"]
+                ).total_seconds(),
+                1,
+            )
+        else:
+            base["duration_sn"] = None
+
+        base["auto_fix_root_run_id"] = None
+        base["auto_fix_attempt"] = None
+
+        collapsed.append(base)
+
+    collapsed.sort(
+        key=lambda row: row["start"] or _MIN_AWARE_DT,
+        reverse=True,
+    )
+
+    return pd.DataFrame(collapsed)
 
 
 # ============================================================
