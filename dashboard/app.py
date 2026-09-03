@@ -732,6 +732,44 @@ def quote_clickhouse_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
 
 
+# CLICKHOUSE_COLUMN_ALIASES'ın tersi: tablodaki gerçek (ör. yanlış yazılmış)
+# kolon adından, dashboard'ın kullandığı mantıksal ada. Böylece şemadan gelen
+# "longtitude" gibi bir ad, kullanıcıya ve filtre eşleştirmesine "longitude"
+# olarak sunulur.
+CLICKHOUSE_PHYSICAL_TO_LOGICAL = {
+    physical: logical
+    for logical, physicals in CLICKHOUSE_COLUMN_ALIASES.items()
+    for physical in physicals
+}
+
+
+def to_logical_column(physical_name: str) -> str:
+    """ClickHouse'taki gerçek kolon adını mantıksal dashboard adına çevirir."""
+
+    return CLICKHOUSE_PHYSICAL_TO_LOGICAL.get(physical_name, physical_name)
+
+
+def get_available_columns_logical() -> list:
+    """
+    get_available_columns()'ı mantıksal adlara çevirip döner (ör. şemadaki
+    "longtitude" -> "longitude"). Kullanıcıya kolon listesi gösteren ya da
+    sorgu metnini kolon adıyla eşleştiren yerler bunu kullanmalı; SQL
+    üretimi (resolve_clickhouse_column / _build_select_projection) ise
+    fiziksel adı gerektirdiği için ham get_available_columns()'ı kullanır.
+    """
+
+    logical = []
+
+    for column in get_available_columns():
+
+        mapped = to_logical_column(column)
+
+        if mapped not in logical:
+            logical.append(mapped)
+
+    return logical
+
+
 # ============================================================
 # SAYISAL KOLONLAR (değer bazlı satır filtresi için)
 # ============================================================
@@ -772,13 +810,20 @@ def get_numeric_columns() -> list:
 
         return type_name
 
-    numeric_cols = [
-        row["kolon"]
-        for _, row in schema.iterrows()
-        if _unwrap_nullable(str(row["tip"])).startswith(
+    # Şemadaki gerçek adlar mantıksal adlara çevrilir (ör. "longtitude"
+    # -> "longitude"); build_clickhouse_where / _build_select_projection
+    # bu mantıksal adı resolve_clickhouse_column ile tekrar fiziksel ada
+    # çözer. Aynı mantıksal ada düşen iki kolon olursa (ör. hem doğru hem
+    # yanlış yazım) sıra korunarak tekilleştirilir.
+    numeric_cols = []
+    for _, row in schema.iterrows():
+        if not _unwrap_nullable(str(row["tip"])).startswith(
             NUMERIC_TYPE_HINTS
-        )
-    ]
+        ):
+            continue
+        logical = to_logical_column(row["kolon"])
+        if logical not in numeric_cols:
+            numeric_cols.append(logical)
 
     return numeric_cols
 
@@ -6116,8 +6161,11 @@ def render_data_export():
                                 ):
 
                                     try:
+                                        # Mantıksal adlar -- "boylam" gibi
+                                        # eş anlamlılar şemadaki "longtitude"
+                                        # yerine "longitude" ile eşleşsin.
                                         mevcut_kolonlar = (
-                                            get_available_columns()
+                                            get_available_columns_logical()
                                         )
                                     except Exception:
                                         mevcut_kolonlar = []
@@ -7100,14 +7148,18 @@ def render_data_export():
                     or vf["operator"] == RANGE_FILTER_OPERATOR
                 )
 
+                # Eski paylaşılan URL'ler kolonu şemadaki gerçek adıyla
+                # (ör. "longtitude") taşıyor olabilir; mantıksal ada çevrilir.
+                vf_column = to_logical_column(vf["column"])
+
                 if (
-                    vf["column"] in numeric_columns
-                    or vf["column"] in COMPUTED_VALUE_COLUMNS
+                    vf_column in numeric_columns
+                    or vf_column in COMPUTED_VALUE_COLUMNS
                 ) and valid_operator:
 
                     restored_filter_row = {
                         "id": index,
-                        "column": vf["column"],
+                        "column": vf_column,
                         "operator": vf["operator"],
                         "value": vf["value"],
                         "exclude": bool(vf.get("exclude", False)),
@@ -7320,8 +7372,11 @@ def render_data_export():
         expanded=False,
     ):
 
+        # Mantıksal adlar gösterilir (ör. şemadaki "longtitude" yerine
+        # "longitude"); _build_select_projection bu adları tekrar fiziksel
+        # ClickHouse adına çözüp `AS` ile mantıksal ada geri bağlar.
         available_columns = (
-            get_available_columns()
+            get_available_columns_logical()
         )
 
         default_columns = [
@@ -7335,9 +7390,13 @@ def render_data_export():
             and "selected_columns" in pending_url_state
         ):
             st.session_state["export_selected_columns"] = [
-                col
-                for col in pending_url_state["selected_columns"]
-                if col in available_columns
+                logical_col
+                for logical_col in (
+                    # eski paylaşılan URL'ler fiziksel adı taşıyor olabilir
+                    to_logical_column(col)
+                    for col in pending_url_state["selected_columns"]
+                )
+                if logical_col in available_columns
             ]
 
         if (
