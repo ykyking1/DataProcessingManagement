@@ -90,6 +90,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
+import altair as alt
 import clickhouse_connect
 import folium
 import pandas as pd
@@ -289,6 +290,19 @@ OBJ_CLASS_COLUMNS = {
 # DAGSTER GRAPHQL
 # ============================================================
 
+# Otomatik düzeltme (bkz. dagster/alerting.py) bir hatayı "re-execute from
+# failure" ile en fazla 3 kez yeniden çalıştırır; her deneme AYRI bir Dagster
+# run'ıdır ve aşağıdaki tag'leri taşır. "Pipeline Metrikleri" sekmesi bu
+# denemeleri kök run başına TEK bir satıra indirger (bkz.
+# _collapse_auto_fix_runs).
+AUTO_FIX_ATTEMPT_TAG = "auto_fix_attempt"
+AUTO_FIX_ROOT_RUN_TAG = "auto_fix_root_run_id"
+
+# ``start`` alanı tz-aware (UTC) ya da None olabilir; sıralamada None yerine
+# kullanılacak sentinel de tz-aware olmalı (naive/aware karşılaştırması
+# TypeError verir).
+_MIN_AWARE_DT = datetime.min.replace(tzinfo=timezone.utc)
+
 RUNS_QUERY = """
 query RecentRuns($limit: Int!) {
   runsOrError(limit: $limit) {
@@ -301,6 +315,10 @@ query RecentRuns($limit: Int!) {
         status
         startTime
         endTime
+        tags {
+          key
+          value
+        }
       }
     }
 
@@ -1115,8 +1133,8 @@ def llm_gun_ici_saat_filtresini_ayikla(filtreler: list):
                 saatler = [int(deger)]
 
             elif operator in (">", ">="):
-                alt = int(deger) if operator == ">=" else int(deger) + 1
-                saatler = list(range(max(alt, 0), 24))
+                alt_sinir = int(deger) if operator == ">=" else int(deger) + 1
+                saatler = list(range(max(alt_sinir, 0), 24))
 
             elif operator in ("<", "<="):
                 ust = int(deger) if operator == "<=" else int(deger) - 1
@@ -2537,6 +2555,11 @@ def fetch_runs(
                 end - start
             ).total_seconds()
 
+        tags = {
+            tag["key"]: tag["value"]
+            for tag in (run.get("tags") or [])
+        }
+
         rows.append(
             {
                 "run_id": run["runId"],
@@ -2549,10 +2572,144 @@ def fetch_runs(
                     if duration is not None
                     else None
                 ),
+                "auto_fix_root_run_id": tags.get(
+                    AUTO_FIX_ROOT_RUN_TAG
+                ),
+                "auto_fix_attempt": tags.get(
+                    AUTO_FIX_ATTEMPT_TAG
+                ),
             }
         )
 
-    return pd.DataFrame(rows)
+    return _collapse_auto_fix_runs(rows)
+
+
+def _collapse_auto_fix_runs(
+    rows: list,
+) -> pd.DataFrame:
+    """Otomatik düzeltme denemelerini kök run başına tek satıra indir.
+
+    Bir hata alındığında ``alerting.py`` aynı run'ı "re-execute from failure"
+    ile en fazla 3 kez yeniden çalıştırır. Her deneme ayrı bir Dagster
+    run'ıdır, dolayısıyla ham liste tek bir mantıksal çalışma için 3 satır
+    içerir. Burada bu denemeler ``auto_fix_root_run_id`` tag'ine (yoksa
+    run'ın kendi id'sine) göre gruplanır ve grup başına TEK bir satır
+    döndürülür:
+
+    * ``run_id`` / ``job`` / ``start`` -> kök (ilk) çalışmadan,
+    * ``status``  -> herhangi bir deneme başarılıysa ``SUCCESS``, aksi
+      halde en son denemenin durumu,
+    * ``end``     -> zincirdeki en geç bitiş,
+    * ``duration_sn`` -> kök başlangıçtan son bitişe kadar geçen süre.
+
+    Kök çalışma getirilen pencerede yoksa gruplama yine paylaşılan
+    ``auto_fix_root_run_id`` değeriyle yapılır ve mevcut en erken deneme
+    kök satır olarak kullanılır.
+    """
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "job",
+                "status",
+                "start",
+                "end",
+                "duration_sn",
+                "auto_fix_root_run_id",
+                "auto_fix_attempt",
+            ]
+        )
+
+    by_id = {
+        row["run_id"]: row
+        for row in rows
+    }
+
+    groups = {}
+
+    for row in rows:
+
+        # Denemeler paylaşılan auto_fix_root_run_id ile gruplanır; kök
+        # çalışmanın kendisinde bu tag yoktur, kendi id'siyle anahtarlanır.
+        root_id = (
+            row.get("auto_fix_root_run_id")
+            or row["run_id"]
+        )
+
+        groups.setdefault(
+            root_id,
+            [],
+        ).append(row)
+
+    def _sort_key(row):
+        # Kök çalışmanın deneme numarası yoktur -> en başa.
+        attempt = row.get("auto_fix_attempt")
+        try:
+            attempt_no = int(attempt)
+        except (TypeError, ValueError):
+            attempt_no = -1
+        return (
+            attempt_no,
+            row["start"] or _MIN_AWARE_DT,
+        )
+
+    collapsed = []
+
+    for root_id, members in groups.items():
+
+        # Tek çalışma (otomatik düzeltme yok) -> olduğu gibi geç.
+        if len(members) == 1:
+            collapsed.append(members[0])
+            continue
+
+        ordered = sorted(
+            members,
+            key=_sort_key,
+        )
+
+        base = dict(by_id.get(root_id, ordered[0]))
+        last = ordered[-1]
+
+        succeeded = any(
+            member["status"] == "SUCCESS"
+            for member in members
+        )
+
+        base["status"] = (
+            "SUCCESS"
+            if succeeded
+            else last["status"]
+        )
+
+        ends = [
+            member["end"]
+            for member in members
+            if member["end"] is not None
+        ]
+        base["end"] = max(ends) if ends else None
+
+        if base["start"] and base["end"]:
+            base["duration_sn"] = round(
+                (
+                    base["end"] - base["start"]
+                ).total_seconds(),
+                1,
+            )
+        else:
+            base["duration_sn"] = None
+
+        base["auto_fix_root_run_id"] = None
+        base["auto_fix_attempt"] = None
+
+        collapsed.append(base)
+
+    collapsed.sort(
+        key=lambda row: row["start"] or _MIN_AWARE_DT,
+        reverse=True,
+    )
+
+    return pd.DataFrame(collapsed)
 
 
 # ============================================================
@@ -3082,6 +3239,60 @@ def render_metadata_history() -> None:
         hide_index=True,
     )
 
+    # --------------------------------------------------------------
+    # İndirme -- gösterilen sonuç kümesi (filtre uygulanmışsa
+    # yalnızca ona uyan kayıtlar). CSV özet tabloyu, JSON ise her
+    # kaydın ham metadata'sını da içeren tam halini verir.
+    # --------------------------------------------------------------
+
+    csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
+
+    json_records = []
+    for _, row in history_df.iterrows():
+        json_records.append(
+            {
+                "asset_key": row["asset_key"],
+                "group_name": row["group_name"],
+                "partition_date": str(row["partition_date"]),
+                "flight_ids": row["_flight_ids"],
+                "row_count": row["row_count"],
+                "materialized_at": str(row["materialized_at"]),
+                "run_id": row["run_id"],
+                "metadata": row["metadata"] or {},
+            }
+        )
+
+    json_bytes = json.dumps(
+        json_records,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    ).encode("utf-8")
+
+    ts_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    dl_col1, dl_col2 = st.columns(2)
+
+    with dl_col1:
+        st.download_button(
+            "📥 CSV indir (özet tablo)",
+            data=csv_bytes,
+            file_name=f"metadata_gecmisi_{ts_suffix}.csv",
+            mime="text/csv",
+            key="metadata_history_download_csv",
+            use_container_width=True,
+        )
+
+    with dl_col2:
+        st.download_button(
+            "📥 JSON indir (ham metadata dahil)",
+            data=json_bytes,
+            file_name=f"metadata_gecmisi_{ts_suffix}.json",
+            mime="application/json",
+            key="metadata_history_download_json",
+            use_container_width=True,
+        )
+
     st.caption(
         "Detay için bir satırı aşağıdan genişletin:"
     )
@@ -3590,6 +3801,362 @@ def notify_new_alerts(alerts_df: pd.DataFrame) -> None:
 
 
 # ===========================================================================
+# ALERT ANALİTİĞİ (grafikler)
+# ===========================================================================
+#
+# Alert kayıtlarını (FAILURE + RESOLVED) grafikleştirir: en çok hangi
+# adım/asset'te hata çıkmış, hatalar nasıl çözülmüş (otomatik / elle),
+# hangileri hâlâ açık ve en sık görülen hata mesajları. Buraya gelen df
+# yalnızca ZAMAN filtresine tabidir; "sadece aktif hatalar" toggle'ı
+# UYGULANMAZ, aksi halde çözülmüş alertler hiç görünmez ve "nasıl
+# çözüldü" analizi anlamsız olurdu.
+
+_ALERT_RESOLUTION_ORDER = [
+    "Açık hata",
+    "Otomatik düzeltme sürüyor",
+    "Çözülemedi (denemeler tükendi)",
+    "Otomatik çözüldü",
+    "Elle çözüldü",
+    "Çözüldü",
+]
+
+_ALERT_RESOLVED_LABELS = {"Otomatik çözüldü", "Elle çözüldü", "Çözüldü"}
+
+# Grafiklerde çözüm durumu -> renk. Kırmızı tonları = hâlâ dert;
+# yeşil/mavi = kapanmış. Hem "En çok hata alan adımlar" hem de "Çözüm
+# durumu dağılımı" aynı paleti kullanır ki renkler iki grafikte tutarlı
+# okunsun.
+_ALERT_STATUS_COLORS = {
+    "Açık hata": "#e4572e",
+    "Otomatik düzeltme sürüyor": "#f2a541",
+    "Çözülemedi (denemeler tükendi)": "#8b2635",
+    "Otomatik çözüldü": "#3a9d5d",
+    "Elle çözüldü": "#8fce8f",
+    "Çözüldü": "#4c78a8",
+}
+
+
+def _alert_status_color_scale(present_labels) -> "alt.Scale":
+    """Yalnızca grafikte GERÇEKTEN bulunan durumlar için, sabit sıralı
+    (kötüden iyiye) bir renk skalası döndürür."""
+
+    present = set(present_labels)
+    domain = [s for s in _ALERT_RESOLUTION_ORDER if s in present]
+    return alt.Scale(
+        domain=domain,
+        range=[_ALERT_STATUS_COLORS[s] for s in domain],
+    )
+
+
+def _classify_alert_resolution(row: pd.Series) -> str:
+    """Bir alert satırını tek bir 'çözüm durumu' etiketine indirger.
+
+    Mantık, render_alerts içindeki "Otomatik düzeltme durumu" bloğuyla
+    aynıdır (dagster/alerting.py::alert_on_failure'ın alerts.json'a
+    yazdığı alanlar): status + auto_fix_* işaretleri.
+    """
+
+    status = str(row.get("status", "FAILURE") or "FAILURE").upper()
+
+    resolved_attempt = row.get("auto_fix_resolved_attempt")
+    exhausted = row.get("auto_fix_exhausted")
+    current_attempt = row.get("auto_fix_current_attempt")
+
+    has_resolved_attempt = (
+        resolved_attempt is not None and not pd.isna(resolved_attempt)
+    )
+    is_exhausted = (
+        exhausted is not None
+        and not pd.isna(exhausted)
+        and bool(exhausted)
+    )
+    has_current_attempt = (
+        current_attempt is not None and not pd.isna(current_attempt)
+    )
+
+    if status == "RESOLVED":
+        if has_resolved_attempt:
+            return "Otomatik çözüldü"
+        if is_exhausted:
+            return "Elle çözüldü"
+        return "Çözüldü"
+
+    # status == FAILURE -> hâlâ açık
+    if is_exhausted:
+        return "Çözülemedi (denemeler tükendi)"
+    if has_current_attempt:
+        return "Otomatik düzeltme sürüyor"
+    return "Açık hata"
+
+
+def render_alert_analytics(
+    alerts_df: pd.DataFrame,
+    time_filter: str,
+) -> None:
+
+    st.subheader("📊 Hata Analizi")
+
+    st.caption(
+        "Bu bölüm, seçilen zaman aralığındaki TÜM alertleri (açık + "
+        "çözülmüş) kapsar — üstteki *sadece aktif hatalar* anahtarından "
+        "etkilenmez."
+    )
+
+    if alerts_df is None or alerts_df.empty:
+        st.info(
+            f"Seçilen zaman aralığında (**{time_filter}**) grafikleştirilecek "
+            "alert kaydı yok."
+        )
+        return
+
+    d = alerts_df.copy()
+
+    for col in (
+        "status",
+        "step_name",
+        "job_name",
+        "error",
+        "auto_fix_resolved_attempt",
+        "auto_fix_exhausted",
+        "auto_fix_current_attempt",
+    ):
+        if col not in d.columns:
+            d[col] = pd.NA
+
+    d["step_name"] = (
+        d["step_name"].fillna("bilinmiyor").replace("", "bilinmiyor")
+    )
+    d["job_name"] = (
+        d["job_name"].fillna("bilinmiyor").replace("", "bilinmiyor")
+    )
+    d["Çözüm durumu"] = d.apply(_classify_alert_resolution, axis=1)
+    d["_resolved"] = d["Çözüm durumu"].isin(_ALERT_RESOLVED_LABELS)
+
+    # ---- KPI'lar --------------------------------------------------------
+    total = len(d)
+    resolved = int(d["_resolved"].sum())
+    unresolved = total - resolved
+    auto_resolved = int((d["Çözüm durumu"] == "Otomatik çözüldü").sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Toplam hata", f"{total:,}")
+    k2.metric("Çözülen", f"{resolved:,}")
+    k3.metric("Çözülemeyen / açık", f"{unresolved:,}")
+    k4.metric(
+        "Otomatik çözüm oranı",
+        f"%{(auto_resolved / total * 100):.0f}" if total else "—",
+    )
+
+    st.divider()
+
+    _sira_map = {
+        label: i for i, label in enumerate(_ALERT_RESOLUTION_ORDER)
+    }
+
+    # ---- En çok hata alan adımlar (asset/step) ------------------------
+    with st.container(border=True):
+
+        st.markdown("**En çok hata alan adımlar (asset / step)**")
+        st.caption(
+            "Çubuk uzunluğu toplam hata sayısı; renkler o adımdaki "
+            "hataların ne kadarının çözüldüğünü gösterir. Üzerine "
+            "gelince kırılımı görebilirsiniz."
+        )
+
+        step_status = (
+            d.groupby(["step_name", "Çözüm durumu"])
+            .size()
+            .reset_index(name="Hata sayısı")
+        )
+        step_totals = (
+            d.groupby("step_name").size().sort_values(ascending=False)
+        )
+        top_steps = step_totals.head(12).index.tolist()
+        step_status_top = step_status[
+            step_status["step_name"].isin(top_steps)
+        ].copy()
+        step_status_top["_sira"] = step_status_top["Çözüm durumu"].map(
+            _sira_map
+        )
+
+        totals_top = (
+            step_totals.loc[top_steps]
+            .rename_axis("step_name")
+            .reset_index(name="Toplam")
+        )
+
+        y_enc = alt.Y(
+            "step_name:N",
+            sort=top_steps,
+            title=None,
+            axis=alt.Axis(labelLimit=280),
+        )
+
+        step_bars = (
+            alt.Chart(step_status_top)
+            .mark_bar(cornerRadiusEnd=3)
+            .encode(
+                y=y_enc,
+                x=alt.X(
+                    "Hata sayısı:Q",
+                    title="Hata sayısı",
+                    axis=alt.Axis(format="d", tickMinStep=1),
+                ),
+                color=alt.Color(
+                    "Çözüm durumu:N",
+                    scale=_alert_status_color_scale(
+                        step_status_top["Çözüm durumu"]
+                    ),
+                    legend=alt.Legend(
+                        title=None,
+                        orient="bottom",
+                        columns=3,
+                        labelLimit=220,
+                    ),
+                ),
+                order=alt.Order("_sira:Q"),
+                tooltip=[
+                    alt.Tooltip("step_name:N", title="Adım"),
+                    alt.Tooltip("Çözüm durumu:N", title="Durum"),
+                    alt.Tooltip("Hata sayısı:Q", title="Adet", format="d"),
+                ],
+            )
+        )
+
+        step_labels = (
+            alt.Chart(totals_top)
+            .mark_text(align="left", dx=4, color="#8a8a8a", fontSize=11)
+            .encode(
+                y=alt.Y("step_name:N", sort=top_steps),
+                x=alt.X("Toplam:Q"),
+                text=alt.Text("Toplam:Q", format="d"),
+            )
+        )
+
+        st.altair_chart(
+            (step_bars + step_labels).properties(
+                height=max(140, 34 * len(top_steps))
+            ),
+            use_container_width=True,
+        )
+
+    # ---- Çözüm durumu dağılımı --------------------------------------
+    with st.container(border=True):
+
+        st.markdown("**Çözüm durumu dağılımı**")
+        st.caption("Tüm hataların çözüm durumuna göre dökümü.")
+
+        res_counts = (
+            d["Çözüm durumu"]
+            .value_counts()
+            .reindex(_ALERT_RESOLUTION_ORDER)
+            .dropna()
+            .astype(int)
+            .reset_index()
+        )
+        res_counts.columns = ["Çözüm durumu", "Adet"]
+        res_counts["Oran"] = res_counts["Adet"] / total * 100
+        res_counts["Etiket"] = res_counts.apply(
+            lambda r: f"{r['Adet']}  (%{r['Oran']:.0f})", axis=1
+        )
+
+        res_base = alt.Chart(res_counts).encode(
+            y=alt.Y(
+                "Çözüm durumu:N",
+                sort=_ALERT_RESOLUTION_ORDER,
+                title=None,
+                axis=alt.Axis(labelLimit=240),
+            ),
+            x=alt.X(
+                "Adet:Q",
+                title="Adet",
+                axis=alt.Axis(format="d", tickMinStep=1),
+            ),
+        )
+
+        res_bars = res_base.mark_bar(cornerRadiusEnd=3).encode(
+            color=alt.Color(
+                "Çözüm durumu:N",
+                scale=_alert_status_color_scale(res_counts["Çözüm durumu"]),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("Çözüm durumu:N", title="Durum"),
+                alt.Tooltip("Adet:Q", format="d"),
+                alt.Tooltip("Oran:Q", title="Oran %", format=".0f"),
+            ],
+        )
+
+        res_labels = res_base.mark_text(
+            align="left", dx=4, color="#8a8a8a", fontSize=11
+        ).encode(text=alt.Text("Etiket:N"))
+
+        st.altair_chart(
+            (res_bars + res_labels).properties(
+                height=max(120, 40 * len(res_counts))
+            ),
+            use_container_width=True,
+        )
+
+    # ---- En sık görülen hata mesajları -----------------------------
+    with st.container(border=True):
+
+        st.markdown("**En sık görülen hata mesajları**")
+        st.caption("İlk satırına göre gruplanmış, en sık 15 mesaj.")
+
+        def _short_err(val: object) -> str:
+            text = str(val or "").strip()
+            if not text:
+                return "(boş)"
+            first_line = text.splitlines()[0]
+            return (
+                (first_line[:160] + "…")
+                if len(first_line) > 160
+                else first_line
+            )
+
+        err_summary = (
+            d.assign(**{"Hata mesajı": d["error"].map(_short_err)})
+            .groupby("Hata mesajı")
+            .agg(
+                Adet=("error", "size"),
+                Çözülen=("_resolved", "sum"),
+            )
+            .reset_index()
+            .sort_values("Adet", ascending=False)
+            .head(15)
+        )
+        err_summary["Çözülemeyen"] = (
+            err_summary["Adet"] - err_summary["Çözülen"]
+        )
+
+        err_max = int(err_summary["Adet"].max()) if not err_summary.empty else 1
+
+        st.dataframe(
+            err_summary[
+                ["Hata mesajı", "Adet", "Çözülen", "Çözülemeyen"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Hata mesajı": st.column_config.TextColumn(
+                    "Hata mesajı", width="large"
+                ),
+                "Adet": st.column_config.ProgressColumn(
+                    "Adet",
+                    format="%d",
+                    min_value=0,
+                    max_value=err_max,
+                ),
+                "Çözülen": st.column_config.NumberColumn("Çözülen ✅"),
+                "Çözülemeyen": st.column_config.NumberColumn(
+                    "Çözülemeyen ❌"
+                ),
+            },
+        )
+
+
+# ===========================================================================
 # ALERT DASHBOARD
 # ===========================================================================
 
@@ -3602,6 +4169,11 @@ def render_alerts(
     )
 
     alerts_df = load_alerts()
+
+    # "sadece aktif hatalar" toggle'ı aşağıda alerts_df'i FAILURE'lara
+    # daraltıyor; Hata Analizi grafiklerinin çözülmüş alertleri de
+    # görebilmesi için filtrelenmemiş halini burada saklıyoruz.
+    alerts_df_all = alerts_df
 
     # -----------------------------------------------------------------------
     # Filtreler (aktif hata + zaman aralığı)
@@ -3684,6 +4256,13 @@ def render_alerts(
 
         alerts_df_filtered = _filter_by_time(
             alerts_df,
+            "timestamp",
+        )
+
+        # Hata Analizi grafikleri için: zaman filtresi uygulanmış ama
+        # statü (FAILURE/RESOLVED) daraltması yapılmamış küme.
+        alerts_analytics_df = _filter_by_time(
+            alerts_df_all,
             "timestamp",
         )
 
@@ -4027,6 +4606,17 @@ def render_alerts(
         st.success(
             "🎉 Henüz kayıtlı veya aktif bir pipeline alert'i yok."
         )
+
+    # -----------------------------------------------------------------------
+    # Hata Analizi (grafikler) -- "Hata Detayı" listesinin altında
+    # -----------------------------------------------------------------------
+
+    st.divider()
+
+    render_alert_analytics(
+        alerts_analytics_df,
+        time_filter,
+    )
 
     # -----------------------------------------------------------------------
     # Başarısız Dagster run'ları
@@ -7911,18 +8501,30 @@ def render_dvc_artifacts() -> None:
             f"{artifacts_df['batch'].dropna().nunique():,}",
         )
 
+        artifacts_table = artifacts_df[
+            [
+                "nesne",
+                "dataset",
+                "batch",
+                "boyut",
+                "degisiklik",
+            ]
+        ]
+
         st.dataframe(
-            artifacts_df[
-                [
-                    "nesne",
-                    "dataset",
-                    "batch",
-                    "boyut",
-                    "degisiklik",
-                ]
-            ],
+            artifacts_table,
             use_container_width=True,
             hide_index=True,
+        )
+
+        st.download_button(
+            "📥 CSV indir (artefakt listesi)",
+            data=artifacts_table.to_csv(index=False).encode("utf-8-sig"),
+            file_name=(
+                f"dvc_artefaktlar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            ),
+            mime="text/csv",
+            key="dvc_artifacts_download_csv",
         )
 
         st.divider()
