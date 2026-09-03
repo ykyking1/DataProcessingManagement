@@ -25,6 +25,10 @@ try:
         DEFAULT_SPARK_MASTER,
     )
     from scripts.validate_tab_spark_ge import write_validation_report
+    from scripts.ge_data_docs import (
+        build_data_docs_bundle,
+        configure_data_docs_site,
+    )
 except ModuleNotFoundError:
     from preprocess_auair_tab_spark import (
         DEFAULT_TIMESTAMP_FORMAT,
@@ -39,6 +43,7 @@ except ModuleNotFoundError:
     )
     from preprocess_tab_spark import DEFAULT_MAX_COLUMNS, DEFAULT_SPARK_MASTER
     from validate_tab_spark_ge import write_validation_report
+    from ge_data_docs import build_data_docs_bundle, configure_data_docs_site
 
 
 CORE_COLUMNS = [
@@ -59,6 +64,7 @@ def validate_auair_dataframe(
     expected_column_count: int,
     result_format: str = "BASIC",
     report_path: Path | str | None = None,
+    data_docs_directory: Path | str | None = None,
 ) -> dict[str, Any]:
     """Run a deliberately small first-pass AU-AIR quality suite."""
 
@@ -135,6 +141,12 @@ def validate_auair_dataframe(
         )
 
     context = gx.get_context(mode="ephemeral")
+    resolved_data_docs_directory = None
+    if data_docs_directory is not None:
+        resolved_data_docs_directory = configure_data_docs_site(
+            context,
+            data_docs_directory,
+        )
     data_source = context.data_sources.add_spark(
         name="auair_processed_spark_source",
         force_reuse_spark_context=True,
@@ -162,6 +174,12 @@ def validate_auair_dataframe(
     )
 
     ge_result = validation_result.to_json_dict()
+    data_docs_bundle = None
+    if resolved_data_docs_directory is not None:
+        data_docs_bundle = build_data_docs_bundle(
+            context,
+            resolved_data_docs_directory,
+        )
     output: dict[str, Any] = {
         "success": bool(ge_result["success"]),
         "statistics": ge_result["statistics"],
@@ -169,6 +187,12 @@ def validate_auair_dataframe(
         "validated_columns": dataframe.columns,
         "result": ge_result,
     }
+    if data_docs_bundle is not None:
+        output["data_docs"] = {
+            "index_path": data_docs_bundle.index_path,
+            "validation_path": data_docs_bundle.validation_path,
+            "file_count": data_docs_bundle.file_count,
+        }
     written_report = write_validation_report(output, report_path)
     output["report_path"] = str(written_report)
     return output
@@ -180,6 +204,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", required=True)
     parser.add_argument("--report", required=True, type=Path)
+    parser.add_argument("--data-docs-dir", type=Path)
     parser.add_argument("--expected-row-count", required=True, type=int)
     parser.add_argument("--expected-column-count", required=True, type=int)
     parser.add_argument("--result-format", default="BASIC")
@@ -212,6 +237,7 @@ def main() -> None:
                 expected_column_count=args.expected_column_count,
                 result_format=args.result_format,
                 report_path=args.report,
+                data_docs_directory=args.data_docs_dir,
             )
         print(
             f"AU-AIR validation "

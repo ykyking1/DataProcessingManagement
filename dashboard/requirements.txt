@@ -9,4 +9,5 @@ folium==0.17.0
 streamlit-folium==0.23.1
 scipy==1.14.1
 minio==7.2.20
+beautifulsoup4==4.12.3
 ollama

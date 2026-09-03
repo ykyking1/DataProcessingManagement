@@ -103,6 +103,12 @@ from folium.plugins import Draw
 from jinja2 import Template
 from streamlit_folium import st_folium
 
+from data_docs_viewer import (
+    DataDocsReferenceError,
+    inline_data_docs_bundle,
+    validate_data_docs_html_key,
+)
+
 # MinIO istemcisi yalnızca "DVC / Veri Sürümleri" sekmesinde kullanılır.
 # Paket kurulu değilse (eski bir imaj / requirements) uygulamanın geri
 # kalanı çökmemeli -- bu yüzden import korumalı yapılır ve sekme, hata
@@ -540,8 +546,8 @@ def get_pipeline_artifacts_bucket() -> str:
 
 def get_validation_prefix() -> str:
     """
-    DVC sekmesinin listeleyeceği önek. Yalnızca kalite raporu JSON'ları
-    bu önekin altındadır (validation/<dataset>/<batch>/<etag>.json);
+    DVC sekmesinin listeleyeceği önek. Kalite raporu JSON'ları ve onların
+    Data Docs bundle'ları bu önekin altındadır;
     _clickhouse-ingest/... altındaki geçici zstd parçaları KAPSAM DIŞI.
     """
     prefix = os.environ.get(
@@ -7564,13 +7570,15 @@ def render_flight_map():
 #
 # Pipeline (dagster/assets.py) her doğrulanmış batch için Great
 # Expectations kalite raporunu MinIO'daki "pipeline-artifacts"
-# bucket'ına şu anahtarla JSON olarak yazar:
+# bucket'ına JSON ve tam Data Docs bundle'ı olarak yazar:
 #
 #     validation/<dataset_id>/<batch_id>/<source_etag[:12]>.json
+#     validation/<dataset_id>/<batch_id>/<source_etag[:12]>/...
 #
 # batch_id (ör. "1000_10000_flight_1_2019-08-29") aynı zamanda DVC'ye
-# publish edilen veri sürümünün kimliğidir. Bu sekme o JSON dosyalarını
-# MinIO üzerinden çekip listeler/gösterir; ayrıca DVC uzak deposundaki
+# publish edilen veri sürümünün kimliğidir. Bu sekme JSON dosyalarını
+# listeler; seçilen JSON'daki Data Docs anahtarını izleyip tam GX raporunu
+# MinIO üzerinden yeni sekmede gösterir. Ayrıca DVC uzak deposundaki
 # (dvc-cache) dizin manifestolarını (.dir) okuyup her sürümün hangi
 # dosyalardan oluştuğunu md5'leriyle birlikte gösterir.
 
@@ -7666,6 +7674,38 @@ def fetch_artifact_bytes(key: str, etag: str) -> bytes:
     finally:
         response.close()
         response.release_conn()
+
+
+def render_ge_data_docs_viewer(object_key: str, cache_buster: str) -> None:
+    """Fetch a private Data Docs page and its bundle assets from MinIO."""
+
+    st.markdown(
+        '<a href="?panel=admin" target="_self">← Dashboarda dön</a>',
+        unsafe_allow_html=True,
+    )
+    st.subheader("Great Expectations — Data Docs")
+
+    try:
+        html_key, bundle_prefix = validate_data_docs_html_key(
+            object_key,
+            validation_prefix=get_validation_prefix(),
+        )
+        html = fetch_artifact_bytes(html_key, cache_buster)
+        rendered_html = inline_data_docs_bundle(
+            html,
+            html_key=html_key,
+            bundle_prefix=bundle_prefix,
+            cache_buster=cache_buster,
+            fetch_object=lambda key: fetch_artifact_bytes(key, cache_buster),
+        )
+    except DataDocsReferenceError as exc:
+        st.error(f"Geçersiz Data Docs bağlantısı: {exc}")
+        return
+    except Exception as exc:
+        st.error(f"Data Docs raporu MinIO'dan okunamadı: {exc}")
+        return
+
+    components.html(rendered_html, height=1200, scrolling=True)
 
 
 @st.cache_data(ttl=60)
@@ -7816,8 +7856,9 @@ def render_dvc_artifacts() -> None:
 
     st.caption(
         "Pipeline'ın her doğrulanmış batch için MinIO'ya yazdığı kalite "
-        "raporu JSON'larını (`pipeline-artifacts/validation/<dataset>/"
-        "<batch>/<etag>.json`) ve DVC uzak deposundaki (`dvc-cache`) dizin "
+        "raporu JSON'larını ve tam GE Data Docs bundle'larını "
+        "(`pipeline-artifacts/validation/<dataset>/<batch>/<etag>...`) ile "
+        "DVC uzak deposundaki (`dvc-cache`) dizin "
         "manifestolarını gösterir. Her `batch` kimliği, DVC'ye publish "
         "edilen bir veri sürümüne karşılık gelir."
     )
@@ -7931,6 +7972,23 @@ def render_dvc_artifacts() -> None:
                     if _looks_like_ge_report(data):
                         _render_ge_report(data)
 
+                    data_docs = data.get("data_docs") if isinstance(data, dict) else None
+                    if isinstance(data_docs, dict) and data_docs.get(
+                        "validation_key"
+                    ):
+                        data_docs_query = urlencode(
+                            {
+                                "ge_data_docs": data_docs["validation_key"],
+                                "ge_docs_version": str(selected_row["etag"]),
+                            }
+                        )
+                        st.link_button(
+                            "📊 GE Data Docs raporunu yeni sekmede aç",
+                            f"?{data_docs_query}",
+                            type="primary",
+                            use_container_width=True,
+                        )
+
                     st.download_button(
                         "📥 JSON indir",
                         data=raw_bytes,
@@ -8005,6 +8063,14 @@ def render_dvc_artifacts() -> None:
 # ============================================================
 
 def main():
+
+    data_docs_key = st.query_params.get("ge_data_docs")
+    if data_docs_key:
+        render_ge_data_docs_viewer(
+            data_docs_key,
+            st.query_params.get("ge_docs_version", "uncached"),
+        )
+        return
 
     # --------------------------------------------------------
     # PANEL DURUMU (başlıktan ÖNCE çözülür)

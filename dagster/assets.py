@@ -1,6 +1,7 @@
 """Dagster assets for generated high-column AU-AIR telemetry."""
 
 import json
+import mimetypes
 import os
 import signal
 import subprocess
@@ -76,6 +77,33 @@ def create_minio_client() -> Minio:
 
 def _normalise_etag(etag: str | None) -> str | None:
     return etag.strip('"') if etag else None
+
+
+def _data_docs_object_key(prefix: str, relative_path: str) -> str:
+    """Join a generated Data Docs path to its private MinIO bundle prefix."""
+
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ValueError(f"Unsafe Data Docs relative path: {relative_path}")
+    return str(PurePosixPath(prefix) / relative)
+
+
+def _artifact_content_type(path: Path) -> str:
+    overrides = {
+        ".css": "text/css",
+        ".html": "text/html",
+        ".js": "application/javascript",
+        ".json": "application/json",
+        ".otf": "font/otf",
+        ".svg": "image/svg+xml",
+        ".ttf": "font/ttf",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+    }
+    return overrides.get(
+        path.suffix.lower(),
+        mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+    )
 
 
 def _staged_object_key(source_key: str, staged_prefix: str) -> str:
@@ -331,7 +359,7 @@ def _run_pipeline_script(context, command: list[str], *, cwd: Path) -> None:
 
 
 class StagedAuairProcessingConfig(Config):
-    """Spark preprocessing knobs for the staged generated AU-AIR batch.
+    """Polars preprocessing knobs for the staged generated AU-AIR batch.
 
     The staged object identity (bucket/key/etag) and the row/column counts now
     arrive from the upstream ``staged_auair_tab`` asset instead of a sensor, so
@@ -340,16 +368,15 @@ class StagedAuairProcessingConfig(Config):
 
     max_columns: int = 100_000
     timestamp_format: str = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-    spark_master: str = "local[2]"
     zstd_level: int = 12
 
 
 @asset(
     group_name="auair_pipeline",
-    compute_kind="spark",
+    compute_kind="polars",
     description=(
         "Downloads one staged generated AU-AIR .tab.zst object, preprocesses "
-        "its dynamic columns with local Spark, and writes ZSTD output parts."
+        "its dynamic columns with Polars, and writes ZSTD output parts."
     ),
 )
 def processed_auair_batch(
@@ -395,12 +422,12 @@ def processed_auair_batch(
         / "batches"
         / batch_id
     )
-    script_path = repo_root / "scripts" / "preprocess_auair_tab_spark.py"
+    script_path = repo_root / "scripts" / "preprocess_auair_tab_polars.py"
     if not script_path.is_file():
-        raise FileNotFoundError(f"Spark preprocessing script missing: {script_path}")
+        raise FileNotFoundError(f"Polars preprocessing script missing: {script_path}")
 
     context.log.info(
-        "Spark preprocessing started: s3://%s/%s -> %s",
+        "Polars preprocessing started: s3://%s/%s -> %s",
         source_bucket,
         source_key,
         batch_path,
@@ -423,8 +450,6 @@ def processed_auair_batch(
             str(config.max_columns),
             "--timestamp-format",
             config.timestamp_format,
-            "--spark-master",
-            config.spark_master,
             "--zstd-level",
             str(config.zstd_level),
         ]
@@ -433,7 +458,7 @@ def processed_auair_batch(
 
     part_files = sorted(batch_path.glob("part-*.tab.zst"))
     if not part_files:
-        raise RuntimeError(f"Spark produced no ZSTD part files: {batch_path}")
+        raise RuntimeError(f"Polars produced no ZSTD part files: {batch_path}")
     output_size = sum(path.stat().st_size for path in part_files)
     value = {
         "dataset_id": dataset_id,
@@ -446,7 +471,7 @@ def processed_auair_batch(
         "column_count": column_count,
         "part_count": len(part_files),
         "output_size_bytes": output_size,
-        "spark_master": config.spark_master,
+        "processing_engine": "polars",
     }
     source_uri = f"s3://{source_bucket}/{source_key}"
     record_asset_materialization(
@@ -465,7 +490,7 @@ def processed_auair_batch(
         output_size_bytes=output_size,
         metadata={
             "processed_path": str(batch_path),
-            "spark_master": config.spark_master,
+            "processing_engine": "polars",
             "zstd_level": config.zstd_level,
         },
     )
@@ -481,7 +506,7 @@ def processed_auair_batch(
             "column_count": column_count,
             "part_count": len(part_files),
             "output_size_bytes": output_size,
-            "spark_master": config.spark_master,
+            "processing_engine": "polars",
         },
     )
 
@@ -501,7 +526,7 @@ class ProcessedAuairValidationConfig(Config):
     compute_kind="great_expectations+spark",
     description=(
         "Validates one processed generated AU-AIR batch with Great Expectations "
-        "on Spark and uploads the JSON quality report to MinIO."
+        "on Spark and uploads its JSON result and Data Docs bundle to MinIO."
     ),
 )
 def validated_auair_batch(
@@ -525,8 +550,12 @@ def validated_auair_batch(
     report_key = (
         f"validation/{dataset_id}/{batch_id}/{source_etag[:12]}.json"
     )
+    data_docs_prefix = (
+        f"validation/{dataset_id}/{batch_id}/{source_etag[:12]}"
+    )
     with tempfile.TemporaryDirectory(prefix="dpm-validation-report-") as temp:
         report_path = Path(temp) / "ge-validation-result.json"
+        data_docs_directory = Path(temp) / "data-docs"
         command = [
             sys.executable,
             str(script_path),
@@ -534,6 +563,8 @@ def validated_auair_batch(
             processed_auair_batch["batch_path"],
             "--report",
             str(report_path),
+            "--data-docs-dir",
+            str(data_docs_directory),
             "--expected-row-count",
             str(processed_auair_batch["row_count"]),
             "--result-format",
@@ -563,22 +594,75 @@ def validated_auair_batch(
             raise RuntimeError(f"GE report was not created: {report_path}")
 
         report = json.loads(report_path.read_text(encoding="utf-8"))
+        data_docs = report.get("data_docs")
+        if not isinstance(data_docs, dict):
+            raise RuntimeError("GE report does not describe a Data Docs bundle.")
+
+        index_key = _data_docs_object_key(
+            data_docs_prefix,
+            str(data_docs.get("index_path", "")),
+        )
+        validation_key = _data_docs_object_key(
+            data_docs_prefix,
+            str(data_docs.get("validation_path", "")),
+        )
+        if not (data_docs_directory / data_docs["index_path"]).is_file():
+            raise RuntimeError("GE Data Docs index file is missing.")
+        if not (data_docs_directory / data_docs["validation_path"]).is_file():
+            raise RuntimeError("GE Data Docs validation page is missing.")
+
         client = create_minio_client()
         if not client.bucket_exists(config.artifact_bucket):
             client.make_bucket(config.artifact_bucket)
+
+        generated_files = sorted(
+            path for path in data_docs_directory.rglob("*") if path.is_file()
+        )
+        if len(generated_files) != int(data_docs.get("file_count", -1)):
+            raise RuntimeError(
+                "GE Data Docs file count changed before its MinIO upload."
+            )
+        object_metadata = {
+            "dataset-id": dataset_id,
+            "batch-id": batch_id,
+            "source-etag": source_etag,
+        }
+        for generated_file in generated_files:
+            relative_path = generated_file.relative_to(
+                data_docs_directory
+            ).as_posix()
+            client.fput_object(
+                config.artifact_bucket,
+                _data_docs_object_key(data_docs_prefix, relative_path),
+                str(generated_file),
+                content_type=_artifact_content_type(generated_file),
+                metadata=object_metadata,
+            )
+
+        data_docs.update(
+            {
+                "index_key": index_key,
+                "validation_key": validation_key,
+                "index_uri": f"s3://{config.artifact_bucket}/{index_key}",
+                "validation_uri": (
+                    f"s3://{config.artifact_bucket}/{validation_key}"
+                ),
+            }
+        )
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         client.fput_object(
             config.artifact_bucket,
             report_key,
             str(report_path),
             content_type="application/json",
-            metadata={
-                "dataset-id": dataset_id,
-                "batch-id": batch_id,
-                "source-etag": source_etag,
-            },
+            metadata=object_metadata,
         )
         context.log.info(
-            "Quality report uploaded: s3://%s/%s",
+            "Quality report and %s Data Docs files uploaded: s3://%s/%s",
+            len(generated_files),
             config.artifact_bucket,
             report_key,
         )
@@ -595,6 +679,7 @@ def validated_auair_batch(
         ),
         "success_percent": statistics.get("success_percent", 0.0),
         "report_uri": f"s3://{config.artifact_bucket}/{report_key}",
+        "data_docs_uri": report["data_docs"]["validation_uri"],
         "quality_report": MetadataValue.json(report),
     }
     if execution_error or not report.get("success", False):
@@ -605,6 +690,7 @@ def validated_auair_batch(
 
     value = dict(processed_auair_batch)
     value["report_uri"] = f"s3://{config.artifact_bucket}/{report_key}"
+    value["data_docs_uri"] = report["data_docs"]["validation_uri"]
     value["validation_statistics"] = statistics
     record_asset_materialization(
         context,
@@ -633,6 +719,7 @@ def validated_auair_batch(
             ),
             "success_percent": statistics.get("success_percent", 0.0),
             "validation_report_uri": value["report_uri"],
+            "data_docs_uri": value["data_docs_uri"],
         },
     )
     return MaterializeResult(value=value, metadata=metadata)
