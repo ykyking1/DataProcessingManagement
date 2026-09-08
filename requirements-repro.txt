@@ -1,4 +1,6 @@
 dvc==3.67.1
-pyspark==4.1.1
+polars==1.35.2
 great_expectations==1.20.0
+pandas==3.0.5
+pyarrow==25.0.1
 zstandard==0.25.0

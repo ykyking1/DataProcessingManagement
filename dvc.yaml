@@ -1,52 +1,50 @@
 stages:
-  preprocess_tab:
+  preprocess_auair:
     cmd: >-
-      python scripts/preprocess_tab_spark.py
+      python scripts/preprocess_auair_tab_polars.py
       --input ${tab_pipeline.input}
       --output ${tab_pipeline.processed_output}
       --max-columns ${tab_pipeline.max_columns}
+      --min-columns ${tab_pipeline.min_columns}
       --timestamp-format ${tab_pipeline.timestamp_format}
-      --spark-master ${tab_pipeline.spark_master}
       --zstd-level ${tab_pipeline.zstd_level}
     deps:
-      - scripts/preprocess_tab_spark.py
+      - scripts/preprocess_auair_tab_polars.py
       - requirements-repro.txt
-      - tools/spark/WindowsLocalFileSystem.java
       - ${tab_pipeline.input}
     params:
       - tab_pipeline.input
       - tab_pipeline.processed_output
       - tab_pipeline.max_columns
+      - tab_pipeline.min_columns
       - tab_pipeline.timestamp_format
-      - tab_pipeline.spark_master
       - tab_pipeline.zstd_level
     outs:
       - ${tab_pipeline.processed_output}
 
-  validate_tab:
+  validate_auair:
     cmd: >-
-      python scripts/validate_tab_spark_ge.py
+      python scripts/validate_auair_tab_polars_ge.py
       --input ${tab_pipeline.processed_output}
       --report ${tab_pipeline.validation_report}
-      --expected-aircraft-type ${tab_pipeline.expected_aircraft_type}
+      --expected-row-count ${tab_pipeline.expected_row_count}
+      --expected-column-count ${tab_pipeline.expected_column_count}
       --result-format ${tab_pipeline.result_format}
       --max-columns ${tab_pipeline.max_columns}
       --timestamp-format ${tab_pipeline.timestamp_format}
-      --spark-master ${tab_pipeline.spark_master}
     deps:
-      - scripts/preprocess_tab_spark.py
-      - scripts/validate_tab_spark_ge.py
+      - scripts/preprocess_auair_tab_polars.py
+      - scripts/validate_auair_tab_polars_ge.py
       - requirements-repro.txt
-      - tools/spark/WindowsLocalFileSystem.java
       - ${tab_pipeline.processed_output}
     params:
       - tab_pipeline.processed_output
       - tab_pipeline.validation_report
-      - tab_pipeline.expected_aircraft_type
+      - tab_pipeline.expected_row_count
+      - tab_pipeline.expected_column_count
       - tab_pipeline.result_format
       - tab_pipeline.max_columns
       - tab_pipeline.timestamp_format
-      - tab_pipeline.spark_master
     metrics:
       - ${tab_pipeline.validation_report}:
           cache: false

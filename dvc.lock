@@ -1,82 +1,73 @@
 schema: '2.0'
 stages:
-  preprocess_tab:
-    cmd: python scripts/preprocess_tab_spark.py --input 
-      data/processed/mx_small_cleaned/mx10000_10rows_clean.tab --output 
-      tmp/dvc_repro/processed --max-columns 100000 --timestamp-format 
-      yyyy-MM-dd'T'HH:mm:ss.SSSXXX --spark-master local[2] --zstd-level 12
+  preprocess_auair:
+    cmd: python scripts/preprocess_auair_tab_polars.py --input
+      local_data/dvc_repro/auair_sample.tab --output tmp/dvc_repro/processed
+      --max-columns 100000 --min-columns 17 --timestamp-format
+      yyyy-MM-dd'T'HH:mm:ss.SSS --zstd-level 12
     deps:
-    - path: data/processed/mx_small_cleaned/mx10000_10rows_clean.tab
+    - path: local_data/dvc_repro/auair_sample.tab
       hash: md5
-      md5: 1c8678e32ee3709697f6625e2223d659
-      size: 1040146
+      md5: ab1d52eeea424ac4c4f68a4cb78d2154
+      size: 793
     - path: requirements-repro.txt
       hash: md5
-      md5: d4812907299106f5a01007b3307e9713
-      size: 76
-    - path: scripts/preprocess_tab_spark.py
+      md5: 5b161f41f3dc8beadcd07d5ed3e8b833
+      size: 102
+    - path: scripts/preprocess_auair_tab_polars.py
       hash: md5
-      md5: 0e416867da1e259c748bbc5c4f990439
-      size: 13167
-    - path: tools/spark/WindowsLocalFileSystem.java
-      hash: md5
-      md5: d71f38d8c872f7778d1268c51a5ff8c0
-      size: 1877
+      md5: ee3ceae9f69c730da9e7e6ec9591655c
+      size: 10893
     params:
       params.yaml:
-        tab_pipeline.input: 
-          data/processed/mx_small_cleaned/mx10000_10rows_clean.tab
+        tab_pipeline.input: local_data/dvc_repro/auair_sample.tab
         tab_pipeline.max_columns: 100000
+        tab_pipeline.min_columns: 17
         tab_pipeline.processed_output: tmp/dvc_repro/processed
-        tab_pipeline.spark_master: local[2]
-        tab_pipeline.timestamp_format: yyyy-MM-dd'T'HH:mm:ss.SSSXXX
+        tab_pipeline.timestamp_format: yyyy-MM-dd'T'HH:mm:ss.SSS
         tab_pipeline.zstd_level: 12
     outs:
     - path: tmp/dvc_repro/processed
       hash: md5
-      md5: ec66b1354ab50b459fdaad90f3c09fd5.dir
-      size: 335548
+      md5: 6fc6d2a12b3171a1fc7eae6dfd8ede4a.dir
+      size: 305
       nfiles: 1
-  validate_tab:
-    cmd: python scripts/validate_tab_spark_ge.py --input tmp/dvc_repro/processed
-      --report reports/validation/dvc_repro_validation.json 
-      --expected-aircraft-type MX10000 --result-format BASIC --max-columns 
-      100000 --timestamp-format yyyy-MM-dd'T'HH:mm:ss.SSSXXX --spark-master 
-      local[2]
+  validate_auair:
+    cmd: python scripts/validate_auair_tab_polars_ge.py --input
+      tmp/dvc_repro/processed --report
+      reports/validation/dvc_repro_validation.json --expected-row-count 5
+      --expected-column-count 17 --result-format BASIC --max-columns 100000
+      --timestamp-format yyyy-MM-dd'T'HH:mm:ss.SSS
     deps:
     - path: requirements-repro.txt
       hash: md5
-      md5: d4812907299106f5a01007b3307e9713
-      size: 76
-    - path: scripts/preprocess_tab_spark.py
+      md5: 5b161f41f3dc8beadcd07d5ed3e8b833
+      size: 102
+    - path: scripts/preprocess_auair_tab_polars.py
       hash: md5
-      md5: 0e416867da1e259c748bbc5c4f990439
-      size: 13167
-    - path: scripts/validate_tab_spark_ge.py
+      md5: ee3ceae9f69c730da9e7e6ec9591655c
+      size: 10893
+    - path: scripts/validate_auair_tab_polars_ge.py
       hash: md5
-      md5: c6b6d533fb76ffb0b0d9887b9f984dbe
-      size: 8957
+      md5: bf4599da3c356e189db1b1baf09e054f
+      size: 6988
     - path: tmp/dvc_repro/processed
       hash: md5
-      md5: ec66b1354ab50b459fdaad90f3c09fd5.dir
-      size: 335548
+      md5: 6fc6d2a12b3171a1fc7eae6dfd8ede4a.dir
+      size: 305
       nfiles: 1
-    - path: tools/spark/WindowsLocalFileSystem.java
-      hash: md5
-      md5: d71f38d8c872f7778d1268c51a5ff8c0
-      size: 1877
     params:
       params.yaml:
-        tab_pipeline.expected_aircraft_type: MX10000
+        tab_pipeline.expected_column_count: 17
+        tab_pipeline.expected_row_count: 5
         tab_pipeline.max_columns: 100000
         tab_pipeline.processed_output: tmp/dvc_repro/processed
         tab_pipeline.result_format: BASIC
-        tab_pipeline.spark_master: local[2]
-        tab_pipeline.timestamp_format: yyyy-MM-dd'T'HH:mm:ss.SSSXXX
+        tab_pipeline.timestamp_format: yyyy-MM-dd'T'HH:mm:ss.SSS
         tab_pipeline.validation_report: 
           reports/validation/dvc_repro_validation.json
     outs:
     - path: reports/validation/dvc_repro_validation.json
       hash: md5
-      md5: eec89518f664b093e6023c39a0b510eb
-      size: 6950
+      md5: c96d1d8d22baca83da0b7dcd9642c86d
+      size: 14103
